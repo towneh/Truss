@@ -1,0 +1,85 @@
+# Deliberately its own crate, with its own `[workspace]`, so the root
+# `cargo build`, `cargo test` and `cargo clippy` never see it. Fuzzing needs a
+# nightly toolchain and libFuzzer, neither of which the stable CI that gates a
+# merge should have to carry.
+#
+# The parent crate forbids `unsafe_code`; that is a package-level lint and does
+# not reach here, which matters because `fuzz_target!` generates an entry point
+# that needs it.
+
+[package]
+name = "truss-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.truss]
+path = ".."
+
+# The targets are shims. Every property they assert lives in `truss::invariants`,
+# which the stable test suite compiles and runs, so nothing here can rot
+# unnoticed on a machine without a nightly toolchain.
+
+[[bin]]
+name = "ts_feed"
+path = "fuzz_targets/ts_feed.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "scan_video_au"
+path = "fuzz_targets/scan_video_au.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "scan_survives_its_own_encoder"
+path = "fuzz_targets/scan_survives_its_own_encoder.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "record_decode"
+path = "fuzz_targets/record_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "flv_roundtrip"
+path = "fuzz_targets/flv_roundtrip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "payload_decode"
+path = "fuzz_targets/payload_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "artnet_packet"
+path = "fuzz_targets/artnet_packet.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "h264_nals"
+path = "fuzz_targets/h264_nals.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]

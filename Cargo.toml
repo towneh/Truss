@@ -1,0 +1,46 @@
+[package]
+name = "truss"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.87"
+description = "Carry DMX lighting control inside a live video stream, as H.264 SEI user data"
+repository = "https://github.com/towneh/Truss"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+keywords = ["dmx", "artnet", "sei", "rtmp", "lighting"]
+categories = ["multimedia::video", "command-line-utilities"]
+
+# The crate parses RTMP, FLV, H.264, MPEG-TS and Art-Net, none of which it
+# controls the contents of, so staying in safe Rust is load-bearing rather than
+# incidental. `unsafe_code` is allow-by-default in rustc, so `clippy -D warnings`
+# never sees it. Forbid is what makes a regression a build failure, and unlike
+# deny it cannot be waved through with an inner allow.
+[lints.rust]
+unsafe_code = "forbid"
+
+[[bin]]
+name = "truss-relay"
+path = "src/bin/truss-relay.rs"
+
+[[bin]]
+name = "truss-detect"
+path = "src/bin/truss-detect.rs"
+
+[[bin]]
+name = "truss-inject"
+path = "src/bin/truss-inject.rs"
+
+[[bin]]
+name = "truss-dmxmon"
+path = "src/bin/truss-dmxmon.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+crc32fast = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ureq = "3"
+rml_rtmp = "0.8"
+bytes = "1"
+socket2 = { version = "0.6.5", features = ["all"] }

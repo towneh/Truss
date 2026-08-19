@@ -1,0 +1,10 @@
+/target
+# Captures and logs from a live run. ffmpeg puts the publish URL in its stderr,
+# and the stream key is in that URL, so nothing from a run belongs in the repo
+# even when it looks like plain text.
+/reports
+/captures
+*.flv
+*.log
+# A stream key on disk, if you keep one there rather than in a secret store.
+*.key

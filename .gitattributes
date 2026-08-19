@@ -1,0 +1,13 @@
+# One line ending in the repository, whatever the working tree uses. Without
+# this a Windows checkout commits CRLF and a Linux one sees the whole file as
+# changed, which buries real diffs.
+* text=auto eol=lf
+
+*.rs    text eol=lf
+*.toml  text eol=lf
+*.md    text eol=lf
+*.yml   text eol=lf
+
+*.png binary
+*.jpg binary
+*.flv binary
