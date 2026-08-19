@@ -21,15 +21,50 @@ lighting data simply never arrives.
 That is worth establishing before anything else:
 
 ```sh
-truss-detect --rtmp rtmp://your-egress/live/stream --seconds 30
+truss-detect rtmp rtmp://your-egress/live/stream --max-seconds 30
 ```
 
 This reads your own egress and reports what arrived. It distinguishes the three
 outcomes that matter: nothing arrived, something arrived but was damaged,
 something arrived intact. Only the last is a basis for running a show.
 
-RTSP and RTMP are read through ffmpeg, which needs to be on your PATH. MPEG-TS
-and local files Truss reads directly.
+The reader is a subcommand. `rtmp` and `rtsp` go through ffmpeg, which needs to
+be on your PATH; `ts` takes an MPEG-TS URL, a local file, or `-` for stdin, and
+is read directly. `--max-seconds` and `--max-mb` bound the run, `--json` writes
+the full report for something else to read, and `--save` keeps the bytes, so a
+disagreement about what arrived can be settled against the capture rather than
+against anyone's recollection of it.
+
+## A dry run
+
+`truss-detect` needs a stream that already carries records, and before the first
+show there is not one. `truss-inject` writes them into a file, which is enough
+to put the path under test with no desk and no encoder present:
+
+```sh
+ffmpeg -i source.mp4 -c:v libx264 -f flv plain.flv
+truss-inject --input plain.flv --output carried.flv
+ffmpeg -re -i carried.flv -c copy -f flv rtmp://ingest.example.net/live/<key>
+```
+
+`-c copy` publishes the file as it stands, so what reaches the egress is what
+`truss-inject` wrote, and `truss-detect` against the egress then scores the path
+itself.
+
+The same file can also be read back without leaving the machine, which separates
+a fault in the carrier from a fault in the network:
+
+```sh
+ffmpeg -i carried.flv -c copy -f mpegts carried.ts
+truss-detect ts carried.ts
+```
+
+The body written here is derived from the sequence number rather than from a
+desk, so what this establishes is that the path carries bytes intact, not that
+the lighting is right. `--payload-len` sets how much each record carries,
+`--every N` and `--keyframes-only` reduce how often records are written, and
+`--max-added-kbps` refuses to write the file at all if the result would cost
+more than was budgeted for. That is a better place to find out than a show.
 
 ## Running a show
 
@@ -53,6 +88,40 @@ universes, so one at the far end of the patch cannot starve.
 counts, which is the more useful measure: a stream can deliver every record
 intact and still carry a snapshot that never changes, and that is a dead show
 which scores correctly on every other test.
+
+```sh
+truss-dmxmon rtsp rtsp://your-egress/live/stream --universe 0
+```
+
+`--universe` prints that universe as a grid on every status line. `--watch
+0.1-16` prints only the channels named, and only as they change, which is the
+shorter way to answer whether one fixture is moving; slots are numbered from 1,
+as on a desk. The readers here are `ts` and `rtsp`, so an RTMP egress is remuxed
+on the way in:
+
+```sh
+ffmpeg -i rtmp://your-egress/live/stream -c copy -f mpegts - | truss-dmxmon ts -
+```
+
+## With no ingest to point at
+
+The relay can be exercised without a real one. ffmpeg will accept a publish on a
+port, which is enough to stand in for an ingest and put the whole path on a
+single machine. Three terminals, started in this order:
+
+```sh
+ffmpeg -listen 1 -f flv -i rtmp://127.0.0.1:1936/live -c copy -f mpegts egress.ts
+truss-relay --listen 127.0.0.1:1935 --ingest 127.0.0.1:1936 --stream-key-file key.txt
+ffmpeg -re -i source.mp4 -c:v libx264 -f flv rtmp://127.0.0.1:1935/live/anykey
+```
+
+The order matters, as each waits for the one before it. OBS can take the place
+of the third terminal, pointed at the same URL. The key in `key.txt` can be
+anything, since the stand-in accepts whatever it is given.
+
+`truss-detect ts egress.ts` then scores what left the far end, and adding
+`--artnet` to the relay puts a desk in the same loop. None of it leaves the
+machine.
 
 ## The stream key
 

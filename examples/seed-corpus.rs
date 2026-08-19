@@ -11,9 +11,9 @@
 //! ```
 //!
 //! Everything written is synthetic. Real captures make better seeds still,
-//! since they carry a remuxer's actual output, and `truss-detect --save` will
-//! produce one; keep those out of the repository and check what is in them
-//! before sharing.
+//! since they carry a remuxer's actual output, and `--save` on `truss-detect`
+//! will produce one; keep those out of the repository and check what is in
+//! them before sharing.
 
 use std::fs;
 use std::path::Path;
