@@ -35,7 +35,7 @@ use truss::inject::{InjectOptions, Injector};
 use truss::osc;
 use truss::payload;
 use truss::record::{DEFAULT_PAYLOAD_LEN, MAX_PAYLOAD_LEN};
-use truss::relay::{OutBuf, RateMeter};
+use truss::relay::{Ingest, OutBuf, RateMeter};
 
 #[derive(Parser, Clone)]
 #[command(
@@ -46,12 +46,13 @@ struct Cli {
     /// Address to accept the encoder on. Point it at rtmp://<this>/live with any key.
     #[arg(long, default_value = "127.0.0.1:1935")]
     listen: String,
-    /// Ingest host and port to publish to.
+    /// Where to publish the stream: rtmp://host/app, with the port after the
+    /// host when it is not 1935, and "live" when no application is given.
+    /// The stream key is never part of this: see --stream-key-file.
     #[arg(long)]
-    ingest: String,
-    /// RTMP application name on the ingest server.
-    #[arg(long, default_value = "live")]
-    app: String,
+    publish: String,
+    #[arg(skip)]
+    target: Ingest,
     /// File holding the stream key, or `-` to read it from stdin. Suits
     /// systemd LoadCredential and container secrets, which both present a
     /// secret as a file. Without it the key is looked for in TRUSS_STREAM_KEY,
@@ -71,12 +72,17 @@ struct Cli {
     /// payload from the universes the desk is sending.
     #[arg(long, default_value_t = DEFAULT_PAYLOAD_LEN)]
     payload_len: usize,
-    /// Carry live Art-Net DMX instead of the sequence-derived test body.
-    #[arg(long)]
-    artnet: bool,
-    /// Address to receive Art-Net on.
-    #[arg(long, default_value_t = format!("0.0.0.0:{}", truss::artnet::DEFAULT_PORT))]
-    artnet_listen: String,
+    /// Carry live Art-Net DMX. On its own this listens on every adapter, port
+    /// 6454, and hears a desk on this machine as well as one on the network.
+    /// Give an address to listen on one adapter only, with :port after it
+    /// when it is not 6454.
+    #[arg(
+        long,
+        value_name = "ADDRESS",
+        num_args = 0..=1,
+        default_missing_value = "0.0.0.0",
+    )]
+    artnet: Option<String>,
     /// Largest DMX payload to put in one frame. The default is the largest
     /// size measured crossing a remuxing CDN intact; more is untested rather than known
     /// to fail. Universes that do not fit are sent on the following frames.
@@ -98,8 +104,8 @@ struct Cli {
     #[arg(long)]
     osc: Option<String>,
     /// Records a second to send to --osc while no publisher is connected.
-    /// With one connected the lane carries the records the stream carries,
-    /// at the video's frame rate.
+    /// With one connected the lane carries the payload of each record the
+    /// stream carries, at the video's frame rate.
     #[arg(long, default_value_t = 30.0)]
     osc_rate: f64,
 }
@@ -130,7 +136,8 @@ fn parse_carriers(spec: &str) -> Result<Vec<Carrier>> {
 }
 
 fn main() -> Result<()> {
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
+    cli.target = Ingest::parse(&cli.publish)?;
     let carriers = parse_carriers(&cli.carriers)?;
 
     // Art-Net is unauthenticated by protocol design, so how many universes turn
@@ -153,21 +160,15 @@ fn main() -> Result<()> {
         Some(creds::StreamKey::resolve(
             cli.stream_key_file.as_deref(),
             "truss",
-            &cli.ingest,
+            &cli.target.authority,
         )?)
     };
 
     // Bound once for the life of the relay rather than per session: a desk
     // keeps sending across an OBS reconnect, and rebinding would drop the
     // current state of every universe.
-    let artnet = match (cli.artnet, cli.passthrough) {
-        (true, false) => {
-            let addr = cli
-                .artnet_listen
-                .parse()
-                .with_context(|| format!("parsing --artnet-listen {:?}", cli.artnet_listen))?;
-            Some(artnet::Receiver::bind(addr)?)
-        }
+    let artnet = match (cli.artnet.as_deref(), cli.passthrough) {
+        (Some(spec), false) => Some(artnet::Receiver::bind(artnet::parse_listen(spec)?)?),
         _ => None,
     };
 
@@ -175,9 +176,6 @@ fn main() -> Result<()> {
         Some(target) => {
             if artnet.is_none() {
                 bail!("--osc carries the Art-Net lane, so it needs --artnet");
-            }
-            if !(cli.osc_rate.is_finite() && cli.osc_rate > 0.0) {
-                bail!("--osc-rate must be a positive number of records a second");
             }
             let addr = target
                 .to_socket_addrs()
@@ -189,16 +187,35 @@ fn main() -> Result<()> {
         None => None,
     };
 
+    // The lane's idle clock, only with a lane to drive. Zero, a negative
+    // number and a rate too low to express as a duration all fail here rather
+    // than later in arithmetic.
+    let tick = match osc {
+        Some(_) => {
+            let rate = cli.osc_rate;
+            let tick = if rate.is_finite() && rate > 0.0 {
+                Duration::try_from_secs_f64(1.0 / rate).ok()
+            } else {
+                None
+            };
+            // A tick of zero would send without pause and never sleep, which
+            // an infinite rate, or a finite one past the clock's resolution,
+            // would otherwise produce.
+            match tick {
+                Some(t) if !t.is_zero() => Some(t),
+                _ => bail!("--osc-rate {rate:?} is not a usable number of records a second"),
+            }
+        }
+        None => None,
+    };
+
     let listener =
         TcpListener::bind(&cli.listen).with_context(|| format!("binding {}", cli.listen))?;
     println!(
         "relay listening on rtmp://{}/{}  (point the encoder here, any stream key)",
-        cli.listen, cli.app
+        cli.listen, cli.target.app
     );
-    println!(
-        "  forwarding to rtmp://{}/{} (key hidden)",
-        cli.ingest, cli.app
-    );
+    println!("  forwarding to {} (key hidden)", cli.target.url());
     if cli.passthrough {
         println!("  passthrough: nothing injected");
     } else if cli.carriers.trim() != DEFAULT_CARRIERS {
@@ -243,7 +260,6 @@ fn main() -> Result<()> {
         .set_nonblocking(true)
         .context("setting the listener non-blocking")?;
     let mut idle = IdleStatus::default();
-    let tick = Duration::from_secs_f64(1.0 / cli.osc_rate);
     let mut next_tick = Instant::now();
     loop {
         let stream = match listener.accept() {
@@ -253,7 +269,7 @@ fn main() -> Result<()> {
                     idle.print(a, osc.as_ref());
                     // With no publisher the lane runs on its own clock, from
                     // the latch, so a desk can be watched with nothing else up.
-                    if let Some(o) = osc.as_mut()
+                    if let (Some(o), Some(tick)) = (osc.as_mut(), tick)
                         && Instant::now() >= next_tick
                     {
                         let blocks = a.latch().snapshot(Instant::now(), cli.artnet_max_payload);
@@ -263,7 +279,7 @@ fn main() -> Result<()> {
                         next_tick = Instant::now() + tick;
                     }
                 }
-                let nap = match osc {
+                let nap = match tick {
                     Some(_) => next_tick
                         .saturating_duration_since(Instant::now())
                         .min(Duration::from_millis(200)),
@@ -299,8 +315,9 @@ fn main() -> Result<()> {
 
 /// The Art-Net lane while no publisher is connected, printed when something
 /// about it changes: a universe appears, a controller polls, the first DMX
-/// arrives, the thread fails. Counts climbing on their own are not a change,
-/// so a desk that is steady is not narrated.
+/// arrives, the thread fails, late packets settle at a steady share. Counts
+/// climbing on their own are not a change, so a desk that is steady is not
+/// narrated.
 #[derive(Default)]
 struct IdleStatus {
     checked: Option<Instant>,
@@ -388,6 +405,12 @@ fn artnet_status(latch: &artnet::Latch) -> (String, Option<String>) {
     }
     if latch.polls > 0 {
         line.push_str(&format!("  polls {}", latch.polls));
+    }
+    if latch.polls_unanswered > 0 {
+        line.push_str(&format!(
+            " ({} unanswered, no route to the controller)",
+            latch.polls_unanswered
+        ));
     }
     if latch.reply_errors > 0 {
         line.push_str(&format!(" ({} replies failed)", latch.reply_errors));
@@ -700,8 +723,8 @@ fn handle_publisher_event(
                             Some(Ok(bytes)) => {
                                 let now = now_unix_nanos();
                                 let rewritten = inj.inject_tag_with(&data, now, Some(&bytes))?;
-                                // The lane carries what the stream carries, so a
-                                // frame the injector left alone gets no record.
+                                // The lane carries the payload the stream carries,
+                                // so a frame the injector left alone gets no record.
                                 if rewritten.is_some()
                                     && let Some(o) = osc.as_mut()
                                 {
@@ -834,14 +857,14 @@ fn queue_server(out: &mut OutBuf, results: Vec<ServerSessionResult>) {
 }
 
 fn connect_upstream(cli: &Cli) -> Result<Upstream> {
-    println!("connecting to {}...", cli.ingest);
-    let mut socket =
-        TcpStream::connect(&cli.ingest).with_context(|| format!("connecting to {}", cli.ingest))?;
+    println!("connecting to {}...", cli.target.authority);
+    let mut socket = TcpStream::connect(&cli.target.authority)
+        .with_context(|| format!("connecting to {}", cli.target.authority))?;
     socket.set_nodelay(true).ok();
     let leftover = client_handshake(&mut socket)?;
 
     let mut config = ClientSessionConfig::new();
-    config.tc_url = Some(format!("rtmp://{}/{}", cli.ingest, cli.app));
+    config.tc_url = Some(cli.target.url());
     let (mut session, initial) =
         ClientSession::new(config).map_err(|e| anyhow!("creating client session: {e:?}"))?;
     for r in initial {
@@ -856,7 +879,7 @@ fn connect_upstream(cli: &Cli) -> Result<Upstream> {
         }
     }
     let res = session
-        .request_connection(cli.app.clone())
+        .request_connection(cli.target.app.clone())
         .map_err(|e| anyhow!("request_connection: {e:?}"))?;
     send_client_blocking(&mut socket, res)?;
     socket.set_nonblocking(true)?;

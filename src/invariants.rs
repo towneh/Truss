@@ -224,7 +224,29 @@ pub fn artnet_poll(data: &[u8]) {
         .map(|c| (u16::from(c[0]) << 8 | u16::from(*c.get(1).unwrap_or(&0))) & 0x7FFF);
     let ports = artnet::advertised_ports(universes);
     assert!(!ports.is_empty() && ports.len() <= artnet::MAX_ADVERTISED_PORTS);
-    let _ = poll.wants(ports.iter().copied());
+    // Targeted mode is decided against the advertised ports and nothing else:
+    // a range holding only universe 0 matches exactly when 0 is advertised, a
+    // range holding every universe always matches, and the poll's own range
+    // matches exactly when some advertised port falls inside it.
+    let only_zero = artnet::ArtPoll {
+        flags: poll.flags,
+        targeted: Some((0, 0)),
+    };
+    assert_eq!(only_zero.wants(ports.iter().copied()), ports.contains(&0));
+    let everything = artnet::ArtPoll {
+        flags: poll.flags,
+        targeted: Some((0, 0x7FFF)),
+    };
+    assert!(everything.wants(ports.iter().copied()));
+    let expected = match poll.targeted {
+        None => true,
+        Some((lo, hi)) => ports.iter().any(|p| (lo..=hi).contains(p)),
+    };
+    assert_eq!(
+        poll.wants(ports.iter().copied()),
+        expected,
+        "targeted mode decided against something other than the advertised ports"
+    );
 
     let replies = u64::from(data.first().copied().unwrap_or(0)) * 97;
     let packets = artnet::poll_replies(

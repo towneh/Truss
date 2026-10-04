@@ -27,8 +27,8 @@ pub const DEFAULT_PORT: u16 = 12100;
 ///
 /// The specification writes the length as a signed 32-bit integer, so a
 /// blob past that is refused rather than written with a length that does
-/// not match its bytes. A record is at most a few tens of kilobytes, so the
-/// refusal is a statement of the limit rather than a path anything takes.
+/// not match its bytes. A record is under 64 KB, so the refusal states the
+/// limit rather than being a path anything takes.
 pub fn encode_blob(address: &str, blob: &[u8]) -> Result<Vec<u8>, EncodeError> {
     let len = i32::try_from(blob.len()).map_err(|_| EncodeError::PayloadTooLong {
         len: blob.len(),

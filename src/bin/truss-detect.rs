@@ -80,8 +80,8 @@ enum Cmd {
     /// Listen for the relay's OSC lane: /truss/dmx messages carrying records.
     ///
     /// A socket has no end, so --max-seconds says when to stop. Nothing here
-    /// crosses a CDN, so what this scores is the relay's output as sent, which
-    /// is the reference the stream's figures are judged against.
+    /// crosses a CDN, so a gap here is the relay's and a gap only in the
+    /// stream is the path's.
     Osc {
         /// Address to listen on.
         #[arg(default_value_t = format!("0.0.0.0:{}", truss::osc::DEFAULT_PORT))]

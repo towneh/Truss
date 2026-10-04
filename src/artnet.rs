@@ -28,7 +28,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use socket2::{Domain, Protocol, Socket, Type};
 
 use crate::payload::{BLOCK_HEADER_LEN, Block, HEADER_LEN as PAYLOAD_HEADER_LEN};
@@ -147,7 +147,7 @@ impl ArtPoll {
     }
 }
 
-/// Most universes a node advertises. Each reply packet names up to four, so
+/// The most universes a node advertises. Each reply packet names up to four, so
 /// this is eight packets per poll, and a bound on how much a poll can cost
 /// once a hostile sender has filled the latch with universes.
 pub const MAX_ADVERTISED_PORTS: usize = 32;
@@ -290,6 +290,11 @@ pub struct Latch {
     pub ignored: u64,
     /// `ArtPoll` packets answered.
     pub polls: u64,
+    /// `ArtPoll` packets from a controller this machine had no route to yet,
+    /// left unanswered rather than answered with an address of 0.0.0.0. One
+    /// is normal for a desk reached through a router; a steady count means
+    /// the routing table never gives an answer for it.
+    pub polls_unanswered: u64,
     /// Who sent the most recent `ArtPoll`. A controller that polls but sends
     /// no DMX has found the node and not yet been told to use it, which is
     /// a different thing to wait for than a desk that is not there.
@@ -389,6 +394,22 @@ impl Latch {
         self.cursor = if taken == 0 { 0 } else { (start + taken) % n };
         blocks
     }
+}
+
+/// Where to listen, from an address, an `address:port`, or a bracketed IPv6
+/// address with or without a port. The port is 6454 unless given.
+pub fn parse_listen(spec: &str) -> Result<SocketAddr> {
+    let spec = spec.trim();
+    if let Ok(addr) = spec.parse::<SocketAddr>() {
+        return Ok(addr);
+    }
+    if let Ok(ip) = spec.trim_matches(['[', ']']).parse::<IpAddr>() {
+        return Ok(SocketAddr::new(ip, DEFAULT_PORT));
+    }
+    bail!(
+        "{spec:?} is not an address to listen on; give an IP address, with :port after it \
+         when it is not {DEFAULT_PORT}"
+    )
 }
 
 /// A background thread receiving Art-Net into a shared latch.
@@ -551,20 +572,32 @@ fn answer_poll(
     let Ok(local) = socket.local_addr() else {
         return;
     };
-    let (replies, latched, ports) = {
-        let Ok(mut l) = latch.lock() else {
+    let (latched, ports) = {
+        let Ok(l) = latch.lock() else {
             return;
         };
         let ports = advertised_ports(l.universes.keys().copied());
         if !poll.wants(ports.iter().copied()) {
             return;
         }
-        l.polls += 1;
-        l.last_controller = Some(from);
-        (l.polls, l.universes.len(), ports)
+        (l.universes.len(), ports)
     };
 
     let r = routes.route_to(local.ip(), controller, Instant::now());
+    // Counted as answered only once there is an answer: a desk told 0.0.0.0
+    // would send its DMX there, so a controller with no route yet gets no
+    // reply, and the next poll is answered once a route is known.
+    let Ok(mut l) = latch.lock() else {
+        return;
+    };
+    if r.ip.is_unspecified() {
+        l.polls_unanswered += 1;
+        return;
+    }
+    l.polls += 1;
+    l.last_controller = Some(from);
+    let replies = l.polls;
+    drop(l);
     let packets = poll_replies(r.ip, local.port(), replies, latched, &ports);
 
     let mut targets = vec![SocketAddr::new(IpAddr::V4(controller), DEFAULT_PORT)];
@@ -589,8 +622,16 @@ fn answer_poll(
     }
 }
 
-/// How often the interface list is read again and the routing table asked.
+/// How often the interface list is read again, and the least time between
+/// two askings of the routing table.
 const ROUTES_REFRESH: Duration = Duration::from_secs(1);
+/// How long a routing-table answer is kept for the controller it was for.
+/// Routes change rarely, and keeping an answer well past the probe budget is
+/// what serves two routed controllers whose polls land inside each other's
+/// second: once each has been asked about once, neither needs asking again.
+const ROUTE_TTL: Duration = Duration::from_secs(60);
+/// Routed controllers remembered at once; past this the oldest makes way.
+const MAX_PROBED: usize = 8;
 
 /// Where replies go, worked out from a snapshot of this machine's interfaces.
 ///
@@ -608,12 +649,16 @@ const ROUTES_REFRESH: Duration = Duration::from_secs(1);
 /// The snapshot is read again at most once a second, and the routing table
 /// asked at most once a second, so what a poll costs the receive thread does
 /// not depend on who sent it. Art-Net is unauthenticated, and a source
-/// address is anyone's to choose.
+/// address is anyone's to choose. A controller there is no answer for yet
+/// gets an unspecified address, which the caller must treat as no reply at
+/// all rather than advertise.
 pub struct Routes {
     interfaces: Vec<(Ipv4Addr, Ipv4Addr)>,
     refreshed: Option<Instant>,
-    /// The last routing-table probe: who it was for, what it said, and when.
-    probed: Option<(Ipv4Addr, Option<Ipv4Addr>, Instant)>,
+    /// Routing-table answers by controller, with when each was asked.
+    probed: Vec<(Ipv4Addr, Option<Ipv4Addr>, Instant)>,
+    /// When the routing table was last asked, for the budget.
+    last_probe: Option<Instant>,
     probe: fn(Ipv4Addr) -> Option<Ipv4Addr>,
 }
 
@@ -622,7 +667,8 @@ impl Default for Routes {
         Self {
             interfaces: Vec::new(),
             refreshed: None,
-            probed: None,
+            probed: Vec::new(),
+            last_probe: None,
             probe: probe_route,
         }
     }
@@ -663,19 +709,39 @@ impl Routes {
 
     /// The routing table's answer for a controller on no local subnet.
     ///
-    /// Asked at most once a second. Inside that second the answer already
-    /// held serves the controller it was for, and any other controller gets
-    /// none: a desk reached through a router polls every few seconds and is
-    /// answered on its next poll, while a flood of invented sources costs one
-    /// probe a second however fast it arrives.
+    /// An answer already held for this controller is used while it lasts: a
+    /// minute for an address, a second for a failure, so a route that could
+    /// not be found is tried again soon. Otherwise the table is asked at most
+    /// once a second across every controller, and a controller arriving
+    /// inside that second gets nothing this time. Two desks reached through
+    /// a router whose polls land in each other's second are both served after
+    /// one round, since the first's answer is still held when the second's
+    /// turn comes; a flood of invented sources costs one probe a second
+    /// however fast it arrives.
     fn probe_for(&mut self, controller: Ipv4Addr, now: Instant) -> Option<Ipv4Addr> {
-        if let Some((who, answer, when)) = self.probed
-            && now.duration_since(when) < ROUTES_REFRESH
+        if let Some((_, answer, when)) = self.probed.iter().find(|(who, _, _)| *who == controller) {
+            let ttl = if answer.is_some() {
+                ROUTE_TTL
+            } else {
+                ROUTES_REFRESH
+            };
+            if now.duration_since(*when) < ttl {
+                return *answer;
+            }
+        }
+        if self
+            .last_probe
+            .is_some_and(|t| now.duration_since(t) < ROUTES_REFRESH)
         {
-            return if who == controller { answer } else { None };
+            return None;
         }
         let answer = (self.probe)(controller);
-        self.probed = Some((controller, answer, now));
+        self.last_probe = Some(now);
+        self.probed.retain(|(who, _, _)| *who != controller);
+        if self.probed.len() >= MAX_PROBED {
+            self.probed.remove(0);
+        }
+        self.probed.push((controller, answer, now));
         answer
     }
 }
@@ -1122,6 +1188,33 @@ mod tests {
     }
 
     #[test]
+    fn a_listen_address_takes_the_art_net_port_unless_told_otherwise() {
+        assert_eq!(
+            parse_listen("0.0.0.0").unwrap(),
+            SocketAddr::from((Ipv4Addr::UNSPECIFIED, DEFAULT_PORT))
+        );
+        assert_eq!(
+            parse_listen("192.168.1.233:6455").unwrap(),
+            "192.168.1.233:6455".parse::<SocketAddr>().unwrap()
+        );
+        assert_eq!(
+            parse_listen("::1").unwrap(),
+            "[::1]:6454".parse::<SocketAddr>().unwrap()
+        );
+        assert_eq!(
+            parse_listen("[::1]").unwrap(),
+            "[::1]:6454".parse::<SocketAddr>().unwrap()
+        );
+        assert_eq!(
+            parse_listen("[::1]:6455").unwrap(),
+            "[::1]:6455".parse::<SocketAddr>().unwrap()
+        );
+        let e = parse_listen("desk").unwrap_err().to_string();
+        assert!(e.contains("not an address"), "{e}");
+        assert!(parse_listen("").is_err());
+    }
+
+    #[test]
     fn bound_to_every_address_the_receiver_also_holds_loopback() {
         let recv = Receiver::bind("0.0.0.0:0".parse().unwrap()).expect("binds");
         let port = recv.local_addr.port();
@@ -1251,7 +1344,8 @@ mod tests {
         Routes {
             interfaces: vec![(Ipv4Addr::new(10, 7, 7, 1), Ipv4Addr::new(255, 255, 255, 0))],
             refreshed: Some(now),
-            probed: None,
+            probed: Vec::new(),
+            last_probe: None,
             probe,
         }
     }
@@ -1288,46 +1382,85 @@ mod tests {
         assert_eq!(r.ip, Ipv4Addr::new(203, 0, 113, 5));
     }
 
+    static FAILED_PROBES: AtomicUsize = AtomicUsize::new(0);
+
+    fn failing_probe(_: Ipv4Addr) -> Option<Ipv4Addr> {
+        FAILED_PROBES.fetch_add(1, Ordering::Relaxed);
+        None
+    }
+
     #[test]
-    fn the_routing_table_is_asked_at_most_once_a_second() {
+    fn the_routing_table_is_asked_at_most_once_a_second_and_every_controller_is_served() {
         let t0 = Instant::now();
         // The counter is this test's alone, so nothing else moves it.
         let mut routes = invented_routes(t0, counted_probe);
         let any = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
+        let answer = Ipv4Addr::new(203, 0, 113, 5);
         // TEST-NET-2, on no subnet of any machine.
         let far = Ipv4Addr::new(198, 51, 100, 1);
         let other = Ipv4Addr::new(198, 51, 100, 2);
-        let before = PROBES.load(Ordering::Relaxed);
+        let probes = || PROBES.load(Ordering::Relaxed);
+        let before = probes();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
 
-        assert_eq!(
-            routes.route_to(any, far, t0).ip,
-            Ipv4Addr::new(203, 0, 113, 5)
-        );
-        assert_eq!(PROBES.load(Ordering::Relaxed), before + 1);
+        assert_eq!(routes.route_to(any, far, at(0)).ip, answer);
+        assert_eq!(probes(), before + 1);
 
-        let r = routes.route_to(any, other, t0 + Duration::from_millis(100));
+        let r = routes.route_to(any, other, at(100));
         assert_eq!(
             r.ip,
             Ipv4Addr::UNSPECIFIED,
-            "no probe to spare for a second source"
+            "no probe to spare for a second source inside the second"
         );
-        assert_eq!(PROBES.load(Ordering::Relaxed), before + 1);
+        assert_eq!(probes(), before + 1);
 
-        let r = routes.route_to(any, far, t0 + Duration::from_millis(200));
         assert_eq!(
-            r.ip,
-            Ipv4Addr::new(203, 0, 113, 5),
+            routes.route_to(any, far, at(200)).ip,
+            answer,
             "the held answer, for who it was for"
         );
-        assert_eq!(PROBES.load(Ordering::Relaxed), before + 1);
+        assert_eq!(probes(), before + 1);
 
         assert_eq!(
-            routes
-                .route_to(any, other, t0 + Duration::from_millis(1500))
-                .ip,
-            Ipv4Addr::new(203, 0, 113, 5),
+            routes.route_to(any, other, at(1500)).ip,
+            answer,
             "asked again once the second is up"
         );
-        assert_eq!(PROBES.load(Ordering::Relaxed), before + 2);
+        assert_eq!(probes(), before + 2);
+
+        // From here both are held, so two controllers whose polls keep landing
+        // inside each other's second are both answered without another probe.
+        for (who, ms) in [(far, 3000), (other, 3500), (far, 6000), (other, 6500)] {
+            assert_eq!(
+                routes.route_to(any, who, at(ms)).ip,
+                answer,
+                "{who} at +{ms} ms"
+            );
+        }
+        assert_eq!(probes(), before + 2);
+    }
+
+    #[test]
+    fn a_route_that_could_not_be_found_is_tried_again_soon() {
+        let t0 = Instant::now();
+        let mut routes = invented_routes(t0, failing_probe);
+        let any = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
+        let far = Ipv4Addr::new(198, 51, 100, 3);
+        let before = FAILED_PROBES.load(Ordering::Relaxed);
+
+        assert_eq!(routes.route_to(any, far, t0).ip, Ipv4Addr::UNSPECIFIED);
+        assert_eq!(FAILED_PROBES.load(Ordering::Relaxed), before + 1);
+        routes.route_to(any, far, t0 + Duration::from_millis(500));
+        assert_eq!(
+            FAILED_PROBES.load(Ordering::Relaxed),
+            before + 1,
+            "a failure is held for the second, not asked again at once"
+        );
+        routes.route_to(any, far, t0 + Duration::from_millis(1500));
+        assert_eq!(
+            FAILED_PROBES.load(Ordering::Relaxed),
+            before + 2,
+            "and asked again after it"
+        );
     }
 }

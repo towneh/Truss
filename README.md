@@ -3,9 +3,9 @@
 DMX lighting control carried inside a live video stream, as H.264 SEI user data.
 
 A lighting desk speaks Art-Net across the local network, and that traffic does
-not leave the building. Video does. Truss takes what the desk is sending, packs
-it into the video as that passes through an RTMP relay, and it arrives wherever
-the video arrives. The data rides inside the access unit rather than alongside
+not leave the building, where video does. Truss takes what the desk is sending,
+packs it into the video as that passes through an RTMP relay, and it arrives
+wherever the video arrives. The data rides inside the access unit rather than alongside
 it, so it stays locked to the picture.
 
 The picture itself is unaltered. What Truss adds sits in a part of the bitstream
@@ -16,9 +16,9 @@ a decoder is required to skip over.
 SEI survives a remux. It does not survive a transcode. A CDN that repackages the
 stream will carry it; one that re-encodes will strip the lane out entirely. No
 warning is given in either case, because the video continues to work and the
-lighting data simply never arrives.
+lighting data never arrives.
 
-That is worth establishing before anything else:
+Check your own path before anything else:
 
 ```sh
 truss-detect rtmp rtmp://your-egress/live/stream --max-seconds 30
@@ -32,8 +32,7 @@ The reader is a subcommand. `rtmp` and `rtsp` go through ffmpeg, which needs to
 be on your PATH; `ts` takes an MPEG-TS URL, a local file, or `-` for stdin, and
 is read directly. `--max-seconds` and `--max-mb` bound the run, `--json` writes
 the full report for something else to read, and `--save` keeps the bytes, so a
-disagreement about what arrived can be settled against the capture rather than
-against anyone's recollection of it.
+disagreement about what arrived can be settled against the capture.
 
 ## A dry run
 
@@ -71,10 +70,15 @@ more than was budgeted for. That is a better place to find out than a show.
 ```sh
 truss-relay \
   --listen 127.0.0.1:1935 \
-  --ingest ingest.example.net:1935 \
+  --publish rtmp://ingest.example.net/live \
   --stream-key-file /run/credentials/truss/key \
   --artnet
 ```
+
+`--listen` is where the encoder sends; `--publish` is where the relay sends on.
+`--publish` is the publish URL up to the application and no further: the host,
+the port after it when it is not 1935, and the application, `live` when none is
+given.
 
 Point your encoder at `rtmp://127.0.0.1/live` with any stream key. Truss holds
 the real one, so it need never be entered into the encoder.
@@ -85,24 +89,30 @@ each video frame. Where the payload budget is exceeded it rotates through the
 universes, so one at the far end of the patch cannot starve.
 
 A desk that lists nodes rather than broadcasting will find one named Truss.
-The relay answers `ArtPoll` with the address the desk can reach it on, which on
-a machine with several adapters is the one on the desk's own subnet, and sends
-the answer to the desk directly and as a broadcast on that subnet. Pick it and
-assign it the universes to carry. Until DMX arrives the relay reports the
-controller that found the node, whether or not a publisher is connected, so a
-show that is lit on the desk and dark in the stream is a patch problem and not
-a network one. The node advertises the universes it has heard, up to 32, and
-universe 0 before it has heard any, so a desk that searches by universe finds
-it from the first poll after that universe starts arriving.
+The relay answers `ArtPoll` with the address the desk can reach it on, the one
+on the desk's own subnet when this machine has several, and sends the answer
+to the desk directly and as a broadcast on that subnet. Pick it and assign it
+the universes to carry. Until DMX arrives the relay reports the controller
+that found the node, whether or not a publisher is connected, which separates
+a desk that has not been patched to the node from a desk that is not there.
+The node advertises the universes it has heard, up to 32, and universe 0
+before it has heard any, so a desk that searches by universe finds it from the
+first poll after that universe starts arriving.
+
+`--artnet` on its own listens on every adapter. `--artnet 192.168.1.20` listens
+on that adapter only and tells every desk to use that address, with `:port`
+after it when the port is not 6454. A socket bound to one address does not
+hear the broadcasts a desk like QLC+ sends by default, so give an address for
+a desk that sends to it on purpose, or to keep Art-Net off a network.
 
 A desk on this same machine shares UDP port 6454 with the relay, and a packet
 sent to a shared port by address reaches whichever socket the operating system
-picks. The relay therefore also listens on 127.0.0.1, which a packet addressed
-there reaches ahead of any socket bound to every address, and tells a desk on
-this machine to send there. A desk set to send to localhost needs no discovery
-at all; set it to send to this node or to localhost, not both, or every
-universe arrives twice and the status line reports a steady share of packets
-late.
+picks. Unless given an address, the relay therefore also listens on 127.0.0.1,
+which a packet addressed there reaches ahead of any socket bound to every
+address, and tells a desk on this machine to send there. A desk set to send to
+localhost needs no discovery at all. Set it to send to this node or to
+localhost, not both, or every universe arrives twice and the status line
+reports a steady share of packets late.
 
 `truss-dmxmon` reports what a receiver would decode. It shows values rather than
 counts, which is the more useful measure: a stream can deliver every record
@@ -127,25 +137,26 @@ ffmpeg -i rtmp://your-egress/live/stream -c copy -f mpegts - | truss-dmxmon ts -
 
 The relay can send every record it builds to an OSC listener as well as into
 the video, so the desk's output can be watched in a tool on the same network
-with no encoder, ingest or player up:
+with nothing else running:
 
 ```sh
-truss-relay --ingest ingest.example.net:1935 --stream-key-file key.txt --artnet --osc 127.0.0.1:12100
+truss-relay --publish rtmp://ingest.example.net/live --stream-key-file key.txt --artnet --osc 127.0.0.1:12100
 truss-dmxmon osc --universe 0
 ```
 
 Each record goes out as one OSC message, `/truss/dmx`, with the record as its
-single blob argument: the same bytes, framing and CRC the stream carries, so a
+single blob argument, framed and CRC-checked as the stream's records are, so a
 listener decodes it with the same code and sees the same universes and ages.
-While a publisher is connected the lane carries exactly the records the stream
-carries, budget rotation included, at the video's frame rate. With no publisher
-it builds records from the Art-Net latch at `--osc-rate`, 30 a second by
-default. The port is 12100 by default, clear of Art-Net, the VRSL Grid Node and
-QLC+.
+While a publisher is connected the lane carries the payload of every record
+the stream carries, budget rotation included, at the video's frame rate. With
+no publisher it builds records from the Art-Net latch at `--osc-rate`, 30 a
+second by default. The lane numbers its records itself, so a listener scores
+loss and order on the lane rather than on the stream. The port is 12100 by
+default, clear of Art-Net, the VRSL Grid Node and QLC+.
 
-`truss-detect osc --max-seconds 10` scores the lane the way it scores a stream,
-and is the reference a stream's figures are judged against: nothing on this
-path crosses a CDN, so a record missing here never left the relay.
+`truss-detect osc --max-seconds 10` scores the lane the way it scores a stream.
+Nothing on this path crosses a CDN, so a gap here is the relay's, and a gap
+only in the stream is the path's.
 
 ## With no ingest to point at
 
@@ -155,7 +166,7 @@ single machine. Three terminals, started in this order:
 
 ```sh
 ffmpeg -listen 1 -f flv -i rtmp://127.0.0.1:1936/live -c copy -f mpegts egress.ts
-truss-relay --listen 127.0.0.1:1935 --ingest 127.0.0.1:1936 --stream-key-file key.txt
+truss-relay --listen 127.0.0.1:1935 --publish rtmp://127.0.0.1:1936/live --stream-key-file key.txt
 ffmpeg -re -i source.mp4 -c:v libx264 -f flv rtmp://127.0.0.1:1935/live/anykey
 ```
 
@@ -184,7 +195,9 @@ Truss resolves the key in this order:
 An RTMP publish URL is `rtmp://host/app/<key>`, so the key is the URL. Truss
 holds the host, the application and the key separately, composes the URL only at
 the point of connecting, and passes anything it prints through a redactor first,
-including child process output.
+including child process output. For the same reason `--publish` stops at the
+application: a URL carrying a further segment, a query, a fragment or a user
+and password is refused, and the refusal does not repeat it.
 
 The redactor exists because the leak is not something a caller can avoid by
 being careful. ffmpeg writes the publish URL to its own stderr, and that output
@@ -197,7 +210,7 @@ A systemd unit:
 ```ini
 [Service]
 LoadCredential=key:/etc/truss/stream.key
-ExecStart=/usr/local/bin/truss-relay --ingest ingest.example.net:1935 \
+ExecStart=/usr/local/bin/truss-relay --publish rtmp://ingest.example.net/live \
           --stream-key-file %d/key --artnet
 ```
 
@@ -222,8 +235,8 @@ never arrived. Those are separate faults with separate causes.
 
 ## Bitrate cost
 
-The lane shares a bitrate ceiling with the picture, so the cost of a given patch
-is worth establishing before committing to it.
+The lane shares a bitrate ceiling with the picture, so find out what a given
+patch costs before committing to it.
 
 A full snapshot is 8 bytes of header plus 522 for each universe, that being 512
 channels and a 10 byte block header. At 30 frames per second, transmitting every
@@ -293,6 +306,12 @@ egress on a remuxing CDN: no loss in steady state, no corruption, payloads to
 10,448 bytes per frame, a median end to end latency of around 112 ms, and 47,038
 consecutive frames across half an hour without a gap. Live desk data has run the
 full path at twenty universes.
+
+Discovery has been exercised against SoundSwitch on the relay's own machine,
+which lists the node and delivers both its universes with no address given. The
+OSC lane has run at the set rate with no publisher and at the video's frame rate
+with one, with no gaps on loopback, into the VRSL-URP source and into
+`truss-detect`.
 
 Nothing longer than a thirty minute publish has been measured, and nothing on a
 degraded uplink.

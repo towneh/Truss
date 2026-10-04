@@ -16,7 +16,119 @@ use std::collections::VecDeque;
 use std::io::{ErrorKind, Write};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
+
+pub const DEFAULT_RTMP_PORT: u16 = 1935;
+pub const DEFAULT_APP: &str = "live";
+
+/// Where the relay publishes: an RTMP host and port, and the application.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Ingest {
+    /// `host:port`, the port filled in when the operator left it out.
+    pub authority: String,
+    pub app: String,
+}
+
+impl Ingest {
+    /// Read `--publish`: `rtmp://host[:port]/app`, the port 1935 unless
+    /// given and the application `live` unless given.
+    ///
+    /// The application is the only path the URL may carry. The stream key
+    /// rides nowhere on the command line, so a URL with a second path
+    /// segment, a query, a fragment or a user and password is refused, and
+    /// refused without being echoed: an argument is visible to anything that
+    /// can list processes, and so is an error message that repeats it.
+    pub fn parse(publish: &str) -> Result<Self> {
+        let Some((scheme, rest)) = publish.trim().split_once("://") else {
+            bail!(
+                "--publish is a URL: rtmp://host/app, with the port after the host when it is not 1935"
+            );
+        };
+        match scheme.to_ascii_lowercase().as_str() {
+            "rtmp" => {}
+            "rtmps" => bail!(
+                "rtmps:// is not supported: the relay speaks plain RTMP, so give rtmp://host/app"
+            ),
+            other => bail!("--publish {other}:// is not understood; give rtmp://host/app"),
+        }
+        if rest.contains('?') || rest.contains('#') {
+            bail!(
+                "--publish carries a query or a fragment, which is where some services put \
+                 the stream key. Give the application only, rtmp://host/app, and the key \
+                 through --stream-key-file"
+            );
+        }
+        let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
+        if authority.contains('@') {
+            bail!(
+                "--publish carries a user and password before the host, which the relay \
+                 cannot pass on and will not print. Give rtmp://host/app and the key \
+                 through --stream-key-file"
+            );
+        }
+        let authority = parse_authority(authority)?;
+        let mut segments = path.split('/').filter(|s| !s.is_empty());
+        let app = segments.next().unwrap_or(DEFAULT_APP);
+        if segments.next().is_some() {
+            bail!(
+                "--publish carries more than the application, which is where the stream key \
+                 goes in a publish URL. Give rtmp://host/app and the key through \
+                 --stream-key-file"
+            );
+        }
+        Ok(Self {
+            authority,
+            app: app.to_string(),
+        })
+    }
+
+    pub fn url(&self) -> String {
+        format!("rtmp://{}/{}", self.authority, self.app)
+    }
+}
+
+/// `host:port` from what stood between the scheme and the path: a host name
+/// or address, an IPv6 address in brackets, and a port a socket can be given,
+/// 1935 unless one is written.
+fn parse_authority(authority: &str) -> Result<String> {
+    let (host, port) = if let Some(rest) = authority.strip_prefix('[') {
+        let Some((inside, after)) = rest.split_once(']') else {
+            bail!("--publish has an IPv6 address with no closing bracket");
+        };
+        inside.parse::<std::net::Ipv6Addr>().map_err(|_| {
+            anyhow!("--publish has {inside:?} in brackets, which is not an IPv6 address")
+        })?;
+        let port = match after {
+            "" => None,
+            p => Some(p.strip_prefix(':').ok_or_else(|| {
+                anyhow!("--publish has {after:?} after the address, where only :port may follow")
+            })?),
+        };
+        (format!("[{inside}]"), port)
+    } else {
+        match authority.rsplit_once(':') {
+            Some((head, _)) if head.contains(':') => {
+                bail!("--publish has an IPv6 address without brackets; write it as [address]:port")
+            }
+            Some((host, port)) => (host.to_string(), Some(port)),
+            None => (authority.to_string(), None),
+        }
+    };
+    if host.is_empty() {
+        bail!("--publish names no host");
+    }
+    let hostname = |b: u8| b.is_ascii_alphanumeric() || b == b'-' || b == b'.';
+    if !host.starts_with('[') && !host.bytes().all(hostname) {
+        bail!("--publish has {host:?} as the host, which is not a host name or an address");
+    }
+    let port = match port {
+        None => DEFAULT_RTMP_PORT,
+        Some(p) => p.parse::<u16>().ok().filter(|&n| n != 0).ok_or_else(|| {
+            anyhow!("--publish has {p:?} as the port, which is not a port number")
+        })?,
+    };
+    Ok(format!("{host}:{port}"))
+}
 
 /// Compaction threshold. Below this, consumed bytes are left in place and the
 /// read cursor walks forward; above it the front is discarded, so a long-lived
@@ -323,5 +435,87 @@ mod tests {
     fn an_empty_meter_reads_zero_rather_than_dividing_by_nothing() {
         let meter = RateMeter::new();
         assert_eq!(meter.kbps(), 0.0);
+    }
+
+    #[test]
+    fn a_publish_url_names_host_port_and_application() {
+        let i = Ingest::parse("rtmp://ingest.example.net/live").unwrap();
+        assert_eq!(i.authority, "ingest.example.net:1935");
+        assert_eq!(i.app, "live");
+        assert_eq!(i.url(), "rtmp://ingest.example.net:1935/live");
+
+        let i = Ingest::parse("RTMP://127.0.0.1:1936/show/").unwrap();
+        assert_eq!(i.authority, "127.0.0.1:1936");
+        assert_eq!(i.app, "show");
+
+        let i = Ingest::parse("rtmp://ingest.example.net").unwrap();
+        assert_eq!(i.app, "live", "the application when the URL names none");
+
+        let i = Ingest::parse("rtmp://[::1]/live").unwrap();
+        assert_eq!(i.authority, "[::1]:1935");
+        let i = Ingest::parse("rtmp://[::1]:1936/live").unwrap();
+        assert_eq!(i.authority, "[::1]:1936");
+    }
+
+    #[test]
+    fn a_bare_host_is_told_what_a_publish_url_looks_like() {
+        let e = Ingest::parse("ingest.example.net:1935")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("rtmp://host/app"), "{e}");
+    }
+
+    #[test]
+    fn anything_that_could_carry_the_key_is_refused_and_not_repeated() {
+        for url in [
+            "rtmp://ingest.example.net/live/sk_secret_123",
+            "rtmp://ingest.example.net/live?key=sk_secret_123",
+            "rtmp://ingest.example.net/live#sk_secret_123",
+            "rtmp://user:sk_secret_123@ingest.example.net/live",
+        ] {
+            let e = Ingest::parse(url).unwrap_err().to_string();
+            assert!(e.contains("--stream-key-file"), "{url}: {e}");
+            assert!(
+                !e.contains("sk_secret"),
+                "the error must not echo the key: {e}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_wrong_scheme_or_no_host_is_refused() {
+        assert!(
+            Ingest::parse("rtmps://ingest.example.net/live")
+                .unwrap_err()
+                .to_string()
+                .contains("rtmps"),
+        );
+        assert!(
+            Ingest::parse("http://ingest.example.net/live")
+                .unwrap_err()
+                .to_string()
+                .contains("not understood"),
+        );
+        for url in ["rtmp:///live", "rtmp://:1935/live"] {
+            let e = Ingest::parse(url).unwrap_err().to_string();
+            assert!(e.contains("names no host"), "{url}: {e}");
+        }
+    }
+
+    #[test]
+    fn a_host_or_port_that_a_socket_could_not_be_given_is_refused_by_name() {
+        for (url, says) in [
+            ("rtmp://ingest.example.net:70000/live", "not a port number"),
+            ("rtmp://ingest.example.net:0/live", "not a port number"),
+            ("rtmp://ingest.example.net:abc/live", "not a port number"),
+            ("rtmp://::1/live", "without brackets"),
+            ("rtmp://[not-an-address]/live", "not an IPv6 address"),
+            ("rtmp://[::1]x/live", "after the address"),
+            ("rtmp://[::1/live", "no closing bracket"),
+            ("rtmp://bad host/live", "not a host name"),
+        ] {
+            let e = Ingest::parse(url).unwrap_err().to_string();
+            assert!(e.contains(says), "{url}: {e}");
+        }
     }
 }
