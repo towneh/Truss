@@ -36,6 +36,7 @@ jobs:
           - payload_decode
           - artnet_packet
           - artnet_poll
+          - osc_message
           - h264_nals
     steps:
       - uses: actions/checkout@v4

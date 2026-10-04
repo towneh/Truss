@@ -292,6 +292,38 @@ fn the_artnet_latch_honours_its_budget() {
 }
 
 #[test]
+fn the_osc_lane_frames_any_blob_and_reads_any_datagram() {
+    each_case(
+        "osc_message",
+        400,
+        |rng| {
+            // Half the cases are raw bytes to frame; half are a message to
+            // read, damaged in the usual ways.
+            if rng.below(2) == 0 {
+                let n = rng.below(600);
+                return rng.bytes(n);
+            }
+            let address = ["/truss/dmx", "/x", "/a/b/c", "#bundle"][rng.below(4)];
+            let mut m = address.as_bytes().to_vec();
+            m.push(0);
+            while !m.len().is_multiple_of(4) {
+                m.push(0);
+            }
+            m.extend_from_slice(b",b\0\0");
+            let n = rng.below(300);
+            let blob = rng.bytes(n);
+            m.extend_from_slice(&(blob.len() as u32).to_be_bytes());
+            m.extend_from_slice(&blob);
+            while !m.len().is_multiple_of(4) {
+                m.push(0);
+            }
+            mutate(rng, &m.clone())
+        },
+        invariants::osc_message,
+    );
+}
+
+#[test]
 fn a_poll_is_answered_with_a_well_formed_reply() {
     each_case(
         "artnet_poll",

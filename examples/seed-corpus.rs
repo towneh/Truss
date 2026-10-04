@@ -44,6 +44,7 @@ fn main() -> std::io::Result<()> {
     )?;
     write(root, "artnet_packet", &artnet_seeds(), inv::artnet_packet)?;
     write(root, "artnet_poll", &artnet_poll_seeds(), inv::artnet_poll)?;
+    write(root, "osc_message", &osc_seeds(), inv::osc_message)?;
     write(root, "h264_nals", &h264_seeds(), inv::h264_nals)?;
 
     Ok(())
@@ -255,6 +256,18 @@ fn artnet_poll_seeds() -> Vec<Vec<u8>> {
     targeted.extend_from_slice(&[0x00, 0x20, 0x00, 0x0E, 0x20, 0x00]); // targeted mode
     targeted.extend_from_slice(&[0x00, 0x0F, 0x00, 0x00]); // port addresses 0 to 15
     vec![plain, targeted]
+}
+
+fn osc_seeds() -> Vec<Vec<u8>> {
+    // A real record on the lane, an empty blob, and a bundle to be refused.
+    let record = Record::with_payload(Carrier::Osc.id(), 1, 2, 3, payload_seeds().remove(0));
+    let framed = Carrier::Osc.frame(&record).expect("a record frames");
+    let empty = truss::osc::encode_blob(truss::osc::ADDRESS, b"").expect("an empty blob frames");
+    let mut bundle = b"#bundle\0".to_vec();
+    bundle.extend_from_slice(&[0; 8]);
+    bundle.extend_from_slice(&(framed.len() as u32).to_be_bytes());
+    bundle.extend_from_slice(&framed);
+    vec![framed, empty, bundle]
 }
 
 fn h264_seeds() -> Vec<Vec<u8>> {

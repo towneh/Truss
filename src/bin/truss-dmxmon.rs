@@ -16,6 +16,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use std::io::ErrorKind;
+use std::net::UdpSocket;
 use truss::carrier::Carrier;
 use truss::detect::ts::TsAnalyzer;
 use truss::h264;
@@ -50,6 +52,14 @@ enum Cmd {
         url: String,
         #[arg(long, default_value = "tcp")]
         transport: String,
+        #[command(flatten)]
+        common: Common,
+    },
+    /// Listen for the relay's OSC lane: /truss/dmx messages carrying records.
+    Osc {
+        /// Address to listen on.
+        #[arg(default_value_t = format!("0.0.0.0:{}", truss::osc::DEFAULT_PORT))]
+        listen: String,
         #[command(flatten)]
         common: Common,
     },
@@ -144,6 +154,7 @@ fn main() -> Result<()> {
             transport,
             common,
         } => (Input::Rtsp { url, transport }, common),
+        Cmd::Osc { listen, common } => return watch_osc(&listen, &common),
     };
     let watches = common
         .watch
@@ -159,19 +170,12 @@ fn main() -> Result<()> {
     // the age of the file.
     let live = src.freshness == Freshness::Live;
     let mut ts = TsAnalyzer::new();
-    let mut state = DmxState::default();
+    let mut tally = Tally::new(watches);
     let mut buf = vec![0u8; 64 * 1024];
 
     let started = Instant::now();
     let mut last_report = Instant::now();
     let interval = Duration::from_secs_f64(common.interval.max(0.1));
-    // Records and changes since the last status line, so the rates describe now
-    // rather than the average since the tool started.
-    let mut window = Window::default();
-    let mut totals = Window::default();
-    let mut watched: BTreeMap<(u16, u16), u8> = BTreeMap::new();
-    let mut malformed = 0u64;
-    let mut out_of_range = 0u64;
 
     println!("reading {}...", describe(&input));
 
@@ -194,28 +198,12 @@ fn main() -> Result<()> {
                 continue;
             }
             for payload in records_in(&unit.data) {
-                match truss::payload::decode(&payload) {
-                    Ok(blocks) => {
-                        let applied = state.apply(&blocks);
-                        window.records += 1;
-                        window.changed += applied.changed as u64;
-                        totals.records += 1;
-                        totals.changed += applied.changed as u64;
-                        out_of_range += applied.out_of_range as u64;
-                        report_watches(&state, &watches, &mut watched);
-                    }
-                    Err(_) => malformed += 1,
-                }
+                tally.absorb(&payload);
             }
         }
 
         if live && last_report.elapsed() >= interval {
-            let secs = last_report.elapsed().as_secs_f64();
-            print_status(&state, &window, secs, live, malformed, out_of_range);
-            if let Some(u) = common.universe {
-                print_universe(&state, u);
-            }
-            window = Window::default();
+            tally.status(last_report.elapsed().as_secs_f64(), live, common.universe);
             last_report = Instant::now();
         }
     }
@@ -224,18 +212,146 @@ fn main() -> Result<()> {
         "\nstream ended after {:.1}s",
         started.elapsed().as_secs_f64()
     );
-    print_status(
-        &state,
-        &totals,
-        started.elapsed().as_secs_f64(),
-        live,
-        malformed,
-        out_of_range,
-    );
-    if let Some(u) = common.universe {
-        print_universe(&state, u);
-    }
+    tally.finish(started.elapsed().as_secs_f64(), live, common.universe);
     Ok(())
+}
+
+/// Watch the relay's OSC lane instead of a stream: the same records, sent
+/// to a socket as they are built, so a desk can be watched with no encoder,
+/// ingest or player running.
+fn watch_osc(listen: &str, common: &Common) -> Result<()> {
+    let watches = common
+        .watch
+        .as_deref()
+        .map(parse_watch)
+        .transpose()?
+        .unwrap_or_default();
+    let socket = UdpSocket::bind(listen).with_context(|| format!("binding {listen}"))?;
+    socket.set_read_timeout(Some(Duration::from_millis(200)))?;
+    let mut tally = Tally::new(watches);
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut not_ours = 0u64;
+
+    let started = Instant::now();
+    let mut last_report = Instant::now();
+    let interval = Duration::from_secs_f64(common.interval.max(0.1));
+
+    println!(
+        "listening on {} for {}...",
+        socket.local_addr()?,
+        truss::osc::ADDRESS
+    );
+
+    loop {
+        if let Some(secs) = common.max_seconds
+            && started.elapsed().as_secs() >= secs
+        {
+            break;
+        }
+        match socket.recv_from(&mut buf) {
+            Ok((n, _)) => match truss::osc::decode_blob(&buf[..n]) {
+                Some((address, blob)) if address == truss::osc::ADDRESS => {
+                    match Record::decode(blob) {
+                        Ok(record) => tally.absorb(&record.payload),
+                        Err(_) => tally.malformed += 1,
+                    }
+                }
+                _ => not_ours += 1,
+            },
+            Err(ref e)
+                if matches!(
+                    e.kind(),
+                    ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::ConnectionReset
+                ) => {}
+            Err(e) => return Err(e).context("reading the OSC socket"),
+        }
+
+        if last_report.elapsed() >= interval {
+            tally.status(last_report.elapsed().as_secs_f64(), true, common.universe);
+            if not_ours > 0 {
+                println!(
+                    "  [{not_ours} datagrams that were not {}]",
+                    truss::osc::ADDRESS
+                );
+            }
+            last_report = Instant::now();
+        }
+    }
+
+    println!("\nstopped after {:.1}s", started.elapsed().as_secs_f64());
+    tally.finish(started.elapsed().as_secs_f64(), true, common.universe);
+    Ok(())
+}
+
+/// The DMX state and the counts around it, fed one record payload at a time.
+struct Tally {
+    state: DmxState,
+    /// Records and changes since the last status line, so the rates describe
+    /// now rather than the average since the tool started.
+    window: Window,
+    totals: Window,
+    watches: Vec<Watch>,
+    watched: BTreeMap<(u16, u16), u8>,
+    malformed: u64,
+    out_of_range: u64,
+}
+
+impl Tally {
+    fn new(watches: Vec<Watch>) -> Self {
+        Self {
+            state: DmxState::default(),
+            window: Window::default(),
+            totals: Window::default(),
+            watches,
+            watched: BTreeMap::new(),
+            malformed: 0,
+            out_of_range: 0,
+        }
+    }
+
+    fn absorb(&mut self, payload: &[u8]) {
+        match truss::payload::decode(payload) {
+            Ok(blocks) => {
+                let applied = self.state.apply(&blocks);
+                self.window.records += 1;
+                self.window.changed += applied.changed as u64;
+                self.totals.records += 1;
+                self.totals.changed += applied.changed as u64;
+                self.out_of_range += applied.out_of_range as u64;
+                report_watches(&self.state, &self.watches, &mut self.watched);
+            }
+            Err(_) => self.malformed += 1,
+        }
+    }
+
+    fn status(&mut self, secs: f64, live: bool, universe: Option<u16>) {
+        print_status(
+            &self.state,
+            &self.window,
+            secs,
+            live,
+            self.malformed,
+            self.out_of_range,
+        );
+        if let Some(u) = universe {
+            print_universe(&self.state, u);
+        }
+        self.window = Window::default();
+    }
+
+    fn finish(&self, secs: f64, live: bool, universe: Option<u16>) {
+        print_status(
+            &self.state,
+            &self.totals,
+            secs,
+            live,
+            self.malformed,
+            self.out_of_range,
+        );
+        if let Some(u) = universe {
+            print_universe(&self.state, u);
+        }
+    }
 }
 
 #[derive(Default)]

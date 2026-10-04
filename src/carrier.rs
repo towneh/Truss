@@ -8,6 +8,7 @@
 //! SRT ingest, so it is absent here by necessity rather than by choice.
 
 use crate::h264;
+use crate::osc;
 use crate::record::{EncodeError, Record};
 use serde::Serialize;
 
@@ -38,6 +39,10 @@ pub enum Class {
     /// Rides in the RTMP container alongside the media. Has no defined mapping
     /// into MPEG-TS or RTP, so egress-dependent by construction.
     Container,
+    /// Sent on its own socket beside the stream, never inside it. Reaches a
+    /// listener on the network, not a viewer of the stream, so no CDN is
+    /// involved and nothing about its survival says anything about one.
+    Network,
 }
 
 /// Where an in-video carrier's NAL belongs within the access unit.
@@ -64,14 +69,28 @@ pub enum Carrier {
     AmfMetadataKey,
     /// Filler-data NAL (type 12) with a non-conformant body.
     FillerNal,
+    /// An OSC message, `/truss/dmx`, with the record as its one blob argument.
+    Osc,
 }
 
+/// The carriers that go into a stream, which is what the relay and the
+/// injector choose between.
 pub const ALL: [Carrier; 5] = [
     Carrier::SeiUnregistered,
     Carrier::SeiT35,
     Carrier::AmfCustom,
     Carrier::AmfMetadataKey,
     Carrier::FillerNal,
+];
+
+/// Every carrier a record can arrive by, which is what a detector reports on.
+pub const EVERY: [Carrier; 6] = [
+    Carrier::SeiUnregistered,
+    Carrier::SeiT35,
+    Carrier::AmfCustom,
+    Carrier::AmfMetadataKey,
+    Carrier::FillerNal,
+    Carrier::Osc,
 ];
 
 impl Carrier {
@@ -82,11 +101,12 @@ impl Carrier {
             Self::AmfCustom => 3,
             Self::AmfMetadataKey => 4,
             Self::FillerNal => 5,
+            Self::Osc => 6,
         }
     }
 
     pub fn from_id(id: u8) -> Option<Self> {
-        ALL.into_iter().find(|c| c.id() == id)
+        EVERY.into_iter().find(|c| c.id() == id)
     }
 
     pub fn slug(self) -> &'static str {
@@ -96,6 +116,7 @@ impl Carrier {
             Self::AmfCustom => "amf-custom",
             Self::AmfMetadataKey => "amf-onmeta",
             Self::FillerNal => "filler-nal",
+            Self::Osc => "osc",
         }
     }
 
@@ -103,6 +124,7 @@ impl Carrier {
         match self {
             Self::SeiUnregistered | Self::SeiT35 | Self::FillerNal => Class::InVideoEs,
             Self::AmfCustom | Self::AmfMetadataKey => Class::Container,
+            Self::Osc => Class::Network,
         }
     }
 
@@ -122,14 +144,16 @@ impl Carrier {
             Self::AmfCustom => "custom AMF0 data message",
             Self::AmfMetadataKey => "extra key inside onMetaData",
             Self::FillerNal => "filler-data NAL (type 12), non-conformant body",
+            Self::Osc => "OSC message /truss/dmx, record as a blob",
         }
     }
 
-    /// Enabled unless the user opts in explicitly. Only the filler-NAL carrier
-    /// is off by default: its body violates the filler RBSP rule, so a strict
-    /// decoder downstream is entitled to reject the stream.
+    /// Enabled unless the user opts in explicitly. The filler-NAL carrier is
+    /// off by default: its body violates the filler RBSP rule, so a strict
+    /// decoder downstream is entitled to reject the stream. OSC is not a
+    /// stream carrier at all and is switched on by naming a listener.
     pub fn default_enabled(self) -> bool {
-        !matches!(self, Self::FillerNal)
+        !matches!(self, Self::FillerNal | Self::Osc)
     }
 
     /// Wrap an encoded record in this carrier's framing.
@@ -155,6 +179,7 @@ impl Carrier {
             }
             Self::FillerNal => h264::build_filler_nal(&body),
             Self::AmfCustom | Self::AmfMetadataKey => hex_encode(&body).into_bytes(),
+            Self::Osc => osc::encode_blob(osc::ADDRESS, &body)?,
         })
     }
 

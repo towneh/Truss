@@ -123,6 +123,30 @@ on the way in:
 ffmpeg -i rtmp://your-egress/live/stream -c copy -f mpegts - | truss-dmxmon ts -
 ```
 
+## Watching the desk with nothing else running
+
+The relay can send every record it builds to an OSC listener as well as into
+the video, so the desk's output can be watched in a tool on the same network
+with no encoder, ingest or player up:
+
+```sh
+truss-relay --ingest ingest.example.net:1935 --stream-key-file key.txt --artnet --osc 127.0.0.1:12100
+truss-dmxmon osc --universe 0
+```
+
+Each record goes out as one OSC message, `/truss/dmx`, with the record as its
+single blob argument: the same bytes, framing and CRC the stream carries, so a
+listener decodes it with the same code and sees the same universes and ages.
+While a publisher is connected the lane carries exactly the records the stream
+carries, budget rotation included, at the video's frame rate. With no publisher
+it builds records from the Art-Net latch at `--osc-rate`, 30 a second by
+default. The port is 12100 by default, clear of Art-Net, the VRSL Grid Node and
+QLC+.
+
+`truss-detect osc --max-seconds 10` scores the lane the way it scores a stream,
+and is the reference a stream's figures are judged against: nothing on this
+path crosses a CDN, so a record missing here never left the relay.
+
 ## With no ingest to point at
 
 The relay can be exercised without a real one. ffmpeg will accept a publish on a

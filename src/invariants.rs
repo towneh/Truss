@@ -22,7 +22,7 @@ use crate::detect::scan::Scanner;
 use crate::detect::ts::{MAX_PES_TOTAL, TsAnalyzer};
 use crate::monitor::DmxState;
 use crate::record::{CRC_LEN, HEADER_LEN, MAX_PAYLOAD_LEN, Record};
-use crate::{artnet, flv, h264, payload};
+use crate::{artnet, flv, h264, osc, payload};
 
 /// Feed arbitrary bytes to the TS reader, in chunks the input chooses.
 ///
@@ -173,6 +173,35 @@ pub fn payload_decode(data: &[u8]) {
         second.changed, 0,
         "absolute values applied twice reported a change"
     );
+}
+
+/// Any bytes survive the OSC lane's framing, and any datagram reads without
+/// panicking.
+///
+/// The lane is a listener's only way to tell a record the relay sent from
+/// anything else on the port, so a message that reads back different from
+/// what went in, or a datagram that takes the reader down, would each be
+/// worse than a lost one.
+pub fn osc_message(data: &[u8]) {
+    let encoded = osc::encode_blob(osc::ADDRESS, data).expect("a blob this size frames");
+    assert!(
+        encoded.len().is_multiple_of(4),
+        "a message is padded to four"
+    );
+    let (address, blob) = osc::decode_blob(&encoded).expect("our own message reads back");
+    assert_eq!(address, osc::ADDRESS);
+    assert_eq!(blob, data, "the blob came back different");
+
+    // The input as a datagram: whatever it reads as, encoding that again
+    // must read the same, so the reader and the writer agree.
+    if let Some((address, blob)) = osc::decode_blob(data) {
+        let again = osc::encode_blob(address, blob).expect("a blob this size frames");
+        assert_eq!(
+            osc::decode_blob(&again),
+            Some((address, blob)),
+            "reader and writer disagree about the same message"
+        );
+    }
 }
 
 /// Anything that parses as an `ArtPoll` gets replies that are not mistakable

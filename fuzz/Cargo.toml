@@ -83,6 +83,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "osc_message"
+path = "fuzz_targets/osc_message.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "h264_nals"
 path = "fuzz_targets/h264_nals.rs"
 test = false

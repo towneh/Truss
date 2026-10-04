@@ -15,7 +15,7 @@
 //! carry a real send time and the detector's latency column works.
 
 use std::io::{ErrorKind, Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -32,6 +32,7 @@ use truss::artnet;
 use truss::carrier::{self, Carrier};
 use truss::creds;
 use truss::inject::{InjectOptions, Injector};
+use truss::osc;
 use truss::payload;
 use truss::record::{DEFAULT_PAYLOAD_LEN, MAX_PAYLOAD_LEN};
 use truss::relay::{OutBuf, RateMeter};
@@ -91,6 +92,16 @@ struct Cli {
     /// Relay without injecting, to measure what the relay itself costs.
     #[arg(long)]
     passthrough: bool,
+    /// Also send every record to this OSC listener, as /truss/dmx with the
+    /// record as a blob, so a tool on this network can watch the desk without
+    /// reading the stream. Needs --artnet.
+    #[arg(long)]
+    osc: Option<String>,
+    /// Records a second to send to --osc while no publisher is connected.
+    /// With one connected the lane carries the records the stream carries,
+    /// at the video's frame rate.
+    #[arg(long, default_value_t = 30.0)]
+    osc_rate: f64,
 }
 
 const DEFAULT_ARTNET_MAX_PAYLOAD: usize = 9216;
@@ -160,6 +171,24 @@ fn main() -> Result<()> {
         _ => None,
     };
 
+    let mut osc = match cli.osc.as_deref() {
+        Some(target) => {
+            if artnet.is_none() {
+                bail!("--osc carries the Art-Net lane, so it needs --artnet");
+            }
+            if !(cli.osc_rate.is_finite() && cli.osc_rate > 0.0) {
+                bail!("--osc-rate must be a positive number of records a second");
+            }
+            let addr = target
+                .to_socket_addrs()
+                .with_context(|| format!("resolving --osc {target:?}"))?
+                .next()
+                .ok_or_else(|| anyhow!("--osc {target:?} resolves to no address"))?;
+            Some(osc::Sender::to(addr).context("opening the OSC socket")?)
+        }
+        None => None,
+    };
+
     let listener =
         TcpListener::bind(&cli.listen).with_context(|| format!("binding {}", cli.listen))?;
     println!(
@@ -206,18 +235,41 @@ fn main() -> Result<()> {
         }
     }
 
+    if let Some(o) = osc.as_ref() {
+        println!("  OSC to {} as {}", o.target(), osc::ADDRESS);
+    }
+
     listener
         .set_nonblocking(true)
         .context("setting the listener non-blocking")?;
     let mut idle = IdleStatus::default();
+    let tick = Duration::from_secs_f64(1.0 / cli.osc_rate);
+    let mut next_tick = Instant::now();
     loop {
         let stream = match listener.accept() {
             Ok((stream, _)) => stream,
             Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
                 if let Some(a) = artnet.as_ref() {
-                    idle.print(a);
+                    idle.print(a, osc.as_ref());
+                    // With no publisher the lane runs on its own clock, from
+                    // the latch, so a desk can be watched with nothing else up.
+                    if let Some(o) = osc.as_mut()
+                        && Instant::now() >= next_tick
+                    {
+                        let blocks = a.latch().snapshot(Instant::now(), cli.artnet_max_payload);
+                        if let Ok(body) = truss::payload::encode(&blocks) {
+                            o.send(&body, now_unix_nanos());
+                        }
+                        next_tick = Instant::now() + tick;
+                    }
                 }
-                std::thread::sleep(Duration::from_millis(200));
+                let nap = match osc {
+                    Some(_) => next_tick
+                        .saturating_duration_since(Instant::now())
+                        .min(Duration::from_millis(200)),
+                    None => Duration::from_millis(200),
+                };
+                std::thread::sleep(nap);
                 continue;
             }
             Err(e) => return Err(e).context("accepting connection"),
@@ -230,7 +282,14 @@ fn main() -> Result<()> {
             .map(|a| a.to_string())
             .unwrap_or_else(|_| "?".into());
         println!("\n-- publisher connected from {peer}");
-        match relay_one(stream, &cli, &carriers, artnet.as_ref(), key.as_ref()) {
+        match relay_one(
+            stream,
+            &cli,
+            &carriers,
+            artnet.as_ref(),
+            &mut osc,
+            key.as_ref(),
+        ) {
             Ok(()) => println!("-- session ended cleanly"),
             Err(e) => println!("-- session ended: {e:#}"),
         }
@@ -256,10 +315,11 @@ type IdleKey = (
     Option<String>,
     bool,
     bool,
+    bool,
 );
 
 impl IdleStatus {
-    fn print(&mut self, artnet: &artnet::Receiver) {
+    fn print(&mut self, artnet: &artnet::Receiver, osc: Option<&osc::Sender>) {
         if self
             .checked
             .is_some_and(|t| t.elapsed() < Duration::from_secs(1))
@@ -276,17 +336,29 @@ impl IdleStatus {
             latch.error.clone(),
             latch.reply_errors > 0,
             duplicate_senders(&latch),
+            osc.is_some_and(|o| o.failed > 0),
         );
         if self.last.as_ref() == Some(&key) {
             return;
         }
-        let (line, note) = artnet_status(&latch);
+        let (mut line, note) = artnet_status(&latch);
+        if let Some(o) = osc {
+            line.push_str(&osc_status(o));
+        }
         println!("waiting for a publisher {line}");
         if let Some(note) = note {
             println!("  {note}");
         }
         self.last = Some(key);
     }
+}
+
+fn osc_status(o: &osc::Sender) -> String {
+    let mut s = format!("  osc {} sent", o.sent);
+    if o.failed > 0 {
+        s.push_str(&format!(" ({} failed)", o.failed));
+    }
+    s
 }
 
 /// Two senders on one universe each put the other's packets behind their
@@ -362,6 +434,7 @@ fn relay_one(
     cli: &Cli,
     carriers: &[Carrier],
     artnet: Option<&artnet::Receiver>,
+    osc: &mut Option<osc::Sender>,
     key: Option<&creds::StreamKey>,
 ) -> Result<()> {
     obs.set_nodelay(true).ok();
@@ -416,6 +489,7 @@ fn relay_one(
                 &mut meter,
                 cli,
                 artnet,
+                osc,
             )?;
         }
 
@@ -444,6 +518,7 @@ fn relay_one(
                                 &mut meter,
                                 cli,
                                 artnet,
+                                osc,
                             )?;
                         }
                         ServerSessionResult::UnhandleableMessageReceived(_) => {}
@@ -537,7 +612,7 @@ fn relay_one(
         if last_report.elapsed() >= Duration::from_secs(5) {
             last_report = Instant::now();
             let queued = upstream.as_ref().map_or(0, |u| u.out.pending());
-            report(&meter, injector.as_ref(), cli, queued, artnet)?;
+            report(&meter, injector.as_ref(), cli, queued, artnet, osc.as_ref())?;
         }
 
         if idle {
@@ -545,7 +620,7 @@ fn relay_one(
         }
     }
 
-    report(&meter, injector.as_ref(), cli, 0, artnet)?;
+    report(&meter, injector.as_ref(), cli, 0, artnet, osc.as_ref())?;
     Ok(())
 }
 
@@ -559,6 +634,7 @@ fn handle_publisher_event(
     meter: &mut RateMeter,
     cli: &Cli,
     artnet: Option<&artnet::Receiver>,
+    osc: &mut Option<osc::Sender>,
 ) -> Result<()> {
     match event {
         ServerSessionEvent::ConnectionRequested { request_id, .. } => {
@@ -622,7 +698,16 @@ fn handle_publisher_event(
                         // probe data instead of its lighting.
                         let rewritten = match dmx {
                             Some(Ok(bytes)) => {
-                                inj.inject_tag_with(&data, now_unix_nanos(), Some(&bytes))?
+                                let now = now_unix_nanos();
+                                let rewritten = inj.inject_tag_with(&data, now, Some(&bytes))?;
+                                // The lane carries what the stream carries, so a
+                                // frame the injector left alone gets no record.
+                                if rewritten.is_some()
+                                    && let Some(o) = osc.as_mut()
+                                {
+                                    o.send(&bytes, now);
+                                }
+                                rewritten
                             }
                             Some(Err(_)) => None,
                             None => inj.inject_tag_with(&data, now_unix_nanos(), None)?,
@@ -862,6 +947,7 @@ fn report(
     cli: &Cli,
     queued_bytes: usize,
     artnet: Option<&artnet::Receiver>,
+    osc: Option<&osc::Sender>,
 ) -> Result<()> {
     let kbps = meter.kbps();
     if kbps <= 0.0 {
@@ -888,6 +974,9 @@ fn report(
         line.push(' ');
         line.push_str(&fragment);
         artnet_note = note;
+    }
+    if let Some(o) = osc {
+        line.push_str(&osc_status(o));
     }
     if queued_bytes > 64 * 1024 {
         // A persistent queue means the upload is not keeping up, which shows

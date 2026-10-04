@@ -13,10 +13,12 @@ use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
+use std::io::ErrorKind;
+use std::net::UdpSocket;
 use truss::detect::scan::{ScanReport, Scanner};
 use truss::detect::ts::{PesUnit, TsAnalyzer};
 use truss::source::{self, Freshness, Input, Source, Transport};
@@ -75,6 +77,18 @@ enum Cmd {
         #[command(flatten)]
         common: Common,
     },
+    /// Listen for the relay's OSC lane: /truss/dmx messages carrying records.
+    ///
+    /// A socket has no end, so --max-seconds says when to stop. Nothing here
+    /// crosses a CDN, so what this scores is the relay's output as sent, which
+    /// is the reference the stream's figures are judged against.
+    Osc {
+        /// Address to listen on.
+        #[arg(default_value_t = format!("0.0.0.0:{}", truss::osc::DEFAULT_PORT))]
+        listen: String,
+        #[command(flatten)]
+        common: Common,
+    },
 }
 
 fn now_unix_nanos() -> u64 {
@@ -107,7 +121,77 @@ fn main() -> Result<()> {
             let out = analyse(&mut src, &common)?;
             finish(&out, &common, Some(amf))
         }
+        Cmd::Osc { listen, common } => {
+            let out = analyse_osc(&listen, &common)?;
+            finish(&out, &common, None)
+        }
     }
+}
+
+/// What arrived on the OSC socket, record or not.
+#[derive(Default, serde::Serialize)]
+struct Datagrams {
+    received: u64,
+    bytes: u64,
+    /// Datagrams that were not a /truss/dmx message with one blob: another
+    /// OSC sender on the port, or something that is not OSC at all.
+    not_ours: u64,
+}
+
+fn analyse_osc(listen: &str, common: &Common) -> Result<Outcome> {
+    let Some(secs) = common.max_seconds else {
+        bail!("osc needs --max-seconds: a socket has no end to read to");
+    };
+    if common.save.is_some() {
+        bail!("--save keeps a stream capture; the OSC lane has no stream to keep");
+    }
+    let socket = UdpSocket::bind(listen).with_context(|| format!("binding {listen}"))?;
+    socket.set_read_timeout(Some(Duration::from_millis(200)))?;
+    println!(
+        "listening on {} for {}...",
+        socket.local_addr()?,
+        truss::osc::ADDRESS
+    );
+
+    let mut scanner = Scanner::new();
+    let mut datagrams = Datagrams::default();
+    let mut buf = vec![0u8; 64 * 1024];
+    let started = Instant::now();
+    let byte_limit = common.max_mb.map(|m| m * 1024 * 1024);
+    while started.elapsed().as_secs() < secs {
+        if byte_limit.is_some_and(|limit| datagrams.bytes >= limit) {
+            break;
+        }
+        let n = match socket.recv_from(&mut buf) {
+            Ok((n, _)) => n,
+            Err(ref e)
+                if matches!(
+                    e.kind(),
+                    ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::ConnectionReset
+                ) =>
+            {
+                continue;
+            }
+            Err(e) => return Err(e).context("reading the OSC socket"),
+        };
+        datagrams.received += 1;
+        datagrams.bytes += n as u64;
+        match truss::osc::decode_blob(&buf[..n]) {
+            Some((address, blob)) if address == truss::osc::ADDRESS => {
+                scanner.feed_framed(truss::carrier::Carrier::Osc, blob, now_unix_nanos());
+            }
+            _ => datagrams.not_ours += 1,
+        }
+    }
+
+    Ok(Outcome {
+        elapsed: started.elapsed().as_secs_f64(),
+        report: scanner.into_report(),
+        ts: TsAnalyzer::new(),
+        transport: Transport::Direct,
+        freshness: Freshness::Live,
+        datagrams: Some(datagrams),
+    })
 }
 
 struct Outcome {
@@ -116,6 +200,8 @@ struct Outcome {
     elapsed: f64,
     transport: Transport,
     freshness: Freshness,
+    /// Present when the input was the OSC socket rather than a stream.
+    datagrams: Option<Datagrams>,
 }
 
 /// Ask ffprobe for the container tags. The `amf-onmeta` carrier rides as an
@@ -216,6 +302,7 @@ fn read_into(
         ts,
         transport: src.transport,
         freshness: src.freshness,
+        datagrams: None,
     })
 }
 
@@ -268,6 +355,7 @@ fn finish(
             "undeclared_pids": ts.undeclared_pids(),
         },
         "amf_tags": amf_tags,
+        "datagrams": out.datagrams,
         "scan": out.report,
     });
     std::fs::write(path, serde_json::to_vec_pretty(&doc)?)
@@ -285,87 +373,98 @@ fn print_summary(out: &Outcome, amf_tags: Option<&BTreeMap<String, String>>) {
         0.0
     };
 
-    println!("== transport ==");
-    if out.transport == Transport::ViaFfmpeg {
-        println!("  (read through ffmpeg: these numbers describe ffmpeg's muxer,");
-        println!("   not the CDN's. Only the bitstream section below is the CDN's.)");
-    }
-    println!(
-        "  {:.1} s, {} packets, {:.2} MB, {:.2} Mb/s",
-        out.elapsed,
-        ts.stats.packets,
-        ts.stats.bytes as f64 / 1e6,
-        mbits
-    );
-    println!(
-        "  resync {} B, continuity errors {}, scrambled {}, pes overflow drops {}",
-        ts.stats.resync_bytes,
-        ts.stats.continuity_errors,
-        ts.stats.scrambled_packets,
-        ts.stats.pes_overflow_drops
-    );
-
-    {
-        println!("\n== PIDs ==");
-        if out.transport == Transport::ViaFfmpeg {
-            // Worth printing even though these are ffmpeg's PIDs: a track
-            // missing from this table means ffmpeg never delivered it, which
-            // is a different failure from the server never sending it. Hiding the
-            // table makes those two look identical.
-            println!("  (ffmpeg's muxer, not the CDN's, but a track absent here");
-            println!("   means ffmpeg did not deliver it at all)");
-        }
-        for (pid, count) in &ts.stats.packets_by_pid {
-            let label = match ts.streams.get(pid) {
-                Some(s) => format!("{} (type 0x{:02x})", s.type_name(), s.stream_type),
-                None if *pid == 0 => "PAT".into(),
-                None if ts.pmt_pids.contains(pid) => "PMT".into(),
-                None if *pid == 0x0011 => "SDT".into(),
-                None if *pid == 0x1FFF => "null".into(),
-                None => "UNDECLARED".into(),
-            };
-            println!("  0x{pid:04x}  {count:>8}  {label}");
-        }
-        let undeclared = ts.undeclared_pids();
-        if !undeclared.is_empty() {
-            println!(
-                "  !! {} PID(s) carried data without a PMT entry: {}",
-                undeclared.len(),
-                undeclared
-                    .iter()
-                    .map(|p| format!("0x{p:04x}"))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            );
-        }
-    }
-
-    let ev = &report.evidence;
-    println!("\n== bitstream ==");
-    println!(
-        "  {} access units, {:.2} MB of video ES",
-        ev.access_units,
-        ev.video_es_bytes as f64 / 1e6
-    );
-    print!("  NAL types:");
-    for (ty, n) in &ev.nal_types {
-        print!(" {}={}({})", ty, n, nal_name(*ty));
-    }
-    println!();
-    if ev.sei_payload_types.is_empty() {
-        println!("  SEI: none present");
+    if let Some(d) = &out.datagrams {
+        println!("== datagrams ==");
+        println!(
+            "  {:.1} s, {} datagrams, {:.2} MB, {} not ours",
+            out.elapsed,
+            d.received,
+            d.bytes as f64 / 1e6,
+            d.not_ours
+        );
     } else {
-        print!("  SEI payload types:");
-        for (t, n) in &ev.sei_payload_types {
-            print!(" {t}={n}");
+        println!("== transport ==");
+        if out.transport == Transport::ViaFfmpeg {
+            println!("  (read through ffmpeg: these numbers describe ffmpeg's muxer,");
+            println!("   not the CDN's. Only the bitstream section below is the CDN's.)");
+        }
+        println!(
+            "  {:.1} s, {} packets, {:.2} MB, {:.2} Mb/s",
+            out.elapsed,
+            ts.stats.packets,
+            ts.stats.bytes as f64 / 1e6,
+            mbits
+        );
+        println!(
+            "  resync {} B, continuity errors {}, scrambled {}, pes overflow drops {}",
+            ts.stats.resync_bytes,
+            ts.stats.continuity_errors,
+            ts.stats.scrambled_packets,
+            ts.stats.pes_overflow_drops
+        );
+
+        {
+            println!("\n== PIDs ==");
+            if out.transport == Transport::ViaFfmpeg {
+                // Worth printing even though these are ffmpeg's PIDs: a track
+                // missing from this table means ffmpeg never delivered it, which
+                // is a different failure from the server never sending it. Hiding the
+                // table makes those two look identical.
+                println!("  (ffmpeg's muxer, not the CDN's, but a track absent here");
+                println!("   means ffmpeg did not deliver it at all)");
+            }
+            for (pid, count) in &ts.stats.packets_by_pid {
+                let label = match ts.streams.get(pid) {
+                    Some(s) => format!("{} (type 0x{:02x})", s.type_name(), s.stream_type),
+                    None if *pid == 0 => "PAT".into(),
+                    None if ts.pmt_pids.contains(pid) => "PMT".into(),
+                    None if *pid == 0x0011 => "SDT".into(),
+                    None if *pid == 0x1FFF => "null".into(),
+                    None => "UNDECLARED".into(),
+                };
+                println!("  0x{pid:04x}  {count:>8}  {label}");
+            }
+            let undeclared = ts.undeclared_pids();
+            if !undeclared.is_empty() {
+                println!(
+                    "  !! {} PID(s) carried data without a PMT entry: {}",
+                    undeclared.len(),
+                    undeclared
+                        .iter()
+                        .map(|p| format!("0x{p:04x}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
+        }
+
+        let ev = &report.evidence;
+        println!("\n== bitstream ==");
+        println!(
+            "  {} access units, {:.2} MB of video ES",
+            ev.access_units,
+            ev.video_es_bytes as f64 / 1e6
+        );
+        print!("  NAL types:");
+        for (ty, n) in &ev.nal_types {
+            print!(" {}={}({})", ty, n, nal_name(*ty));
         }
         println!();
-    }
-    for f in &ev.foreign_sei_samples {
-        println!(
-            "  foreign SEI type {} len {} :: {} | {}",
-            f.payload_type, f.len, f.head_hex, f.head_ascii
-        );
+        if ev.sei_payload_types.is_empty() {
+            println!("  SEI: none present");
+        } else {
+            print!("  SEI payload types:");
+            for (t, n) in &ev.sei_payload_types {
+                print!(" {t}={n}");
+            }
+            println!();
+        }
+        for f in &ev.foreign_sei_samples {
+            println!(
+                "  foreign SEI type {} len {} :: {} | {}",
+                f.payload_type, f.len, f.head_hex, f.head_ascii
+            );
+        }
     }
 
     if let Some(tags) = amf_tags {
@@ -394,7 +493,7 @@ fn print_summary(out: &Outcome, amf_tags: Option<&BTreeMap<String, String>>) {
         "latency min/med/max ms"
     );
     let mut any = false;
-    for c in truss::carrier::ALL {
+    for c in truss::carrier::EVERY {
         let Some(t) = report.carriers.get(c.slug()) else {
             continue;
         };

@@ -24,6 +24,7 @@ pub mod h264;
 pub mod inject;
 pub mod invariants;
 pub mod monitor;
+pub mod osc;
 pub mod payload;
 pub mod record;
 pub mod relay;
