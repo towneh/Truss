@@ -65,9 +65,16 @@ impl DmxState {
         };
         self.records += 1;
 
+        // Blocks for one universe may overlap within a record, and the later
+        // one wins. Changes are counted against what was held before the whole
+        // record, so a repeat of a record reports none however it is split.
+        let mut before: BTreeMap<u16, [u8; UNIVERSE_SLOTS]> = BTreeMap::new();
         for b in blocks {
             let u = self.universes.entry(b.universe).or_default();
-            u.updates += 1;
+            before.entry(b.universe).or_insert_with(|| {
+                u.updates += 1;
+                u.values
+            });
             u.last_age_us = b.age_us;
 
             let start = b.start as usize;
@@ -77,14 +84,15 @@ impl DmxState {
                     out.out_of_range += 1;
                     continue;
                 }
-                if u.values[slot] != v {
-                    u.values[slot] = v;
-                    out.changed += 1;
-                }
+                u.values[slot] = v;
                 if slot + 1 > u.len {
                     u.len = slot + 1;
                 }
             }
+        }
+        for (universe, old) in &before {
+            let now = &self.universes[universe].values;
+            out.changed += old.iter().zip(now).filter(|(a, b)| a != b).count();
         }
         self.changed_total += out.changed as u64;
         out
@@ -170,6 +178,20 @@ mod tests {
         s.apply(&[block(0, 0, vec![255])]);
         s.apply(&[block(0, 0, vec![0])]);
         assert_eq!(s.value(0, 0), Some(0));
+    }
+
+    #[test]
+    fn within_a_record_the_later_block_wins_and_a_repeat_is_not_a_change() {
+        let mut s = DmxState::default();
+        let record = [block(0, 0, vec![1, 2, 3, 4]), block(0, 1, vec![9, 9])];
+        let first = s.apply(&record);
+        assert_eq!(s.value(0, 1), Some(9));
+        assert_eq!(s.value(0, 3), Some(4));
+        assert_eq!(first.changed, 4, "slots are counted once, not per write");
+        assert_eq!(s.universe(0).unwrap().updates, 1, "one record, one update");
+
+        let again = s.apply(&record);
+        assert_eq!(again.changed, 0, "the same record twice is not activity");
     }
 
     #[test]

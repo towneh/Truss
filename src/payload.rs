@@ -33,7 +33,9 @@
 //! each universe is rather than assuming they were all sampled together.
 //!
 //! A block is a run rather than a whole universe, so sending only the channels
-//! that changed needs no format change.
+//! that changed needs no format change. A universe may appear in several blocks
+//! of one payload, and where two of them cover the same slot the later block
+//! wins, as a later Art-Net packet does.
 
 use std::fmt;
 
