@@ -16,12 +16,12 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser};
 use std::io::ErrorKind;
-use std::net::UdpSocket;
+use std::net::{SocketAddr, UdpSocket};
 use truss::detect::scan::{ScanReport, Scanner};
 use truss::detect::ts::{PesUnit, TsAnalyzer};
-use truss::source::{self, Freshness, Input, Source, Transport};
+use truss::source::{self, Freshness, Input, Source, Target, Transport};
 
 #[derive(Parser)]
 #[command(
@@ -29,8 +29,23 @@ use truss::source::{self, Freshness, Input, Source, Transport};
     about = "Score what survived a round trip through your own CDN"
 )]
 struct Cli {
-    #[command(subcommand)]
-    cmd: Cmd,
+    /// What to read. rtsp:// and rtmp:// go through ffmpeg; http://, https://,
+    /// a file path or - for stdin are MPEG-TS read directly; and
+    /// osc://[address][:port] listens for the relay's lane, every adapter on
+    /// port 12100 unless given.
+    ///
+    /// An rtmp:// egress shows the video bitstream, so it covers the in-video
+    /// carriers; ffmpeg discards script data it does not recognise, so the
+    /// amf-custom carrier needs a native RTMP client, and amf-onmeta is checked
+    /// through ffprobe's format tags. The lane has no end, so osc:// needs
+    /// --max-seconds; nothing on it crosses a CDN, so a gap there is the relay's
+    /// and a gap only in the stream is the path's.
+    source: String,
+    /// RTSP lower transport, for an rtsp:// source.
+    #[arg(long, default_value = "tcp")]
+    transport: String,
+    #[command(flatten)]
+    common: Common,
 }
 
 #[derive(Args, Clone)]
@@ -49,48 +64,6 @@ struct Common {
     save: Option<PathBuf>,
 }
 
-#[derive(Subcommand)]
-enum Cmd {
-    /// Read an MPEG-TS stream: a URL, a file, or "-" for stdin.
-    Ts {
-        input: String,
-        #[command(flatten)]
-        common: Common,
-    },
-    /// Read the RTSP egress, using ffmpeg as the transport.
-    Rtsp {
-        url: String,
-        /// RTSP lower transport.
-        #[arg(long, default_value = "tcp")]
-        transport: String,
-        #[command(flatten)]
-        common: Common,
-    },
-    /// Read the RTMP egress, using ffmpeg as the transport.
-    ///
-    /// This sees the video bitstream, so it covers the in-video carriers. It
-    /// does not see custom AMF data messages: ffmpeg discards script data it
-    /// does not recognise, so the `amf-custom` carrier needs a native RTMP
-    /// client. `amf-onmeta` is checked separately via ffprobe's format tags.
-    Rtmp {
-        url: String,
-        #[command(flatten)]
-        common: Common,
-    },
-    /// Listen for the relay's OSC lane: /truss/dmx messages carrying records.
-    ///
-    /// A socket has no end, so --max-seconds says when to stop. Nothing here
-    /// crosses a CDN, so a gap here is the relay's and a gap only in the
-    /// stream is the path's.
-    Osc {
-        /// Address to listen on.
-        #[arg(default_value_t = format!("0.0.0.0:{}", truss::osc::DEFAULT_PORT))]
-        listen: String,
-        #[command(flatten)]
-        common: Common,
-    },
-}
-
 fn now_unix_nanos() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -100,30 +73,19 @@ fn now_unix_nanos() -> u64 {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    match cli.cmd {
-        Cmd::Ts { input, common } => {
-            let mut src = source::open(&Input::Ts(input))?;
-            let out = analyse(&mut src, &common)?;
-            finish(&out, &common, None)
+    match Target::parse(&cli.source, &cli.transport)? {
+        Target::Osc(listen) => {
+            let out = analyse_osc(listen, &cli.common)?;
+            finish(&out, &cli.common, None)
         }
-        Cmd::Rtsp {
-            url,
-            transport,
-            common,
-        } => {
-            let mut src = source::open(&Input::Rtsp { url, transport })?;
-            let out = analyse(&mut src, &common)?;
-            finish(&out, &common, None)
-        }
-        Cmd::Rtmp { url, common } => {
-            let amf = probe_onmetadata(&url);
-            let mut src = source::open(&Input::Rtmp { url })?;
-            let out = analyse(&mut src, &common)?;
-            finish(&out, &common, Some(amf))
-        }
-        Cmd::Osc { listen, common } => {
-            let out = analyse_osc(&listen, &common)?;
-            finish(&out, &common, None)
+        Target::Stream(input) => {
+            let amf = match &input {
+                Input::Rtmp { url } => Some(probe_onmetadata(url)),
+                _ => None,
+            };
+            let mut src = source::open(&input)?;
+            let out = analyse(&mut src, &cli.common)?;
+            finish(&out, &cli.common, amf)
         }
     }
 }
@@ -138,7 +100,7 @@ struct Datagrams {
     not_ours: u64,
 }
 
-fn analyse_osc(listen: &str, common: &Common) -> Result<Outcome> {
+fn analyse_osc(listen: SocketAddr, common: &Common) -> Result<Outcome> {
     let Some(secs) = common.max_seconds else {
         bail!("osc needs --max-seconds: a socket has no end to read to");
     };

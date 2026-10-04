@@ -28,7 +28,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use socket2::{Domain, Protocol, Socket, Type};
 
 use crate::payload::{BLOCK_HEADER_LEN, Block, HEADER_LEN as PAYLOAD_HEADER_LEN};
@@ -396,20 +396,10 @@ impl Latch {
     }
 }
 
-/// Where to listen, from an address, an `address:port`, or a bracketed IPv6
-/// address with or without a port. The port is 6454 unless given.
+/// Where to listen for Art-Net, from an address, an `address:port`, a bare
+/// `:port`, or a bracketed IPv6 address. The port is 6454 unless given.
 pub fn parse_listen(spec: &str) -> Result<SocketAddr> {
-    let spec = spec.trim();
-    if let Ok(addr) = spec.parse::<SocketAddr>() {
-        return Ok(addr);
-    }
-    if let Ok(ip) = spec.trim_matches(['[', ']']).parse::<IpAddr>() {
-        return Ok(SocketAddr::new(ip, DEFAULT_PORT));
-    }
-    bail!(
-        "{spec:?} is not an address to listen on; give an IP address, with :port after it \
-         when it is not {DEFAULT_PORT}"
-    )
+    crate::source::listen_address(spec, DEFAULT_PORT)
 }
 
 /// A background thread receiving Art-Net into a shared latch.
@@ -1211,7 +1201,11 @@ mod tests {
         );
         let e = parse_listen("desk").unwrap_err().to_string();
         assert!(e.contains("not an address"), "{e}");
-        assert!(parse_listen("").is_err());
+        assert_eq!(
+            parse_listen("").unwrap(),
+            SocketAddr::from((Ipv4Addr::UNSPECIFIED, DEFAULT_PORT)),
+            "nothing given means every adapter"
+        );
     }
 
     #[test]

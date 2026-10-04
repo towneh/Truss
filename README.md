@@ -21,16 +21,16 @@ lighting data never arrives.
 Check your own path before anything else:
 
 ```sh
-truss-detect rtmp rtmp://your-egress/live/stream --max-seconds 30
+truss-detect rtmp://your-egress/live/stream --max-seconds 30
 ```
 
 This reads your own egress and reports what arrived. It distinguishes the three
 outcomes that matter: nothing arrived, something arrived but was damaged,
 something arrived intact. Only the last is a basis for running a show.
 
-The reader is a subcommand. `rtmp` and `rtsp` go through ffmpeg, which needs to
-be on your PATH; `ts` takes an MPEG-TS URL, a local file, or `-` for stdin, and
-is read directly. `--max-seconds` and `--max-mb` bound the run, `--json` writes
+The scheme picks the reader. `rtsp://` and `rtmp://` go through ffmpeg, which
+needs to be on your PATH; `http://`, `https://`, a file path or `-` for stdin
+are MPEG-TS and are read directly. `--max-seconds` and `--max-mb` bound the run, `--json` writes
 the full report for something else to read, and `--save` keeps the bytes, so a
 disagreement about what arrived can be settled against the capture.
 
@@ -55,7 +55,7 @@ a fault in the carrier from a fault in the network:
 
 ```sh
 ffmpeg -i carried.flv -c copy -f mpegts carried.ts
-truss-detect ts carried.ts
+truss-detect carried.ts
 ```
 
 The body written here is derived from the sequence number rather than from a
@@ -120,18 +120,13 @@ intact and still carry a snapshot that never changes, and that is a dead show
 which scores correctly on every other test.
 
 ```sh
-truss-dmxmon rtsp rtsp://your-egress/live/stream --universe 0
+truss-dmxmon rtsp://your-egress/live/stream --universe 0
 ```
 
 `--universe` prints that universe as a grid on every status line. `--watch
 0.1-16` prints only the channels named, and only as they change, which is the
 shorter way to answer whether one fixture is moving; slots are numbered from 1,
-as on a desk. The readers here are `ts` and `rtsp`, so an RTMP egress is remuxed
-on the way in:
-
-```sh
-ffmpeg -i rtmp://your-egress/live/stream -c copy -f mpegts - | truss-dmxmon ts -
-```
+as on a desk. It reads the same sources `truss-detect` does.
 
 ## Watching the desk with nothing else running
 
@@ -141,7 +136,7 @@ with nothing else running:
 
 ```sh
 truss-relay --publish rtmp://ingest.example.net/live --stream-key-file key.txt --artnet --osc 127.0.0.1:12100
-truss-dmxmon osc --universe 0
+truss-dmxmon osc:// --universe 0
 ```
 
 Each record goes out as one OSC message, `/truss/dmx`, with the record as its
@@ -152,9 +147,10 @@ the stream carries, budget rotation included, at the video's frame rate. With
 no publisher it builds records from the Art-Net latch at `--osc-rate`, 30 a
 second by default. The lane numbers its records itself, so a listener scores
 loss and order on the lane rather than on the stream. The port is 12100 by
-default, clear of Art-Net, the VRSL Grid Node and QLC+.
+default, clear of Art-Net, the VRSL Grid Node and QLC+; `osc://:12200` or
+`osc://192.168.1.20:12200` listens elsewhere.
 
-`truss-detect osc --max-seconds 10` scores the lane the way it scores a stream.
+`truss-detect osc:// --max-seconds 10` scores the lane the way it scores a stream.
 Nothing on this path crosses a CDN, so a gap here is the relay's, and a gap
 only in the stream is the path's.
 
@@ -174,7 +170,7 @@ The order matters, as each waits for the one before it. OBS can take the place
 of the third terminal, pointed at the same URL. The key in `key.txt` can be
 anything, since the stand-in accepts whatever it is given.
 
-`truss-detect ts egress.ts` then scores what left the far end, and adding
+`truss-detect egress.ts` then scores what left the far end, and adding
 `--artnet` to the relay puts a desk in the same loop. None of it leaves the
 machine.
 

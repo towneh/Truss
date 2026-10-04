@@ -15,15 +15,15 @@ use std::io::Read;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::Parser;
 use std::io::ErrorKind;
-use std::net::UdpSocket;
+use std::net::{SocketAddr, UdpSocket};
 use truss::carrier::Carrier;
 use truss::detect::ts::TsAnalyzer;
 use truss::h264;
 use truss::monitor::DmxState;
 use truss::record::Record;
-use truss::source::{self, Freshness, Input};
+use truss::source::{self, Freshness, Target};
 
 #[derive(Parser)]
 #[command(
@@ -31,38 +31,20 @@ use truss::source::{self, Freshness, Input};
     about = "Watch the DMX arriving in a live stream"
 )]
 struct Cli {
-    #[command(subcommand)]
-    cmd: Cmd,
-}
-
-#[derive(Subcommand)]
-enum Cmd {
-    /// Read an MPEG-TS stream: a URL, a file, or "-" for stdin.
-    Ts {
-        input: String,
-        #[command(flatten)]
-        common: Common,
-    },
-    /// Read the RTSP egress, using ffmpeg as the transport.
+    /// What to read. rtsp:// and rtmp:// go through ffmpeg; http://, https://,
+    /// a file path or - for stdin are MPEG-TS read directly; and
+    /// osc://[address][:port] listens for the relay's lane, every adapter on
+    /// port 12100 unless given.
     ///
-    /// Note that RTSP delivers video only when nothing else from this machine is
-    /// already reading the stream, so close other readers first or this will see
-    /// audio and no data.
-    Rtsp {
-        url: String,
-        #[arg(long, default_value = "tcp")]
-        transport: String,
-        #[command(flatten)]
-        common: Common,
-    },
-    /// Listen for the relay's OSC lane: /truss/dmx messages carrying records.
-    Osc {
-        /// Address to listen on.
-        #[arg(default_value_t = format!("0.0.0.0:{}", truss::osc::DEFAULT_PORT))]
-        listen: String,
-        #[command(flatten)]
-        common: Common,
-    },
+    /// RTSP delivers video only when nothing else from this machine is already
+    /// reading the stream, so close other readers first or this sees audio and
+    /// no data.
+    source: String,
+    /// RTSP lower transport, for an rtsp:// source.
+    #[arg(long, default_value = "tcp")]
+    transport: String,
+    #[command(flatten)]
+    common: Common,
 }
 
 #[derive(clap::Args, Clone)]
@@ -147,14 +129,10 @@ fn split_addr(addr: &str, part: &str, form: &str) -> Result<(u16, u16)> {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let (input, common) = match cli.cmd {
-        Cmd::Ts { input, common } => (Input::Ts(input), common),
-        Cmd::Rtsp {
-            url,
-            transport,
-            common,
-        } => (Input::Rtsp { url, transport }, common),
-        Cmd::Osc { listen, common } => return watch_osc(&listen, &common),
+    let common = cli.common;
+    let input = match Target::parse(&cli.source, &cli.transport)? {
+        Target::Osc(listen) => return watch_osc(listen, &common),
+        Target::Stream(input) => input,
     };
     let watches = common
         .watch
@@ -177,7 +155,7 @@ fn main() -> Result<()> {
     let mut last_report = Instant::now();
     let interval = Duration::from_secs_f64(common.interval.max(0.1));
 
-    println!("reading {}...", describe(&input));
+    println!("reading {}...", input.describe());
 
     loop {
         if let Some(secs) = common.max_seconds
@@ -219,7 +197,7 @@ fn main() -> Result<()> {
 /// Watch the relay's OSC lane instead of a stream: the same records, sent
 /// to a socket as they are built, so a desk can be watched with no encoder,
 /// ingest or player running.
-fn watch_osc(listen: &str, common: &Common) -> Result<()> {
+fn watch_osc(listen: SocketAddr, common: &Common) -> Result<()> {
     let watches = common
         .watch
         .as_deref()
@@ -358,14 +336,6 @@ impl Tally {
 struct Window {
     records: u64,
     changed: u64,
-}
-
-fn describe(input: &Input) -> String {
-    match input {
-        Input::Ts(t) => t.clone(),
-        Input::Rtsp { url, .. } => url.clone(),
-        Input::Rtmp { url } => url.clone(),
-    }
 }
 
 /// Every record body in one access unit, from whichever carrier framed it.
