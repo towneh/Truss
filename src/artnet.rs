@@ -16,7 +16,9 @@
 //! same machine can keep running alongside this one. That only works for
 //! broadcast traffic: if the desk is set to unicast to a single node's address,
 //! exactly one process receives each packet and which one is undefined. Patch
-//! both as separate nodes on the desk, or broadcast.
+//! both as separate nodes on the desk, or broadcast. The exception is a desk
+//! on this machine sending to 127.0.0.1: bound to that address, this socket
+//! receives those packets ahead of any socket bound to every address.
 
 use std::collections::BTreeMap;
 use std::io::ErrorKind;
@@ -393,43 +395,53 @@ impl Latch {
 pub struct Receiver {
     latch: Arc<Mutex<Latch>>,
     running: Arc<AtomicBool>,
-    thread: Option<JoinHandle<()>>,
+    threads: Vec<JoinHandle<()>>,
     pub local_addr: SocketAddr,
+    /// A second socket on 127.0.0.1, held when `local_addr` is every address.
+    ///
+    /// A datagram to 127.0.0.1 is delivered to a socket bound to that address
+    /// ahead of any bound to every address, so a desk on this machine that
+    /// sends there reaches this receiver and not whichever other Art-Net node
+    /// shares the port. Polls from such a desk are answered with this address.
+    pub loopback_addr: Option<SocketAddr>,
 }
 
 impl Receiver {
     pub fn bind(addr: SocketAddr) -> Result<Self> {
-        let socket = Socket::new(Domain::for_address(addr), Type::DGRAM, Some(Protocol::UDP))
-            .context("creating the Art-Net socket")?;
-        // Shares the port with any other Art-Net node on this machine.
-        socket
-            .set_reuse_address(true)
-            .context("setting SO_REUSEADDR")?;
-        socket
-            .bind(&addr.into())
-            .with_context(|| format!("binding {addr}"))?;
-        let socket: UdpSocket = socket.into();
-        // Bounded so the thread notices a shutdown rather than blocking on a
-        // desk that has stopped sending.
-        socket.set_read_timeout(Some(Duration::from_millis(200)))?;
+        let socket = open(addr)?;
         let local_addr = socket.local_addr()?;
+        let loopback = match addr.ip() {
+            IpAddr::V4(v4) if v4.is_unspecified() => open(SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                local_addr.port(),
+            ))
+            .ok(),
+            _ => None,
+        };
+        let loopback_addr = loopback.as_ref().and_then(|s| s.local_addr().ok());
 
         let latch = Arc::new(Mutex::new(Latch::default()));
         let running = Arc::new(AtomicBool::new(true));
-        let thread = {
+        let mut threads = Vec::new();
+        for (name, socket) in
+            std::iter::once(("artnet", socket)).chain(loopback.map(|s| ("artnet-loopback", s)))
+        {
             let latch = Arc::clone(&latch);
             let running = Arc::clone(&running);
-            std::thread::Builder::new()
-                .name("artnet".into())
-                .spawn(move || receive_loop(&socket, &latch, &running))
-                .context("spawning the Art-Net receive thread")?
-        };
+            threads.push(
+                std::thread::Builder::new()
+                    .name(name.into())
+                    .spawn(move || receive_loop(&socket, &latch, &running))
+                    .context("spawning the Art-Net receive thread")?,
+            );
+        }
 
         Ok(Self {
             latch,
             running,
-            thread: Some(thread),
+            threads,
             local_addr,
+            loopback_addr,
         })
     }
 
@@ -441,23 +453,42 @@ impl Receiver {
 impl Drop for Receiver {
     fn drop(&mut self) {
         self.running.store(false, Ordering::Relaxed);
-        if let Some(t) = self.thread.take() {
+        for t in self.threads.drain(..) {
             let _ = t.join();
         }
     }
+}
+
+/// An Art-Net socket on `addr`, sharing the port with any other node here.
+fn open(addr: SocketAddr) -> Result<UdpSocket> {
+    let socket = Socket::new(Domain::for_address(addr), Type::DGRAM, Some(Protocol::UDP))
+        .context("creating the Art-Net socket")?;
+    socket
+        .set_reuse_address(true)
+        .context("setting SO_REUSEADDR")?;
+    // Replies to a poll go out on the controller's subnet broadcast too.
+    socket.set_broadcast(true).context("setting SO_BROADCAST")?;
+    socket
+        .bind(&addr.into())
+        .with_context(|| format!("binding {addr}"))?;
+    let socket: UdpSocket = socket.into();
+    // Bounded so the thread notices a shutdown rather than blocking on a
+    // desk that has stopped sending.
+    socket.set_read_timeout(Some(Duration::from_millis(200)))?;
+    Ok(socket)
 }
 
 fn receive_loop(socket: &UdpSocket, latch: &Mutex<Latch>, running: &AtomicBool) {
     // One datagram at a time. An ArtDmx packet is 530 bytes; anything larger on
     // this port belongs to a protocol this does not speak.
     let mut buf = [0u8; 2048];
-    let mut route = None;
+    let mut routes = Routes::default();
     while running.load(Ordering::Relaxed) {
         match socket.recv_from(&mut buf) {
             Ok((n, from)) => {
                 let now = Instant::now();
                 if let Some(poll) = parse_poll(&buf[..n]) {
-                    answer_poll(socket, latch, &poll, from, &mut route);
+                    answer_poll(socket, latch, &poll, from, &mut routes);
                 } else if let Ok(mut l) = latch.lock() {
                     l.accept(&buf[..n], now);
                 }
@@ -481,13 +512,26 @@ fn receive_loop(socket: &UdpSocket, latch: &Mutex<Latch>, running: &AtomicBool) 
     }
 }
 
+/// Where a reply to a controller goes, and the address it carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Route {
+    /// The local address the controller is told to send to.
+    pub ip: Ipv4Addr,
+    /// The directed broadcast of the subnet the controller is on, when that
+    /// is one of this machine's subnets.
+    pub broadcast: Option<Ipv4Addr>,
+}
+
 /// Answer an `ArtPoll` from `from`, if it is one this node should answer.
 ///
-/// The reply goes to the controller's address on the Art-Net port, which is
-/// where a controller listens, and also to the exact endpoint the poll came
-/// from when that differs, for one that listens on the port it sent from.
-/// Both are unicast from the receive socket, so the reply carries the Art-Net
-/// port as its source, which some controllers check.
+/// The reply is unicast to the controller's address on the Art-Net port,
+/// which is where a controller listens, to the exact endpoint the poll came
+/// from when that differs, and broadcast on the controller's subnet. The
+/// broadcast is what reaches a controller on this same machine: a unicast to
+/// a port two sockets share is delivered to whichever of them the operating
+/// system picks, a broadcast to both. All of it leaves from the receive
+/// socket, so the reply carries the Art-Net port as its source, which some
+/// controllers check.
 ///
 /// A targeted poll is answered only when one of the ports the reply would
 /// advertise is in its range, so a controller never receives an answer that
@@ -497,7 +541,7 @@ fn answer_poll(
     latch: &Mutex<Latch>,
     poll: &ArtPoll,
     from: SocketAddr,
-    route: &mut Option<(Ipv4Addr, Ipv4Addr)>,
+    routes: &mut Routes,
 ) {
     let IpAddr::V4(controller) = from.ip() else {
         // Art-Net carries IPv4 addresses in its packets, so there is nothing
@@ -520,12 +564,15 @@ fn answer_poll(
         (l.polls, l.universes.len(), ports)
     };
 
-    let ip = advertised_address(local.ip(), controller, route);
-    let packets = poll_replies(ip, local.port(), replies, latched, &ports);
+    let r = routes.route_to(local.ip(), controller, Instant::now());
+    let packets = poll_replies(r.ip, local.port(), replies, latched, &ports);
 
     let mut targets = vec![SocketAddr::new(IpAddr::V4(controller), DEFAULT_PORT)];
     if from.port() != DEFAULT_PORT {
         targets.push(from);
+    }
+    if let Some(b) = r.broadcast {
+        targets.push(SocketAddr::new(IpAddr::V4(b), DEFAULT_PORT));
     }
     let mut failed = 0u64;
     for packet in &packets {
@@ -542,48 +589,148 @@ fn answer_poll(
     }
 }
 
-/// The address to tell a controller at `controller` to send to.
+/// How often the interface list is read again and the routing table asked.
+const ROUTES_REFRESH: Duration = Duration::from_secs(1);
+
+/// Where replies go, worked out from a snapshot of this machine's interfaces.
 ///
-/// A socket bound to one address advertises that address. One bound to all of
-/// them asks the routing table which local address a packet to the controller
-/// would leave from, so a machine with a VPN or a virtual adapter advertises
-/// the one the desk can actually reach, rather than whichever is listed first.
+/// The interface whose subnet holds the controller decides the address to
+/// advertise and the broadcast to answer on, so a machine with a VPN or a
+/// virtual adapter advertises the address the desk can actually reach rather
+/// than whichever is listed first. A controller at one of this machine's own
+/// addresses is on this machine, and is told to use 127.0.0.1, where
+/// [`Receiver`] holds the socket that wins that delivery. A socket bound to
+/// one address advertises that address whatever interface the controller is
+/// on. A controller on none of this machine's subnets is reached through a
+/// router: the routing table then says which local address a packet to it
+/// leaves from, and no broadcast reaches it.
 ///
-/// `route` remembers the answer for the last controller asked about. Polls
-/// arrive every few seconds from the same desk, and the probe costs a socket
-/// each time it runs, so the receive thread is not made to pay that per poll
-/// by anyone who can send one.
-fn advertised_address(
-    bound: IpAddr,
+/// The snapshot is read again at most once a second, and the routing table
+/// asked at most once a second, so what a poll costs the receive thread does
+/// not depend on who sent it. Art-Net is unauthenticated, and a source
+/// address is anyone's to choose.
+pub struct Routes {
+    interfaces: Vec<(Ipv4Addr, Ipv4Addr)>,
+    refreshed: Option<Instant>,
+    /// The last routing-table probe: who it was for, what it said, and when.
+    probed: Option<(Ipv4Addr, Option<Ipv4Addr>, Instant)>,
+    probe: fn(Ipv4Addr) -> Option<Ipv4Addr>,
+}
+
+impl Default for Routes {
+    fn default() -> Self {
+        Self {
+            interfaces: Vec::new(),
+            refreshed: None,
+            probed: None,
+            probe: probe_route,
+        }
+    }
+}
+
+impl Routes {
+    /// The route to a controller at `controller`, as of `now`.
+    pub fn route_to(&mut self, bound: IpAddr, controller: Ipv4Addr, now: Instant) -> Route {
+        if self
+            .refreshed
+            .is_none_or(|t| now.duration_since(t) >= ROUTES_REFRESH)
+        {
+            self.interfaces = local_interfaces();
+            self.refreshed = Some(now);
+        }
+        let bound = match bound {
+            IpAddr::V4(v4) if !v4.is_unspecified() => Some(v4),
+            _ => None,
+        };
+        // Being on this machine and being on a subnet with a broadcast are
+        // separate questions: a VPN gives this machine an address on a /32.
+        let local =
+            controller.is_loopback() || self.interfaces.iter().any(|(ip, _)| *ip == controller);
+        let subnet = subnet_of(controller, self.interfaces.iter().copied());
+        let ip = match (bound, local, subnet) {
+            (Some(b), _, _) => b,
+            (None, true, _) => Ipv4Addr::LOCALHOST,
+            (None, false, Some((ip, _))) => ip,
+            (None, false, None) => self
+                .probe_for(controller, now)
+                .unwrap_or(Ipv4Addr::UNSPECIFIED),
+        };
+        Route {
+            ip,
+            broadcast: subnet.map(|(_, broadcast)| broadcast),
+        }
+    }
+
+    /// The routing table's answer for a controller on no local subnet.
+    ///
+    /// Asked at most once a second. Inside that second the answer already
+    /// held serves the controller it was for, and any other controller gets
+    /// none: a desk reached through a router polls every few seconds and is
+    /// answered on its next poll, while a flood of invented sources costs one
+    /// probe a second however fast it arrives.
+    fn probe_for(&mut self, controller: Ipv4Addr, now: Instant) -> Option<Ipv4Addr> {
+        if let Some((who, answer, when)) = self.probed
+            && now.duration_since(when) < ROUTES_REFRESH
+        {
+            return if who == controller { answer } else { None };
+        }
+        let answer = (self.probe)(controller);
+        self.probed = Some((controller, answer, now));
+        answer
+    }
+}
+
+/// This machine's IPv4 interfaces as `(address, netmask)` pairs.
+fn local_interfaces() -> Vec<(Ipv4Addr, Ipv4Addr)> {
+    if_addrs::get_if_addrs()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|i| match i.addr {
+            if_addrs::IfAddr::V4(v4) => Some((v4.ip, v4.netmask)),
+            if_addrs::IfAddr::V6(_) => None,
+        })
+        .collect()
+}
+
+/// The address and directed broadcast of the first of `interfaces`, given as
+/// `(address, netmask)` pairs, whose subnet holds `controller`.
+///
+/// Loopback is left out: it has no broadcast worth sending to, and a
+/// controller there is already sending to this machine by address.
+fn subnet_of(
     controller: Ipv4Addr,
-    route: &mut Option<(Ipv4Addr, Ipv4Addr)>,
-) -> Ipv4Addr {
-    if let IpAddr::V4(v4) = bound
-        && !v4.is_unspecified()
-    {
-        return v4;
-    }
-    if let Some((known, ip)) = *route
-        && known == controller
-    {
-        return ip;
-    }
+    interfaces: impl IntoIterator<Item = (Ipv4Addr, Ipv4Addr)>,
+) -> Option<(Ipv4Addr, Ipv4Addr)> {
+    interfaces.into_iter().find_map(|(ip, mask)| {
+        let mask_bits = mask.to_bits();
+        // A /32 holds only itself and a /0 holds everything; neither is a
+        // subnet with a broadcast.
+        if ip.is_loopback() || mask_bits == 0 || mask_bits == u32::MAX {
+            return None;
+        }
+        if ip.to_bits() & mask_bits != controller.to_bits() & mask_bits {
+            return None;
+        }
+        Some((ip, Ipv4Addr::from_bits(ip.to_bits() | !mask_bits)))
+    })
+}
+
+/// The local address a packet to `controller` would leave from, from the
+/// routing table, which needs a socket and nothing else.
+fn probe_route(controller: Ipv4Addr) -> Option<Ipv4Addr> {
     let probe = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
         .and_then(|s| s.connect((controller, DEFAULT_PORT)).map(|()| s))
         .and_then(|s| s.local_addr());
     match probe {
-        Ok(SocketAddr::V4(a)) => {
-            *route = Some((controller, *a.ip()));
-            *a.ip()
-        }
-        // Left uncached, so the next poll tries again.
-        _ => Ipv4Addr::UNSPECIFIED,
+        Ok(SocketAddr::V4(a)) => Some(*a.ip()),
+        _ => None,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicUsize;
 
     fn art_dmx(universe: u16, sequence: u8, values: &[u8]) -> Vec<u8> {
         let mut p = Vec::new();
@@ -975,42 +1122,212 @@ mod tests {
     }
 
     #[test]
-    fn a_bound_address_is_advertised_as_it_is() {
-        let bound = Ipv4Addr::new(10, 1, 2, 3);
-        assert_eq!(
-            advertised_address(IpAddr::V4(bound), Ipv4Addr::new(10, 1, 2, 9), &mut None),
-            bound
-        );
-        // Unspecified asks the routing table; loopback routes to loopback, and
-        // the answer is kept for that controller.
-        let mut route = None;
-        assert_eq!(
-            advertised_address(
-                IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-                Ipv4Addr::LOCALHOST,
-                &mut route
-            ),
-            Ipv4Addr::LOCALHOST
-        );
-        assert_eq!(route, Some((Ipv4Addr::LOCALHOST, Ipv4Addr::LOCALHOST)));
+    fn bound_to_every_address_the_receiver_also_holds_loopback() {
+        let recv = Receiver::bind("0.0.0.0:0".parse().unwrap()).expect("binds");
+        let port = recv.local_addr.port();
+        let lo = recv.loopback_addr.expect("a loopback companion");
+        assert_eq!(lo, SocketAddr::from((Ipv4Addr::LOCALHOST, port)));
 
-        // A remembered answer is used without probing, and only for the
-        // controller it was learned from.
-        let desk = Ipv4Addr::new(192, 0, 2, 7);
-        let mut route = Some((desk, Ipv4Addr::new(192, 0, 2, 1)));
+        let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
+        sender.send_to(&art_dmx(3, 1, &[9]), lo).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while recv.latch().universe_count() == 0 {
+            assert!(Instant::now() < deadline, "nothing latched via loopback");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let pinned = Receiver::bind("127.0.0.1:0".parse().unwrap()).expect("binds");
+        assert_eq!(pinned.loopback_addr, None, "already on loopback");
+    }
+
+    #[test]
+    fn a_desk_on_this_machine_is_told_to_use_loopback() {
+        // Every IPv4 address this machine has, a VPN's /32 included.
+        let own: Vec<(Ipv4Addr, u8)> = if_addrs::get_if_addrs()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|i| match i.addr {
+                if_addrs::IfAddr::V4(v4) if !v4.ip.is_loopback() => Some((v4.ip, v4.prefixlen)),
+                _ => None,
+            })
+            .collect();
+        let mut routes = Routes::default();
+        for (ip, prefixlen) in own {
+            let r = routes.route_to(IpAddr::V4(Ipv4Addr::UNSPECIFIED), ip, Instant::now());
+            assert_eq!(r.ip, Ipv4Addr::LOCALHOST, "{ip}/{prefixlen}");
+            assert_eq!(
+                r.broadcast.is_some(),
+                prefixlen < 32,
+                "{ip}/{prefixlen}: a subnet with room for a broadcast is answered on it"
+            );
+
+            let r = routes.route_to(IpAddr::V4(ip), ip, Instant::now());
+            assert_eq!(r.ip, ip, "a pinned socket has no loopback companion");
+        }
+    }
+
+    #[test]
+    fn the_interface_whose_subnet_holds_the_controller_gives_the_broadcast() {
+        let lan = (
+            Ipv4Addr::new(192, 168, 1, 233),
+            Ipv4Addr::new(255, 255, 255, 0),
+        );
+        let switch = (
+            Ipv4Addr::new(172, 25, 160, 1),
+            Ipv4Addr::new(255, 255, 240, 0),
+        );
+        let interfaces = [lan, switch];
         assert_eq!(
-            advertised_address(IpAddr::V4(Ipv4Addr::UNSPECIFIED), desk, &mut route),
-            Ipv4Addr::new(192, 0, 2, 1)
+            subnet_of(Ipv4Addr::new(172, 25, 170, 9), interfaces),
+            Some((switch.0, Ipv4Addr::new(172, 25, 175, 255)))
         );
         assert_eq!(
-            advertised_address(
-                IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-                Ipv4Addr::LOCALHOST,
-                &mut route
-            ),
+            subnet_of(Ipv4Addr::new(192, 168, 1, 5), interfaces),
+            Some((lan.0, Ipv4Addr::new(192, 168, 1, 255)))
+        );
+        assert_eq!(
+            subnet_of(Ipv4Addr::new(10, 9, 9, 9), interfaces),
+            None,
+            "routed"
+        );
+
+        let host_only = [(Ipv4Addr::new(10, 0, 0, 1), Ipv4Addr::BROADCAST)];
+        assert_eq!(
+            subnet_of(Ipv4Addr::new(10, 0, 0, 1), host_only),
+            None,
+            "/32"
+        );
+        let everything = [(Ipv4Addr::new(10, 0, 0, 1), Ipv4Addr::UNSPECIFIED)];
+        assert_eq!(
+            subnet_of(Ipv4Addr::new(10, 0, 0, 1), everything),
+            None,
+            "/0"
+        );
+        let loopback = [(Ipv4Addr::LOCALHOST, Ipv4Addr::new(255, 0, 0, 0))];
+        assert_eq!(subnet_of(Ipv4Addr::LOCALHOST, loopback), None, "loopback");
+    }
+
+    #[test]
+    fn a_bound_address_is_advertised_as_it_is() {
+        let mut routes = Routes::default();
+        let bound = Ipv4Addr::new(10, 1, 2, 3);
+        let r = routes.route_to(
+            IpAddr::V4(bound),
+            Ipv4Addr::new(10, 1, 2, 9),
+            Instant::now(),
+        );
+        assert_eq!(r.ip, bound);
+
+        // Unspecified asks the interfaces; loopback is on this machine and is
+        // reached by address, with no broadcast.
+        let r = routes.route_to(
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
             Ipv4Addr::LOCALHOST,
-            "a different controller is probed afresh"
+            Instant::now(),
         );
-        assert_eq!(route, Some((Ipv4Addr::LOCALHOST, Ipv4Addr::LOCALHOST)));
+        assert_eq!(
+            r,
+            Route {
+                ip: Ipv4Addr::LOCALHOST,
+                broadcast: None
+            }
+        );
+    }
+
+    static PROBES: AtomicUsize = AtomicUsize::new(0);
+
+    fn counted_probe(_: Ipv4Addr) -> Option<Ipv4Addr> {
+        PROBES.fetch_add(1, Ordering::Relaxed);
+        Some(Ipv4Addr::new(203, 0, 113, 5))
+    }
+
+    fn fixed_probe(_: Ipv4Addr) -> Option<Ipv4Addr> {
+        Some(Ipv4Addr::new(203, 0, 113, 5))
+    }
+
+    /// A snapshot holding one invented interface, taken at `now`, with
+    /// `probe` in place of the routing table.
+    fn invented_routes(now: Instant, probe: fn(Ipv4Addr) -> Option<Ipv4Addr>) -> Routes {
+        Routes {
+            interfaces: vec![(Ipv4Addr::new(10, 7, 7, 1), Ipv4Addr::new(255, 255, 255, 0))],
+            refreshed: Some(now),
+            probed: None,
+            probe,
+        }
+    }
+
+    #[test]
+    fn the_snapshot_serves_a_second_of_polls_and_is_then_read_again() {
+        let t0 = Instant::now();
+        let mut routes = invented_routes(t0, fixed_probe);
+        let desk = Ipv4Addr::new(10, 7, 7, 9);
+        let any = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
+
+        let r = routes.route_to(any, desk, t0);
+        assert_eq!(
+            r.ip,
+            Ipv4Addr::new(10, 7, 7, 1),
+            "from the snapshot, no walk"
+        );
+        assert_eq!(r.broadcast, Some(Ipv4Addr::new(10, 7, 7, 255)));
+        let r = routes.route_to(
+            any,
+            Ipv4Addr::new(10, 7, 7, 10),
+            t0 + Duration::from_millis(900),
+        );
+        assert_eq!(
+            r.ip,
+            Ipv4Addr::new(10, 7, 7, 1),
+            "another controller, same snapshot"
+        );
+
+        // A second on, the real interfaces are read and the invented one is
+        // gone, so the desk is now off every subnet and the probe answers.
+        let r = routes.route_to(any, desk, t0 + Duration::from_secs(1));
+        assert_eq!(r.broadcast, None);
+        assert_eq!(r.ip, Ipv4Addr::new(203, 0, 113, 5));
+    }
+
+    #[test]
+    fn the_routing_table_is_asked_at_most_once_a_second() {
+        let t0 = Instant::now();
+        // The counter is this test's alone, so nothing else moves it.
+        let mut routes = invented_routes(t0, counted_probe);
+        let any = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
+        // TEST-NET-2, on no subnet of any machine.
+        let far = Ipv4Addr::new(198, 51, 100, 1);
+        let other = Ipv4Addr::new(198, 51, 100, 2);
+        let before = PROBES.load(Ordering::Relaxed);
+
+        assert_eq!(
+            routes.route_to(any, far, t0).ip,
+            Ipv4Addr::new(203, 0, 113, 5)
+        );
+        assert_eq!(PROBES.load(Ordering::Relaxed), before + 1);
+
+        let r = routes.route_to(any, other, t0 + Duration::from_millis(100));
+        assert_eq!(
+            r.ip,
+            Ipv4Addr::UNSPECIFIED,
+            "no probe to spare for a second source"
+        );
+        assert_eq!(PROBES.load(Ordering::Relaxed), before + 1);
+
+        let r = routes.route_to(any, far, t0 + Duration::from_millis(200));
+        assert_eq!(
+            r.ip,
+            Ipv4Addr::new(203, 0, 113, 5),
+            "the held answer, for who it was for"
+        );
+        assert_eq!(PROBES.load(Ordering::Relaxed), before + 1);
+
+        assert_eq!(
+            routes
+                .route_to(any, other, t0 + Duration::from_millis(1500))
+                .ip,
+            Ipv4Addr::new(203, 0, 113, 5),
+            "asked again once the second is up"
+        );
+        assert_eq!(PROBES.load(Ordering::Relaxed), before + 2);
     }
 }

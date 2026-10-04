@@ -44,3 +44,4 @@ ureq = "3"
 rml_rtmp = "0.8"
 bytes = "1"
 socket2 = { version = "0.6.5", features = ["all"] }
+if-addrs = "0.15"

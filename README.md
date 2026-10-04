@@ -86,17 +86,21 @@ universes, so one at the far end of the patch cannot starve.
 
 A desk that lists nodes rather than broadcasting will find one named Truss.
 The relay answers `ArtPoll` with the address the desk can reach it on, which on
-a machine with several adapters is the one a packet to the desk would leave
-from. Pick it and assign it the universes to carry; until DMX arrives the
-status line names the controller that found the node, so a show that is lit
-on the desk and dark in the stream is a patch problem and not a network one.
-The node advertises the universes it has heard, up to 32, and universe 0 before
-it has heard any, so a desk that searches by universe finds it from the first
-poll after that universe starts arriving.
+a machine with several adapters is the one on the desk's own subnet, and sends
+the answer to the desk directly and as a broadcast on that subnet. Pick it and
+assign it the universes to carry. Until DMX arrives the status line names the
+controller that found the node, so a show that is lit on the desk and dark in
+the stream is a patch problem and not a network one. The node advertises the universes it has heard, up to 32, and
+universe 0 before it has heard any, so a desk that searches by universe finds
+it from the first poll after that universe starts arriving.
 
-A desk on this same machine that unicasts shares UDP port 6454 with the relay,
-and the operating system hands each packet to one of the two. Set the desk to
-broadcast, or run it on another machine.
+A desk on this same machine shares UDP port 6454 with the relay, and a packet
+sent to a shared port by address reaches whichever socket the operating system
+picks. The relay therefore also listens on 127.0.0.1, which a packet addressed
+there reaches ahead of any socket bound to every address, and tells a desk on
+this machine to send there. A desk set to send to localhost needs no discovery
+at all; set it to send to this node or to localhost, not both, or every
+universe arrives twice.
 
 `truss-dmxmon` reports what a receiver would decode. It shows values rather than
 counts, which is the more useful measure: a stream can deliver every record
