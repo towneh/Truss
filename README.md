@@ -84,6 +84,20 @@ retains the newest value for each universe and packs as much as will fit into
 each video frame. Where the payload budget is exceeded it rotates through the
 universes, so one at the far end of the patch cannot starve.
 
+A desk that lists nodes rather than broadcasting will find one named Truss.
+The relay answers `ArtPoll` with the address the desk can reach it on, which on
+a machine with several adapters is the one a packet to the desk would leave
+from. Pick it and assign it the universes to carry; until DMX arrives the
+status line names the controller that found the node, so a show that is lit
+on the desk and dark in the stream is a patch problem and not a network one.
+The node advertises the universes it has heard, up to 32, and universe 0 before
+it has heard any, so a desk that searches by universe finds it from the first
+poll after that universe starts arriving.
+
+A desk on this same machine that unicasts shares UDP port 6454 with the relay,
+and the operating system hands each packet to one of the two. Set the desk to
+broadcast, or run it on another machine.
+
 `truss-dmxmon` reports what a receiver would decode. It shows values rather than
 counts, which is the more useful measure: a stream can deliver every record
 intact and still carry a snapshot that never changes, and that is a dead show

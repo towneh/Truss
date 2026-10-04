@@ -292,6 +292,28 @@ fn the_artnet_latch_honours_its_budget() {
 }
 
 #[test]
+fn a_poll_is_answered_with_a_well_formed_reply() {
+    each_case(
+        "artnet_poll",
+        400,
+        |rng| {
+            let mut d = b"Art-Net\0".to_vec();
+            d.extend_from_slice(&[0x00, 0x20, 0x00, 0x0E]); // OpPoll, protocol 14
+            d.push(rng.byte()); // flags, targeted mode among them
+            d.push(rng.byte()); // diagnostic priority
+            if rng.below(2) == 0 {
+                d.extend(rng.bytes(4)); // a target range, either way round
+            }
+            if rng.below(4) == 0 {
+                d.extend(rng.some_bytes(8)); // trailing bytes a newer controller might add
+            }
+            mutate(rng, &d.clone())
+        },
+        invariants::artnet_poll,
+    );
+}
+
+#[test]
 fn escaping_a_bitstream_round_trips() {
     each_case(
         "h264_nals",

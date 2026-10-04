@@ -179,6 +179,7 @@ fn main() -> Result<()> {
     }
     if let Some(a) = artnet.as_ref() {
         println!("  receiving Art-Net on {}", a.local_addr);
+        println!("    answering ArtPoll as \"Truss\", for a desk that picks nodes from a list");
         println!(
             "    up to {} payload bytes per frame; broadcast if another node shares this machine",
             cli.artnet_max_payload
@@ -765,11 +766,25 @@ fn report(
         if latch.out_of_order > 0 {
             line.push_str(&format!(" ({} late)", latch.out_of_order));
         }
+        if latch.polls > 0 {
+            line.push_str(&format!("  polls {}", latch.polls));
+        }
+        if latch.reply_errors > 0 {
+            line.push_str(&format!(" ({} replies failed)", latch.reply_errors));
+        }
         // An empty lane and a dead lane look identical in the record counts,
-        // so say which this is rather than leaving it to be inferred.
+        // so say which this is rather than leaving it to be inferred. A desk
+        // that has polled and sent nothing is a third case, waiting on the
+        // operator rather than on the network.
         artnet_note = latch.error.clone().or_else(|| {
-            (latch.packets == 0).then(|| {
-                "no Art-Net received yet: the carriers are crossing with empty payloads".into()
+            (latch.packets == 0).then(|| match latch.last_controller {
+                Some(c) => format!(
+                    "a controller at {c} has found this node and sent no DMX yet: \
+                     assign it a universe on the desk"
+                ),
+                None => {
+                    "no Art-Net received yet: the carriers are crossing with empty payloads".into()
+                }
             })
         });
     }

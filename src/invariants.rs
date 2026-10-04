@@ -175,6 +175,73 @@ pub fn payload_decode(data: &[u8]) {
     );
 }
 
+/// Anything that parses as an `ArtPoll` gets replies that are not mistakable
+/// for anything else and that advertise exactly the ports asked for.
+///
+/// A reply goes back out on the same port it listens on, so a reply that read
+/// as a poll would have two nodes answering each other for ever, and one that
+/// read as DMX would latch its own bytes as a universe. The counters and the
+/// universes come from the input, so the report text is exercised at every
+/// width and the packing at every mix of net and sub-net.
+pub fn artnet_poll(data: &[u8]) {
+    let Some(poll) = artnet::parse_poll(data) else {
+        return;
+    };
+
+    // The bytes after the header stand in for the latch: a run of universes in
+    // whatever order and quantity the input chose, well past the cap.
+    let universes = data
+        .chunks(2)
+        .map(|c| (u16::from(c[0]) << 8 | u16::from(*c.get(1).unwrap_or(&0))) & 0x7FFF);
+    let ports = artnet::advertised_ports(universes);
+    assert!(!ports.is_empty() && ports.len() <= artnet::MAX_ADVERTISED_PORTS);
+    let _ = poll.wants(ports.iter().copied());
+
+    let replies = u64::from(data.first().copied().unwrap_or(0)) * 97;
+    let packets = artnet::poll_replies(
+        std::net::Ipv4Addr::new(10, 0, 0, 2),
+        artnet::DEFAULT_PORT,
+        replies,
+        data.len(),
+        &ports,
+    );
+
+    let mut advertised = Vec::new();
+    for (i, reply) in packets.iter().enumerate() {
+        assert_eq!(reply.len(), artnet::POLL_REPLY_LEN);
+        assert!(
+            artnet::parse_poll(reply).is_none(),
+            "a reply must not read as a poll"
+        );
+        assert!(
+            artnet::parse_dmx(reply).is_none(),
+            "a reply must not read as DMX"
+        );
+        for end in [43, 107, 171] {
+            assert_eq!(
+                reply[end], 0,
+                "text field ending at {end} is not terminated"
+            );
+        }
+        assert_eq!(
+            usize::from(reply[211]),
+            (i + 1).min(255),
+            "bind indexes count from 1"
+        );
+        let n = usize::from(reply[173]);
+        assert!((1..=4).contains(&n), "a packet holds one to four ports");
+        for k in 0..n {
+            let port =
+                u16::from(reply[18]) << 8 | u16::from(reply[19]) << 4 | u16::from(reply[190 + k]);
+            advertised.push(port);
+        }
+    }
+    assert_eq!(
+        advertised, ports,
+        "the packets together advertise exactly the ports, in order"
+    );
+}
+
 /// Take arbitrary datagrams into the latch, then check the budget is honoured.
 ///
 /// Art-Net is unauthenticated by protocol design, so every byte here is

@@ -76,6 +76,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "artnet_poll"
+path = "fuzz_targets/artnet_poll.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "h264_nals"
 path = "fuzz_targets/h264_nals.rs"
 test = false

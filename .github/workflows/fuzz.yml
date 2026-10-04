@@ -35,6 +35,7 @@ jobs:
           - flv_roundtrip
           - payload_decode
           - artnet_packet
+          - artnet_poll
           - h264_nals
     steps:
       - uses: actions/checkout@v4

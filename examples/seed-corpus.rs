@@ -43,6 +43,7 @@ fn main() -> std::io::Result<()> {
         inv::payload_decode,
     )?;
     write(root, "artnet_packet", &artnet_seeds(), inv::artnet_packet)?;
+    write(root, "artnet_poll", &artnet_poll_seeds(), inv::artnet_poll)?;
     write(root, "h264_nals", &h264_seeds(), inv::h264_nals)?;
 
     Ok(())
@@ -245,6 +246,15 @@ fn artnet_seeds() -> Vec<Vec<u8>> {
         }
     }
     vec![generous, tight]
+}
+
+fn artnet_poll_seeds() -> Vec<Vec<u8>> {
+    let mut plain = b"Art-Net\0".to_vec();
+    plain.extend_from_slice(&[0x00, 0x20, 0x00, 0x0E, 0x00, 0x00]); // OpPoll, protocol 14
+    let mut targeted = b"Art-Net\0".to_vec();
+    targeted.extend_from_slice(&[0x00, 0x20, 0x00, 0x0E, 0x20, 0x00]); // targeted mode
+    targeted.extend_from_slice(&[0x00, 0x0F, 0x00, 0x00]); // port addresses 0 to 15
+    vec![plain, targeted]
 }
 
 fn h264_seeds() -> Vec<Vec<u8>> {
