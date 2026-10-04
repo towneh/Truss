@@ -495,6 +495,9 @@ fn relay_one(
     let mut upstream: Option<Upstream> = None;
     let mut meter = RateMeter::new();
     let mut last_report = Instant::now();
+    // The note under the status line is printed when it changes, not with
+    // every line: a desk sending the same way for an hour is said once.
+    let mut last_note: Option<String> = None;
     let mut buf = vec![0u8; 32 * 1024];
     obs.set_nonblocking(true)?;
 
@@ -635,7 +638,15 @@ fn relay_one(
         if last_report.elapsed() >= Duration::from_secs(5) {
             last_report = Instant::now();
             let queued = upstream.as_ref().map_or(0, |u| u.out.pending());
-            report(&meter, injector.as_ref(), cli, queued, artnet, osc.as_ref())?;
+            report(
+                &meter,
+                injector.as_ref(),
+                cli,
+                queued,
+                artnet,
+                osc.as_ref(),
+                &mut last_note,
+            )?;
         }
 
         if idle {
@@ -643,7 +654,15 @@ fn relay_one(
         }
     }
 
-    report(&meter, injector.as_ref(), cli, 0, artnet, osc.as_ref())?;
+    report(
+        &meter,
+        injector.as_ref(),
+        cli,
+        0,
+        artnet,
+        osc.as_ref(),
+        &mut last_note,
+    )?;
     Ok(())
 }
 
@@ -971,6 +990,7 @@ fn report(
     queued_bytes: usize,
     artnet: Option<&artnet::Receiver>,
     osc: Option<&osc::Sender>,
+    last_note: &mut Option<String>,
 ) -> Result<()> {
     let kbps = meter.kbps();
     if kbps <= 0.0 {
@@ -1007,8 +1027,11 @@ fn report(
         line.push_str(&format!("  [{} kB queued]", queued_bytes / 1024));
     }
     println!("{line}");
-    if let Some(note) = artnet_note {
-        println!("  {note}");
+    if artnet_note != *last_note {
+        if let Some(note) = &artnet_note {
+            println!("  {note}");
+        }
+        *last_note = artnet_note;
     }
 
     if kbps > cli.warn_kbps {
