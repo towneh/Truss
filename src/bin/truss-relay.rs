@@ -15,7 +15,7 @@
 //! carry a real send time and the detector's latency column works.
 
 use std::io::{ErrorKind, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -42,7 +42,7 @@ use truss::relay::{OutBuf, RateMeter};
     about = "Relay RTMP, planting DMX in the video on the way through"
 )]
 struct Cli {
-    /// Address to accept OBS on. Point OBS at rtmp://<this>/live with any key.
+    /// Address to accept the encoder on. Point it at rtmp://<this>/live with any key.
     #[arg(long, default_value = "127.0.0.1:1935")]
     listen: String,
     /// Ingest host and port to publish to.
@@ -61,7 +61,7 @@ struct Cli {
     #[arg(long)]
     stream_key_file: Option<String>,
     /// Comma-separated carrier slugs.
-    #[arg(long, default_value = "sei-unreg")]
+    #[arg(long, default_value = DEFAULT_CARRIERS)]
     carriers: String,
     /// Inject on every Nth video frame.
     #[arg(long, default_value_t = 1)]
@@ -79,7 +79,7 @@ struct Cli {
     /// Largest DMX payload to put in one frame. The default is the largest
     /// size measured crossing a remuxing CDN intact; more is untested rather than known
     /// to fail. Universes that do not fit are sent on the following frames.
-    #[arg(long, default_value_t = 9216)]
+    #[arg(long, default_value_t = DEFAULT_ARTNET_MAX_PAYLOAD)]
     artnet_max_payload: usize,
     /// Warn when the outgoing stream averages above this many kb/s.
     #[arg(long, default_value_t = 5500.0)]
@@ -92,6 +92,9 @@ struct Cli {
     #[arg(long)]
     passthrough: bool,
 }
+
+const DEFAULT_ARTNET_MAX_PAYLOAD: usize = 9216;
+const DEFAULT_CARRIERS: &str = "sei-unreg";
 
 fn now_unix_nanos() -> u64 {
     SystemTime::now()
@@ -159,15 +162,17 @@ fn main() -> Result<()> {
 
     let listener =
         TcpListener::bind(&cli.listen).with_context(|| format!("binding {}", cli.listen))?;
-    println!("relay listening on rtmp://{}/{}", cli.listen, cli.app);
-    println!("  point OBS at that URL with any stream key");
+    println!(
+        "relay listening on rtmp://{}/{}  (point the encoder here, any stream key)",
+        cli.listen, cli.app
+    );
     println!(
         "  forwarding to rtmp://{}/{} (key hidden)",
         cli.ingest, cli.app
     );
     if cli.passthrough {
-        println!("  passthrough mode: no carriers injected");
-    } else {
+        println!("  passthrough: nothing injected");
+    } else if cli.carriers.trim() != DEFAULT_CARRIERS {
         println!(
             "  carriers: {}",
             carriers
@@ -178,12 +183,16 @@ fn main() -> Result<()> {
         );
     }
     if let Some(a) = artnet.as_ref() {
-        println!("  receiving Art-Net on {}", a.local_addr);
-        println!("    answering ArtPoll as \"Truss\", for a desk that picks nodes from a list");
-        println!(
-            "    up to {} payload bytes per frame; broadcast if another node shares this machine",
-            cli.artnet_max_payload
-        );
+        match a.loopback_addr {
+            Some(lo) => println!("  Art-Net on {} and {lo}", a.local_addr),
+            None => println!("  Art-Net on {}", a.local_addr),
+        }
+        if cli.artnet_max_payload != DEFAULT_ARTNET_MAX_PAYLOAD {
+            println!(
+                "    up to {} payload bytes per frame",
+                cli.artnet_max_payload
+            );
+        }
         if carriers.len() > 1 {
             // Every carrier ships the same bytes, which is the point when the
             // question is which of them survives and pure cost once that is
@@ -197,8 +206,25 @@ fn main() -> Result<()> {
         }
     }
 
-    for stream in listener.incoming() {
-        let stream = stream.context("accepting connection")?;
+    listener
+        .set_nonblocking(true)
+        .context("setting the listener non-blocking")?;
+    let mut idle = IdleStatus::default();
+    loop {
+        let stream = match listener.accept() {
+            Ok((stream, _)) => stream,
+            Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
+                if let Some(a) = artnet.as_ref() {
+                    idle.print(a);
+                }
+                std::thread::sleep(Duration::from_millis(200));
+                continue;
+            }
+            Err(e) => return Err(e).context("accepting connection"),
+        };
+        stream
+            .set_nonblocking(false)
+            .context("setting the publisher socket blocking")?;
         let peer = stream
             .peer_addr()
             .map(|a| a.to_string())
@@ -208,8 +234,109 @@ fn main() -> Result<()> {
             Ok(()) => println!("-- session ended cleanly"),
             Err(e) => println!("-- session ended: {e:#}"),
         }
+        idle = IdleStatus::default();
     }
-    Ok(())
+}
+
+/// The Art-Net lane while no publisher is connected, printed when something
+/// about it changes: a universe appears, a controller polls, the first DMX
+/// arrives, the thread fails. Counts climbing on their own are not a change,
+/// so a desk that is steady is not narrated.
+#[derive(Default)]
+struct IdleStatus {
+    checked: Option<Instant>,
+    last: Option<IdleKey>,
+}
+
+type IdleKey = (
+    usize,
+    bool,
+    bool,
+    Option<SocketAddr>,
+    Option<String>,
+    bool,
+    bool,
+);
+
+impl IdleStatus {
+    fn print(&mut self, artnet: &artnet::Receiver) {
+        if self
+            .checked
+            .is_some_and(|t| t.elapsed() < Duration::from_secs(1))
+        {
+            return;
+        }
+        self.checked = Some(Instant::now());
+        let latch = artnet.latch();
+        let key: IdleKey = (
+            latch.universe_count(),
+            latch.packets > 0,
+            latch.polls > 0,
+            latch.last_controller,
+            latch.error.clone(),
+            latch.reply_errors > 0,
+            duplicate_senders(&latch),
+        );
+        if self.last.as_ref() == Some(&key) {
+            return;
+        }
+        let (line, note) = artnet_status(&latch);
+        println!("waiting for a publisher {line}");
+        if let Some(note) = note {
+            println!("  {note}");
+        }
+        self.last = Some(key);
+    }
+}
+
+/// Two senders on one universe each put the other's packets behind their
+/// own. A tenth is well above anything one sender reorders on a LAN, and 200
+/// packets is a couple of seconds of one desk, enough to judge by.
+fn duplicate_senders(latch: &artnet::Latch) -> bool {
+    latch.packets >= 200 && latch.out_of_order * 10 > latch.packets
+}
+
+/// The Art-Net fragment of a status line, and a note when the lane needs
+/// explaining.
+///
+/// An empty lane and a dead lane look identical in the record counts, so the
+/// note says which this is rather than leaving it to be inferred. A desk that
+/// has polled and sent nothing is a third case, waiting on the operator rather
+/// than on the network, and a steady share of late packets is a fourth: two
+/// senders carrying the same universes, which a desk does when it is set to
+/// send both to this node and to localhost.
+fn artnet_status(latch: &artnet::Latch) -> (String, Option<String>) {
+    let mut line = format!(
+        " dmx {} universes {} packets",
+        latch.universe_count(),
+        latch.packets
+    );
+    if latch.out_of_order > 0 {
+        line.push_str(&format!(" ({} late)", latch.out_of_order));
+    }
+    if latch.polls > 0 {
+        line.push_str(&format!("  polls {}", latch.polls));
+    }
+    if latch.reply_errors > 0 {
+        line.push_str(&format!(" ({} replies failed)", latch.reply_errors));
+    }
+    let note = latch.error.clone().or_else(|| {
+        (latch.packets == 0).then(|| match latch.last_controller {
+            Some(c) => format!(
+                "a controller at {c} has found this node and sent no DMX yet: \
+                 assign it a universe on the desk"
+            ),
+            None => "no Art-Net received yet: the carriers are crossing with empty payloads".into(),
+        })
+    });
+    let note = note.or_else(|| {
+        duplicate_senders(latch).then(|| {
+            "a steady share of packets arrive late: two senders are carrying the same \
+             universes, as a desk does when set to send both to this node and to localhost"
+                .into()
+        })
+    });
+    (line, note)
 }
 
 /// The upstream leg: our RTMP client connection to the ingest server.
@@ -757,36 +884,10 @@ fn report(
     }
     let mut artnet_note = None;
     if let Some(a) = artnet {
-        let latch = a.latch();
-        line.push_str(&format!(
-            "  dmx {} universes {} packets",
-            latch.universe_count(),
-            latch.packets
-        ));
-        if latch.out_of_order > 0 {
-            line.push_str(&format!(" ({} late)", latch.out_of_order));
-        }
-        if latch.polls > 0 {
-            line.push_str(&format!("  polls {}", latch.polls));
-        }
-        if latch.reply_errors > 0 {
-            line.push_str(&format!(" ({} replies failed)", latch.reply_errors));
-        }
-        // An empty lane and a dead lane look identical in the record counts,
-        // so say which this is rather than leaving it to be inferred. A desk
-        // that has polled and sent nothing is a third case, waiting on the
-        // operator rather than on the network.
-        artnet_note = latch.error.clone().or_else(|| {
-            (latch.packets == 0).then(|| match latch.last_controller {
-                Some(c) => format!(
-                    "a controller at {c} has found this node and sent no DMX yet: \
-                     assign it a universe on the desk"
-                ),
-                None => {
-                    "no Art-Net received yet: the carriers are crossing with empty payloads".into()
-                }
-            })
-        });
+        let (fragment, note) = artnet_status(&a.latch());
+        line.push(' ');
+        line.push_str(&fragment);
+        artnet_note = note;
     }
     if queued_bytes > 64 * 1024 {
         // A persistent queue means the upload is not keeping up, which shows
@@ -802,7 +903,7 @@ fn report(
         println!(
             "  WARNING: {kbps:.0} kb/s is above {:.0}. many ingests count video and audio \
              together against 6000 + 320 kb/s and warns for five minutes before \
-             disconnecting. Lower the OBS bitrate or raise --every.",
+             disconnecting. Lower the encoder bitrate or raise --every.",
             cli.warn_kbps
         );
     }
