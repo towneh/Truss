@@ -114,6 +114,14 @@ localhost needs no discovery at all. Set it to send to this node or to
 localhost, not both, or every universe arrives twice and the status line
 reports a steady share of packets late.
 
+At a terminal the relay shows a panel redrawn in place: the encoder and ingest,
+the stream's bitrate and frames, the Art-Net lane and the OSC lane, each as a
+rate beside a running total. Anything wrong right now is listed under it while
+it holds, and the last few connections and disconnections under that.
+`--show-logging` prints a line for everything instead, which is also what it
+does whenever its output is not a terminal, so a service log or a file gets
+lines rather than a redrawn screen.
+
 `truss-dmxmon` reports what a receiver would decode. It shows values rather than
 counts, which is the more useful measure: a stream can deliver every record
 intact and still carry a snapshot that never changes, and that is a dead show
@@ -126,7 +134,9 @@ truss-dmxmon rtsp://your-egress/live/stream --universe 0
 `--universe` prints that universe as a grid on every status line. `--watch
 0.1-16` prints only the channels named, and only as they change, which is the
 shorter way to answer whether one fixture is moving; slots are numbered from 1,
-as on a desk. It reads the same sources `truss-detect` does.
+as on a desk. It reads the same sources `truss-detect` does. On a live source at
+a terminal it redraws one panel in place, the grid and the watched channels'
+current values included; `--show-logging` gives the scrolling lines instead.
 
 ## Watching the desk with nothing else running
 

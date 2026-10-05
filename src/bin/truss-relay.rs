@@ -30,6 +30,7 @@ use rml_rtmp::sessions::{
 use rml_rtmp::time::RtmpTimestamp;
 use truss::artnet;
 use truss::carrier::{self, Carrier};
+use truss::console;
 use truss::creds;
 use truss::inject::{InjectOptions, Injector};
 use truss::osc;
@@ -112,6 +113,10 @@ struct Cli {
     /// stream carries, at the video's frame rate.
     #[arg(long, default_value_t = 30.0)]
     osc_rate: f64,
+    /// Print a line for everything as it happens instead of a panel redrawn
+    /// in place. Always the case when the output is not a terminal.
+    #[arg(long)]
+    show_logging: bool,
 }
 
 const DEFAULT_ARTNET_MAX_PAYLOAD: usize = 9216;
@@ -271,6 +276,11 @@ fn main() -> Result<()> {
         println!("  OSC to {} as {}", o.target(), osc::ADDRESS);
     }
 
+    console::init(cli.show_logging);
+    if console::panel() {
+        println!();
+    }
+    let mut dash = Dashboard::default();
     let mut idle = IdleStatus::default();
     let mut next_tick = Instant::now();
 
@@ -290,6 +300,7 @@ fn main() -> Result<()> {
                 "osc only",
                 cli.artnet_max_payload,
             );
+            dash.tick(&cli, None, Some(a), osc.as_ref());
             std::thread::sleep(nap);
         }
     };
@@ -313,6 +324,7 @@ fn main() -> Result<()> {
                     ),
                     None => Duration::from_millis(200),
                 };
+                dash.tick(&cli, None, artnet.as_ref(), osc.as_ref());
                 std::thread::sleep(nap);
                 continue;
             }
@@ -325,7 +337,8 @@ fn main() -> Result<()> {
             .peer_addr()
             .map(|a| a.to_string())
             .unwrap_or_else(|_| "?".into());
-        println!("\n-- publisher connected from {peer}");
+        console::log("");
+        console::event(format!("-- publisher connected from {peer}"));
         match relay_one(
             stream,
             &cli,
@@ -333,9 +346,11 @@ fn main() -> Result<()> {
             artnet.as_ref(),
             &mut osc,
             key.as_ref(),
+            &peer,
+            &mut dash,
         ) {
-            Ok(()) => println!("-- session ended cleanly"),
-            Err(e) => println!("-- session ended: {e:#}"),
+            Ok(()) => console::event("-- session ended cleanly"),
+            Err(e) => console::event(format!("-- session ended: {e:#}")),
         }
         idle = IdleStatus::default();
     }
@@ -421,11 +436,206 @@ impl IdleStatus {
         if let Some(o) = osc {
             line.push_str(&osc_status(o));
         }
-        println!("{label} {line}");
+        console::log(format!("{label} {line}"));
         if let Some(note) = note {
-            println!("  {note}");
+            console::log(format!("  {note}"));
         }
         self.last = Some(key);
+    }
+}
+
+/// What a connected publisher's session shows on the panel.
+struct SessionView<'a> {
+    peer: &'a str,
+    since: Instant,
+    publishing: bool,
+    meter: &'a RateMeter,
+    injector: Option<&'a Injector>,
+    queued: usize,
+}
+
+#[derive(Default, Clone, Copy)]
+struct Counts {
+    packets: u64,
+    late: u64,
+    osc: u64,
+    frames: u64,
+}
+
+/// The panel's side of the relay: when it last drew, and the counts it last
+/// sampled, so each rate is over the last second or so rather than the run.
+#[derive(Default)]
+struct Dashboard {
+    drawn: Option<Instant>,
+    sampled: Option<(Instant, Counts)>,
+    per_sec: [f64; 4],
+}
+
+impl Dashboard {
+    fn tick(
+        &mut self,
+        cli: &Cli,
+        session: Option<SessionView>,
+        artnet: Option<&artnet::Receiver>,
+        osc: Option<&osc::Sender>,
+    ) {
+        if !console::panel()
+            || self
+                .drawn
+                .is_some_and(|t| t.elapsed() < Duration::from_secs(1))
+        {
+            return;
+        }
+        self.drawn = Some(Instant::now());
+        let body = self.body(cli, session.as_ref(), artnet, osc);
+        console::draw(body);
+    }
+
+    fn sample(&mut self, now: Counts) {
+        let at = Instant::now();
+        if let Some((then, before)) = self.sampled {
+            let secs = at.duration_since(then).as_secs_f64();
+            if secs < 0.5 {
+                return;
+            }
+            let rate = |a: u64, b: u64| a.saturating_sub(b) as f64 / secs;
+            self.per_sec = [
+                rate(now.packets, before.packets),
+                rate(now.late, before.late),
+                rate(now.osc, before.osc),
+                rate(now.frames, before.frames),
+            ];
+        }
+        self.sampled = Some((at, now));
+    }
+
+    fn body(
+        &mut self,
+        cli: &Cli,
+        session: Option<&SessionView>,
+        artnet: Option<&artnet::Receiver>,
+        osc: Option<&osc::Sender>,
+    ) -> Vec<String> {
+        let latch = artnet.map(|a| a.latch());
+        self.sample(Counts {
+            packets: latch.as_ref().map_or(0, |l| l.packets),
+            late: latch.as_ref().map_or(0, |l| l.out_of_order),
+            osc: osc.map_or(0, |o| o.sent),
+            frames: session
+                .and_then(|s| s.injector)
+                .map_or(0, |i| i.stats.video_frames),
+        });
+        let [packets_s, late_s, osc_s, frames_s] = self.per_sec;
+        let mut warnings = Vec::new();
+
+        let mut lines = vec![format!(
+            "truss-relay{}   up {}",
+            if cli.publish.is_none() {
+                "  (OSC lane only)"
+            } else {
+                ""
+            },
+            console::clock(console::uptime())
+        )];
+
+        if cli.publish.is_some() {
+            let listen = format!("rtmp://{}/{}", cli.listen, cli.target.app);
+            lines.push(match session {
+                Some(s) => format!(
+                    "encoder   {listen}   connected from {} for {}",
+                    s.peer,
+                    console::clock(s.since.elapsed())
+                ),
+                None => format!("encoder   {listen}   waiting for a publisher"),
+            });
+            lines.push(format!(
+                "ingest    {}   {}",
+                cli.target.url(),
+                match session {
+                    None => "not connected",
+                    Some(s) if s.publishing => "publishing",
+                    Some(_) => "connecting",
+                }
+            ));
+            if let Some(s) = session {
+                let kbps = s.meter.kbps();
+                let mut line = format!("stream    {kbps:.0} kb/s out");
+                match s.injector {
+                    Some(inj) => {
+                        line.push_str(&format!(
+                            "   frames {} ({frames_s:.1}/s)",
+                            console::count(inj.stats.video_frames)
+                        ));
+                        for (carrier, n) in &inj.stats.injected {
+                            line.push_str(&format!("   {carrier} {}", console::count(*n)));
+                        }
+                        line.push_str(&format!(
+                            "   +{} kB added",
+                            console::count(inj.stats.added_bytes / 1000)
+                        ));
+                    }
+                    None => line.push_str("   passthrough, nothing injected"),
+                }
+                lines.push(line);
+                if kbps > cli.warn_kbps {
+                    warnings.push(format!(
+                        "{kbps:.0} kb/s is above {:.0}: lower the encoder bitrate or raise --every",
+                        cli.warn_kbps
+                    ));
+                }
+                if s.queued > 64 * 1024 {
+                    warnings.push(format!(
+                        "{} kB queued: the upload is not keeping up",
+                        s.queued / 1024
+                    ));
+                }
+            }
+        }
+
+        if let Some(l) = latch.as_ref() {
+            let mut line = format!(
+                "art-net   {} universes   {packets_s:.0} pkt/s ({})   late {late_s:.0}/s ({})",
+                l.universe_count(),
+                console::count(l.packets),
+                console::count(l.out_of_order)
+            );
+            if l.polls > 0 {
+                line.push_str(&format!("   polls {}", console::count(l.polls)));
+            }
+            lines.push(line);
+            if l.polls_unanswered > 0 {
+                warnings.push(format!(
+                    "{} polls unanswered: no route to the controller",
+                    l.polls_unanswered
+                ));
+            }
+            if l.reply_errors > 0 {
+                warnings.push(format!("{} poll replies failed", l.reply_errors));
+            }
+            if let (_, Some(note)) = artnet_status(l) {
+                warnings.push(note);
+            }
+        }
+        drop(latch);
+
+        if let Some(o) = osc {
+            let mut line = format!(
+                "osc       {} as {}   {osc_s:.1}/s ({})",
+                o.target(),
+                osc::ADDRESS,
+                console::count(o.sent)
+            );
+            if o.failed > 0 {
+                line.push_str(&format!("   {} failed", console::count(o.failed)));
+            }
+            lines.push(line);
+        }
+
+        if !warnings.is_empty() {
+            lines.push(String::new());
+            lines.extend(warnings.into_iter().map(|w| format!("! {w}")));
+        }
+        lines
     }
 }
 
@@ -504,6 +714,7 @@ struct Upstream {
     pending_metadata: Option<StreamMetadata>,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn relay_one(
     mut obs: TcpStream,
     cli: &Cli,
@@ -511,7 +722,10 @@ fn relay_one(
     artnet: Option<&artnet::Receiver>,
     osc: &mut Option<osc::Sender>,
     key: Option<&creds::StreamKey>,
+    peer: &str,
+    dash: &mut Dashboard,
 ) -> Result<()> {
+    let started = Instant::now();
     obs.set_nodelay(true).ok();
     let leftover = server_handshake(&mut obs)?;
 
@@ -573,7 +787,7 @@ fn relay_one(
 
         match obs.read(&mut buf) {
             Ok(0) => {
-                println!("publisher disconnected");
+                console::event("publisher disconnected");
                 break;
             }
             Ok(n) => {
@@ -643,7 +857,7 @@ fn relay_one(
                                     );
                                 }
                                 ClientSessionEvent::PublishRequestAccepted => {
-                                    println!("ingest accepted the publish");
+                                    console::event("ingest accepted the publish");
                                     up.publishing = true;
                                     just_accepted = true;
                                 }
@@ -658,7 +872,7 @@ fn relay_one(
                                             "the ingest server refused the publish ({code}). If the key is                                              right, the previous session is probably still                                              connected: wait for the stream to drop, or press                                              Disconnect in the control panel."
                                         );
                                     }
-                                    println!("ingest status: {code}");
+                                    console::event(format!("ingest status: {code}"));
                                 }
                                 _ => {}
                             },
@@ -700,6 +914,20 @@ fn relay_one(
                 &mut last_note,
             )?;
         }
+
+        dash.tick(
+            cli,
+            Some(SessionView {
+                peer,
+                since: started,
+                publishing: upstream.as_ref().is_some_and(|u| u.publishing),
+                meter: &meter,
+                injector: injector.as_ref(),
+                queued: upstream.as_ref().map_or(0, |u| u.out.pending()),
+            }),
+            artnet,
+            osc.as_ref(),
+        );
 
         if idle {
             std::thread::sleep(Duration::from_millis(1));
@@ -750,9 +978,9 @@ fn handle_publisher_event(
         } => {
             // OBS's key is ignored: the relay holds the real one. Any value
             // works locally, which keeps the real key out of OBS entirely.
-            println!(
+            console::log(format!(
                 "publisher requested stream key {stream_key:?} (ignored, relay holds the real key)"
-            );
+            ));
             let results = server
                 .accept_request(request_id)
                 .map_err(|e| anyhow!("accept_request: {e:?}"))?;
@@ -822,7 +1050,7 @@ fn handle_publisher_event(
             forward_av(upstream, meter, false, data, timestamp)?;
         }
         ServerSessionEvent::PublishStreamFinished { .. } => {
-            println!("publisher stopped");
+            console::event("publisher stopped");
         }
         _ => {}
     }
@@ -879,7 +1107,7 @@ fn flush_pending(up: &mut Upstream, meter: &mut RateMeter) -> Result<()> {
     let pending = std::mem::take(&mut up.pending);
     up.pending_bytes = 0;
     if !pending.is_empty() {
-        println!("flushing {} buffered messages", pending.len());
+        console::log(format!("flushing {} buffered messages", pending.len()));
     }
     for (is_video, data, ts) in pending {
         publish_one(up, meter, is_video, data, ts)?;
@@ -928,7 +1156,7 @@ fn queue_server(out: &mut OutBuf, results: Vec<ServerSessionResult>) {
 }
 
 fn connect_upstream(cli: &Cli) -> Result<Upstream> {
-    println!("connecting to {}...", cli.target.authority);
+    console::event(format!("connecting to {}...", cli.target.authority));
     let mut socket = TcpStream::connect(&cli.target.authority)
         .with_context(|| format!("connecting to {}", cli.target.authority))?;
     socket.set_nodelay(true).ok();
@@ -1078,21 +1306,21 @@ fn report(
         // up to viewers as stutter long before it shows up as an error.
         line.push_str(&format!("  [{} kB queued]", queued_bytes / 1024));
     }
-    println!("{line}");
+    console::log(&line);
     if artnet_note != *last_note {
         if let Some(note) = &artnet_note {
-            println!("  {note}");
+            console::log(format!("  {note}"));
         }
         *last_note = artnet_note;
     }
 
     if kbps > cli.warn_kbps {
-        println!(
+        console::log(format!(
             "  WARNING: {kbps:.0} kb/s is above {:.0}. many ingests count video and audio \
              together against 6000 + 320 kb/s and warns for five minutes before \
              disconnecting. Lower the encoder bitrate or raise --every.",
             cli.warn_kbps
-        );
+        ));
     }
     // Aborting is opt-in on purpose. A bitrate flag expires after 24 hours and
     // does not count towards the strike system, whereas killing the relay

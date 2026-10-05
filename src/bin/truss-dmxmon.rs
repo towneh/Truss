@@ -19,6 +19,7 @@ use clap::Parser;
 use std::io::ErrorKind;
 use std::net::{SocketAddr, UdpSocket};
 use truss::carrier::Carrier;
+use truss::console;
 use truss::detect::ts::TsAnalyzer;
 use truss::h264;
 use truss::monitor::DmxState;
@@ -62,6 +63,11 @@ struct Common {
     /// Print this universe's values as a grid on every status line.
     #[arg(long)]
     universe: Option<u16>,
+    /// Print a status line every interval instead of a panel redrawn in
+    /// place. Always the case when the output is not a terminal, or the
+    /// source is a file.
+    #[arg(long)]
+    show_logging: bool,
 }
 
 /// A channel range a desk operator would recognise: universe, first and last
@@ -147,6 +153,8 @@ fn main() -> Result<()> {
     // figure there, the same way latency is reported as offline rather than as
     // the age of the file.
     let live = src.freshness == Freshness::Live;
+    console::init(common.show_logging || !live);
+    let source = input.describe();
     let mut ts = TsAnalyzer::new();
     let mut tally = Tally::new(watches);
     let mut buf = vec![0u8; 64 * 1024];
@@ -155,7 +163,7 @@ fn main() -> Result<()> {
     let mut last_report = Instant::now();
     let interval = Duration::from_secs_f64(common.interval.max(0.1));
 
-    println!("reading {}...", input.describe());
+    println!("reading {source}...");
 
     loop {
         if let Some(secs) = common.max_seconds
@@ -181,7 +189,13 @@ fn main() -> Result<()> {
         }
 
         if live && last_report.elapsed() >= interval {
-            tally.status(last_report.elapsed().as_secs_f64(), live, common.universe);
+            tally.status(
+                last_report.elapsed().as_secs_f64(),
+                live,
+                common.universe,
+                source,
+                0,
+            );
             last_report = Instant::now();
         }
     }
@@ -209,6 +223,8 @@ fn watch_osc(listen: SocketAddr, common: &Common) -> Result<()> {
     let mut tally = Tally::new(watches);
     let mut buf = vec![0u8; 64 * 1024];
     let mut not_ours = 0u64;
+    console::init(common.show_logging);
+    let source = format!("osc://{}", socket.local_addr()?);
 
     let started = Instant::now();
     let mut last_report = Instant::now();
@@ -245,13 +261,22 @@ fn watch_osc(listen: SocketAddr, common: &Common) -> Result<()> {
         }
 
         if last_report.elapsed() >= interval {
-            tally.status(last_report.elapsed().as_secs_f64(), true, common.universe);
+            tally.status(
+                last_report.elapsed().as_secs_f64(),
+                true,
+                common.universe,
+                &source,
+                not_ours,
+            );
             if not_ours > 0 {
-                println!(
+                console::log(format!(
                     "  [{not_ours} datagrams that were not {}]",
                     truss::osc::ADDRESS
-                );
+                ));
             }
+            // Per interval, like the rates beside it, so a stray sender that
+            // has stopped stops being reported.
+            not_ours = 0;
             last_report = Instant::now();
         }
     }
@@ -302,32 +327,121 @@ impl Tally {
         }
     }
 
-    fn status(&mut self, secs: f64, live: bool, universe: Option<u16>) {
-        print_status(
-            &self.state,
-            &self.window,
-            secs,
-            live,
-            self.malformed,
-            self.out_of_range,
-        );
-        if let Some(u) = universe {
-            print_universe(&self.state, u);
+    fn status(
+        &mut self,
+        secs: f64,
+        live: bool,
+        universe: Option<u16>,
+        source: &str,
+        not_ours: u64,
+    ) {
+        if console::panel() {
+            console::draw(self.panel(secs, universe, source, not_ours));
+        } else {
+            console::log(status_line(
+                &self.state,
+                &self.window,
+                secs,
+                live,
+                self.malformed,
+                self.out_of_range,
+            ));
+            if let Some(u) = universe {
+                for line in universe_lines(&self.state, u) {
+                    console::log(line);
+                }
+            }
         }
         self.window = Window::default();
     }
 
+    /// The panel: this interval's rates beside the totals, the watched
+    /// channels' current values, what is wrong right now, and the grid.
+    fn panel(&self, secs: f64, universe: Option<u16>, source: &str, not_ours: u64) -> Vec<String> {
+        let rate = |n: u64| if secs > 0.0 { n as f64 / secs } else { 0.0 };
+        let mut lines = vec![
+            format!(
+                "truss-dmxmon   {source}   up {}",
+                console::clock(console::uptime())
+            ),
+            format!(
+                "records   {:.1}/s ({})",
+                rate(self.window.records),
+                console::count(self.totals.records)
+            ),
+            format!(
+                "changes   {:.0} ch/s ({})",
+                rate(self.window.changed),
+                console::count(self.totals.changed)
+            ),
+            format!(
+                "universes {}   {} channels   oldest {:.1} ms",
+                self.state.universe_count(),
+                console::count(self.state.channel_count() as u64),
+                oldest_age_ms(&self.state)
+            ),
+        ];
+        if !self.watches.is_empty() {
+            let mut line = String::from("watch    ");
+            for w in &self.watches {
+                for slot in w.first..=w.last {
+                    let value = self
+                        .state
+                        .value(w.universe, slot - 1)
+                        .map_or("-".to_string(), |v| v.to_string());
+                    line.push_str(&format!("  {}.{slot}={value}", w.universe));
+                }
+            }
+            lines.push(line);
+        }
+
+        let mut warnings = Vec::new();
+        if self.window.records == 0 {
+            warnings.push("no records this interval".to_string());
+        }
+        if self.malformed > 0 {
+            warnings.push(format!("{} malformed", console::count(self.malformed)));
+        }
+        if self.out_of_range > 0 {
+            warnings.push(format!(
+                "{} slots past the end of a universe",
+                console::count(self.out_of_range)
+            ));
+        }
+        if not_ours > 0 {
+            warnings.push(format!(
+                "{} datagrams that were not {}",
+                console::count(not_ours),
+                truss::osc::ADDRESS
+            ));
+        }
+        if !warnings.is_empty() {
+            lines.push(String::new());
+            lines.extend(warnings.into_iter().map(|w| format!("! {w}")));
+        }
+        if let Some(u) = universe {
+            lines.push(String::new());
+            lines.extend(universe_lines(&self.state, u));
+        }
+        lines
+    }
+
     fn finish(&self, secs: f64, live: bool, universe: Option<u16>) {
-        print_status(
-            &self.state,
-            &self.totals,
-            secs,
-            live,
-            self.malformed,
-            self.out_of_range,
+        println!(
+            "{}",
+            status_line(
+                &self.state,
+                &self.totals,
+                secs,
+                live,
+                self.malformed,
+                self.out_of_range,
+            )
         );
         if let Some(u) = universe {
-            print_universe(&self.state, u);
+            for line in universe_lines(&self.state, u) {
+                println!("{line}");
+            }
         }
     }
 }
@@ -361,16 +475,24 @@ fn records_in(annexb: &[u8]) -> Vec<Vec<u8>> {
     out
 }
 
-fn print_status(
+fn oldest_age_ms(state: &DmxState) -> f64 {
+    state
+        .universes()
+        .map(|(_, u)| u.last_age_us)
+        .max()
+        .unwrap_or(0) as f64
+        / 1000.0
+}
+
+fn status_line(
     state: &DmxState,
     window: &Window,
     secs: f64,
     live: bool,
     malformed: u64,
     out_of_range: u64,
-) {
-    let ages: Vec<u32> = state.universes().map(|(_, u)| u.last_age_us).collect();
-    let age = ages.iter().copied().max().unwrap_or(0) as f64 / 1000.0;
+) -> String {
+    let age = oldest_age_ms(state);
 
     let counts = if live && secs > 0.0 {
         format!(
@@ -404,19 +526,18 @@ fn print_status(
     if window.records == 0 {
         line.push_str("  <- no records this interval");
     }
-    println!("{line}");
+    line
 }
 
-fn print_universe(state: &DmxState, universe: u16) {
+fn universe_lines(state: &DmxState, universe: u16) -> Vec<String> {
     let Some(u) = state.universe(universe) else {
-        println!("  universe {universe}: not seen");
-        return;
+        return vec![format!("  universe {universe}: not seen")];
     };
-    println!(
+    let mut lines = vec![format!(
         "  universe {universe}, {} channels, age {:.1} ms",
         u.len,
         f64::from(u.last_age_us) / 1000.0
-    );
+    )];
     for row in 0..u.len.div_ceil(16) {
         let start = row * 16;
         let end = (start + 16).min(u.len);
@@ -424,8 +545,9 @@ fn print_universe(state: &DmxState, universe: u16) {
             .iter()
             .map(|v| format!("{v:>3}"))
             .collect();
-        println!("   {:>4}: {}", start + 1, cells.join(" "));
+        lines.push(format!("   {:>4}: {}", start + 1, cells.join(" ")));
     }
+    lines
 }
 
 fn report_watches(state: &DmxState, watches: &[Watch], last: &mut BTreeMap<(u16, u16), u8>) {
@@ -437,7 +559,7 @@ fn report_watches(state: &DmxState, watches: &[Watch], last: &mut BTreeMap<(u16,
             };
             let key = (w.universe, slot);
             if last.insert(key, v) != Some(v) {
-                println!("  {}.{} = {}", w.universe, slot, v);
+                console::log(format!("  {}.{} = {}", w.universe, slot, v));
             }
         }
     }

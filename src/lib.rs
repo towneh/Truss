@@ -17,6 +17,7 @@
 
 pub mod artnet;
 pub mod carrier;
+pub mod console;
 pub mod creds;
 pub mod detect;
 pub mod flv;
