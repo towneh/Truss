@@ -150,6 +150,15 @@ loss and order on the lane rather than on the stream. The port is 12100 by
 default, clear of Art-Net, the VRSL Grid Node and QLC+; `osc://:12200` or
 `osc://192.168.1.20:12200` listens elsewhere.
 
+Leave out `--publish` to run the lane alone, for testing against a desk with
+no encoder or ingest. Nothing listens for an encoder and no stream key is
+needed, so the stream-only flags (`--listen`, `--stream-key-file`,
+`--carriers` and the rest) are refused:
+
+```sh
+truss-relay --artnet --osc 127.0.0.1:12100
+```
+
 `truss-detect osc:// --max-seconds 10` scores the lane the way it scores a stream.
 Nothing on this path crosses a CDN, so a gap here is the relay's, and a gap
 only in the stream is the path's.

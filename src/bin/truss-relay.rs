@@ -44,13 +44,17 @@ use truss::relay::{Ingest, OutBuf, RateMeter};
 )]
 struct Cli {
     /// Address to accept the encoder on. Point it at rtmp://<this>/live with any key.
-    #[arg(long, default_value = "127.0.0.1:1935")]
+    #[arg(long, default_value = "127.0.0.1:1935", requires = "publish")]
     listen: String,
     /// Where to publish the stream: rtmp://host/app, with the port after the
     /// host when it is not 1935, and "live" when no application is given.
     /// The stream key is never part of this: see --stream-key-file.
-    #[arg(long)]
-    publish: String,
+    ///
+    /// Leave it out to run the OSC lane alone, for testing against a desk
+    /// with no encoder or ingest: then --artnet and --osc are needed, and
+    /// nothing listens for an encoder.
+    #[arg(long, required_unless_present = "osc")]
+    publish: Option<String>,
     #[arg(skip)]
     target: Ingest,
     /// File holding the stream key, or `-` to read it from stdin. Suits
@@ -60,17 +64,17 @@ struct Cli {
     ///
     /// There is deliberately no flag that takes the key itself: an argument is
     /// visible to anything that can list processes.
-    #[arg(long)]
+    #[arg(long, requires = "publish")]
     stream_key_file: Option<String>,
     /// Comma-separated carrier slugs.
-    #[arg(long, default_value = DEFAULT_CARRIERS)]
+    #[arg(long, default_value = DEFAULT_CARRIERS, requires = "publish")]
     carriers: String,
     /// Inject on every Nth video frame.
-    #[arg(long, default_value_t = 1)]
+    #[arg(long, default_value_t = 1, requires = "publish")]
     every: u32,
     /// Payload bytes per record. Ignored with --artnet, which sizes each
     /// payload from the universes the desk is sending.
-    #[arg(long, default_value_t = DEFAULT_PAYLOAD_LEN)]
+    #[arg(long, default_value_t = DEFAULT_PAYLOAD_LEN, requires = "publish")]
     payload_len: usize,
     /// Carry live Art-Net DMX. On its own this listens on every adapter, port
     /// 6454, and hears a desk on this machine as well as one on the network.
@@ -89,14 +93,14 @@ struct Cli {
     #[arg(long, default_value_t = DEFAULT_ARTNET_MAX_PAYLOAD)]
     artnet_max_payload: usize,
     /// Warn when the outgoing stream averages above this many kb/s.
-    #[arg(long, default_value_t = 5500.0)]
+    #[arg(long, default_value_t = 5500.0, requires = "publish")]
     warn_kbps: f64,
     /// Stop the relay if the outgoing stream sustains this rate. Off by
     /// default: see the note where this is used.
-    #[arg(long)]
+    #[arg(long, requires = "publish")]
     abort_kbps: Option<f64>,
     /// Relay without injecting, to measure what the relay itself costs.
-    #[arg(long)]
+    #[arg(long, requires = "publish")]
     passthrough: bool,
     /// Also send every record to this OSC listener, as /truss/dmx with the
     /// record as a blob, so a tool on this network can watch the desk without
@@ -137,7 +141,9 @@ fn parse_carriers(spec: &str) -> Result<Vec<Carrier>> {
 
 fn main() -> Result<()> {
     let mut cli = Cli::parse();
-    cli.target = Ingest::parse(&cli.publish)?;
+    if let Some(publish) = cli.publish.as_deref() {
+        cli.target = Ingest::parse(publish)?;
+    }
     let carriers = parse_carriers(&cli.carriers)?;
 
     // Art-Net is unauthenticated by protocol design, so how many universes turn
@@ -154,7 +160,7 @@ fn main() -> Result<()> {
 
     // Resolved before the listener is bound. A missing key should fail while
     // the operator is still watching, not on the first frame of a show.
-    let key = if cli.passthrough {
+    let key = if cli.passthrough || cli.publish.is_none() {
         None
     } else {
         Some(creds::StreamKey::resolve(
@@ -209,13 +215,22 @@ fn main() -> Result<()> {
         None => None,
     };
 
-    let listener =
-        TcpListener::bind(&cli.listen).with_context(|| format!("binding {}", cli.listen))?;
-    println!(
-        "relay listening on rtmp://{}/{}  (point the encoder here, any stream key)",
-        cli.listen, cli.target.app
-    );
-    println!("  forwarding to {} (key hidden)", cli.target.url());
+    let listener = match cli.publish {
+        Some(_) => {
+            let listener = TcpListener::bind(&cli.listen)
+                .with_context(|| format!("binding {}", cli.listen))?;
+            println!(
+                "relay listening on rtmp://{}/{}  (point the encoder here, any stream key)",
+                cli.listen, cli.target.app
+            );
+            println!("  forwarding to {} (key hidden)", cli.target.url());
+            Some(listener)
+        }
+        None => {
+            println!("relay running the OSC lane only: no encoder accepted, nothing published");
+            None
+        }
+    };
     if cli.passthrough {
         println!("  passthrough: nothing injected");
     } else if cli.carriers.trim() != DEFAULT_CARRIERS {
@@ -256,33 +271,46 @@ fn main() -> Result<()> {
         println!("  OSC to {} as {}", o.target(), osc::ADDRESS);
     }
 
+    let mut idle = IdleStatus::default();
+    let mut next_tick = Instant::now();
+
+    let Some(listener) = listener else {
+        // --osc is required without --publish, and needs --artnet, both
+        // checked above.
+        let Some(a) = artnet.as_ref() else {
+            bail!("the OSC lane needs --artnet");
+        };
+        loop {
+            let nap = tend_lane(
+                a,
+                &mut osc,
+                tick,
+                &mut next_tick,
+                &mut idle,
+                "osc only",
+                cli.artnet_max_payload,
+            );
+            std::thread::sleep(nap);
+        }
+    };
+
     listener
         .set_nonblocking(true)
         .context("setting the listener non-blocking")?;
-    let mut idle = IdleStatus::default();
-    let mut next_tick = Instant::now();
     loop {
         let stream = match listener.accept() {
             Ok((stream, _)) => stream,
             Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
-                if let Some(a) = artnet.as_ref() {
-                    idle.print(a, osc.as_ref());
-                    // With no publisher the lane runs on its own clock, from
-                    // the latch, so a desk can be watched with nothing else up.
-                    if let (Some(o), Some(tick)) = (osc.as_mut(), tick)
-                        && Instant::now() >= next_tick
-                    {
-                        let blocks = a.latch().snapshot(Instant::now(), cli.artnet_max_payload);
-                        if let Ok(body) = truss::payload::encode(&blocks) {
-                            o.send(&body, now_unix_nanos());
-                        }
-                        next_tick = Instant::now() + tick;
-                    }
-                }
-                let nap = match tick {
-                    Some(_) => next_tick
-                        .saturating_duration_since(Instant::now())
-                        .min(Duration::from_millis(200)),
+                let nap = match artnet.as_ref() {
+                    Some(a) => tend_lane(
+                        a,
+                        &mut osc,
+                        tick,
+                        &mut next_tick,
+                        &mut idle,
+                        "waiting for a publisher",
+                        cli.artnet_max_payload,
+                    ),
                     None => Duration::from_millis(200),
                 };
                 std::thread::sleep(nap);
@@ -313,6 +341,37 @@ fn main() -> Result<()> {
     }
 }
 
+/// One pass over the Art-Net lane while no publisher is connected: the status
+/// line when it has changed, and a record to --osc when the lane's own clock
+/// is due, so a desk can be watched with nothing else up. Returns how long to
+/// sleep before the next pass.
+fn tend_lane(
+    artnet: &artnet::Receiver,
+    osc: &mut Option<osc::Sender>,
+    tick: Option<Duration>,
+    next_tick: &mut Instant,
+    idle: &mut IdleStatus,
+    label: &str,
+    max_payload: usize,
+) -> Duration {
+    idle.print(label, artnet, osc.as_ref());
+    if let (Some(o), Some(tick)) = (osc.as_mut(), tick)
+        && Instant::now() >= *next_tick
+    {
+        let blocks = artnet.latch().snapshot(Instant::now(), max_payload);
+        if let Ok(body) = truss::payload::encode(&blocks) {
+            o.send(&body, now_unix_nanos());
+        }
+        *next_tick = Instant::now() + tick;
+    }
+    match tick {
+        Some(_) => next_tick
+            .saturating_duration_since(Instant::now())
+            .min(Duration::from_millis(200)),
+        None => Duration::from_millis(200),
+    }
+}
+
 /// The Art-Net lane while no publisher is connected, printed when something
 /// about it changes: a universe appears, a controller polls, the first DMX
 /// arrives, the thread fails, late packets settle at a steady share. Counts
@@ -336,7 +395,7 @@ type IdleKey = (
 );
 
 impl IdleStatus {
-    fn print(&mut self, artnet: &artnet::Receiver, osc: Option<&osc::Sender>) {
+    fn print(&mut self, label: &str, artnet: &artnet::Receiver, osc: Option<&osc::Sender>) {
         if self
             .checked
             .is_some_and(|t| t.elapsed() < Duration::from_secs(1))
@@ -362,7 +421,7 @@ impl IdleStatus {
         if let Some(o) = osc {
             line.push_str(&osc_status(o));
         }
-        println!("waiting for a publisher {line}");
+        println!("{label} {line}");
         if let Some(note) = note {
             println!("  {note}");
         }
@@ -421,7 +480,7 @@ fn artnet_status(latch: &artnet::Latch) -> (String, Option<String>) {
                 "a controller at {c} has found this node and sent no DMX yet: \
                  assign it a universe on the desk"
             ),
-            None => "no Art-Net received yet: the carriers are crossing with empty payloads".into(),
+            None => "no Art-Net received yet: records are going out with empty payloads".into(),
         })
     });
     let note = note.or_else(|| {
