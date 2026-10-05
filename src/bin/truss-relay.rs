@@ -577,6 +577,11 @@ impl Dashboard {
                     None => line.push_str("   passthrough, nothing injected"),
                 }
                 lines.push(line);
+                if let Some(codec) = s.injector.and_then(|i| i.stats.unsupported_codec.as_ref()) {
+                    warnings.push(format!(
+                        "video is {codec}, which records cannot ride in: passing it through"
+                    ));
+                }
                 if kbps > cli.warn_kbps {
                     warnings.push(format!(
                         "{kbps:.0} kb/s is above {:.0}: lower the encoder bitrate or raise --every",
@@ -999,7 +1004,7 @@ fn handle_publisher_event(
         } => {
             let payload = match injector.as_mut() {
                 Some(inj) => {
-                    if truss::flv::is_avc_sequence_header_data(&data) {
+                    if matches!(truss::flv::video(&data), truss::flv::Video::Config { .. }) {
                         inj.note_sequence_header(&data)?;
                         data
                     } else {
@@ -1314,6 +1319,11 @@ fn report(
         *last_note = artnet_note;
     }
 
+    if let Some(codec) = injector.and_then(|i| i.stats.unsupported_codec.as_ref()) {
+        console::log(format!(
+            "  WARNING: video is {codec}, which records cannot ride in: passing it through"
+        ));
+    }
     if kbps > cli.warn_kbps {
         console::log(format!(
             "  WARNING: {kbps:.0} kb/s is above {:.0}. many ingests count video and audio \

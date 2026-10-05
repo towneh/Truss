@@ -362,3 +362,34 @@ fn escaping_a_bitstream_round_trips() {
         invariants::h264_nals,
     );
 }
+
+#[test]
+fn the_injector_keeps_any_video_tag_it_rewrites_intact() {
+    const HEADERS: [&[u8]; 5] = [
+        &[0x17, 1, 0, 0, 0],
+        &[0x2C, 1, 0, 0, 0],
+        &[0x91, b'h', b'v', b'c', b'1', 0, 0, 0],
+        &[0xA3, b'h', b'v', b'c', b'1'],
+        &[0x91, b'a', b'v', b'c', b'1', 0, 0, 0],
+    ];
+    each_case(
+        "inject_video_tag",
+        400,
+        |rng| {
+            let mut v = HEADERS[rng.below(HEADERS.len())].to_vec();
+            // Mostly well framed, so the rewrite path runs rather than the
+            // framing check turning nearly every case away.
+            for _ in 0..1 + rng.below(4) {
+                let nal = rng.some_bytes(40);
+                v.extend_from_slice(&(nal.len() as u32).to_be_bytes());
+                v.extend_from_slice(&nal);
+            }
+            if rng.below(4) == 0 {
+                mutate(rng, &v)
+            } else {
+                v
+            }
+        },
+        invariants::inject_video_tag,
+    );
+}

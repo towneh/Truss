@@ -9,6 +9,8 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
+use crate::codec::VideoCodec;
+
 pub const PACKET_LEN: usize = 188;
 const SYNC_BYTE: u8 = 0x47;
 const PID_PAT: u16 = 0x0000;
@@ -40,6 +42,15 @@ pub struct StreamInfo {
 impl StreamInfo {
     pub fn type_name(&self) -> &'static str {
         stream_type_name(self.stream_type)
+    }
+
+    /// `None` for anything that is not video the scanner can walk.
+    pub fn video_codec(&self) -> Option<VideoCodec> {
+        match self.stream_type {
+            0x1B => Some(VideoCodec::H264),
+            0x24 => Some(VideoCodec::Hevc),
+            _ => None,
+        }
     }
 }
 

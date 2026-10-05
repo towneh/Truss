@@ -10,6 +10,8 @@
 
 /// H.264 NAL type for SEI.
 pub const NAL_SEI: u8 = 6;
+/// H.264 NAL type for an access-unit delimiter.
+pub const NAL_AUD: u8 = 9;
 /// H.264 NAL type for filler data.
 pub const NAL_FILLER: u8 = 12;
 /// SEI payload type: user_data_registered_itu_t_t35.
@@ -149,16 +151,22 @@ fn push_varlen(out: &mut Vec<u8>, mut value: u64) {
 /// Build a complete SEI NAL (header byte included, emulation-prevented)
 /// carrying one message.
 pub fn build_sei_nal(payload_type: u64, payload: &[u8]) -> Vec<u8> {
+    let rbsp = sei_rbsp(payload_type, payload);
+    let mut nal = Vec::with_capacity(rbsp.len() + 2);
+    nal.push(NAL_SEI); // nal_ref_idc = 0, type = 6
+    nal.extend_from_slice(&escape_rbsp(&rbsp));
+    nal
+}
+
+/// One SEI message plus trailing bits, unescaped. HEVC uses the same syntax
+/// under a different NAL header.
+pub(crate) fn sei_rbsp(payload_type: u64, payload: &[u8]) -> Vec<u8> {
     let mut rbsp = Vec::with_capacity(payload.len() + 8);
     push_varlen(&mut rbsp, payload_type);
     push_varlen(&mut rbsp, payload.len() as u64);
     rbsp.extend_from_slice(payload);
     rbsp.push(0x80); // rbsp_trailing_bits
-
-    let mut nal = Vec::with_capacity(rbsp.len() + 2);
-    nal.push(NAL_SEI); // nal_ref_idc = 0, type = 6
-    nal.extend_from_slice(&escape_rbsp(&rbsp));
-    nal
+    rbsp
 }
 
 /// Build a filler-data NAL whose RBSP holds `payload` instead of the `0xFF`

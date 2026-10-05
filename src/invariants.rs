@@ -18,11 +18,14 @@
 use std::time::Instant;
 
 use crate::carrier::Carrier;
+use crate::codec::VideoCodec;
 use crate::detect::scan::Scanner;
 use crate::detect::ts::{MAX_PES_TOTAL, TsAnalyzer};
+use crate::flv::Video;
+use crate::inject::{InjectOptions, Injector};
 use crate::monitor::DmxState;
 use crate::record::{CRC_LEN, HEADER_LEN, MAX_PAYLOAD_LEN, Record};
-use crate::{artnet, flv, h264, osc, payload};
+use crate::{artnet, flv, h264, hevc, osc, payload};
 
 /// Feed arbitrary bytes to the TS reader, in chunks the input chooses.
 ///
@@ -70,7 +73,8 @@ pub fn ts_feed(data: &[u8]) {
 /// [`scan_survives_its_own_encoder`] is where the real property lives.
 pub fn scan_video_au(data: &[u8]) {
     let mut s = Scanner::new();
-    s.feed_video_au(data, 0);
+    s.feed_video_au(VideoCodec::H264, data, 0);
+    s.feed_video_au(VideoCodec::Hevc, data, 0);
     s.feed_raw(data, 0);
 }
 
@@ -92,23 +96,27 @@ pub fn scan_survives_its_own_encoder(data: &[u8]) {
 
     let c = Carrier::SeiUnregistered;
     let record = Record::with_payload(c.id(), 7, 1, 7, body);
-    let nal = c
-        .frame(&record)
-        .expect("a payload inside the limit encodes");
+    for codec in [VideoCodec::H264, VideoCodec::Hevc] {
+        let nal = c
+            .frame_for(codec, &record)
+            .expect("a payload inside the limit encodes");
+        let mut annexb = vec![0, 0, 0, 1];
+        annexb.extend_from_slice(&nal);
 
-    let mut annexb = vec![0, 0, 0, 1];
-    annexb.extend_from_slice(&nal);
+        let mut s = Scanner::new();
+        s.feed_video_au(codec, &annexb, 2);
 
-    let mut s = Scanner::new();
-    s.feed_video_au(&annexb, 2);
-
-    let t = &s.report().carriers[c.slug()];
-    assert_eq!(
-        t.ok, 1,
-        "a record we built ourselves did not read back: {t:?}"
-    );
-    assert_eq!(t.corrupt, 0, "our own record was scored corrupt: {t:?}");
-    assert_eq!(t.rewritten, 0, "a live payload must not score rewritten");
+        let t = &s.report().carriers[c.slug()];
+        assert_eq!(
+            t.ok, 1,
+            "a {codec:?} record we built ourselves did not read back: {t:?}"
+        );
+        assert_eq!(
+            t.corrupt, 0,
+            "our own {codec:?} record was scored corrupt: {t:?}"
+        );
+        assert_eq!(t.rewritten, 0, "a live payload must not score rewritten");
+    }
 }
 
 /// Anything that decodes as a record must re-encode to the bytes it came from.
@@ -150,6 +158,36 @@ pub fn flv_roundtrip(data: &[u8]) {
     );
     let again = flv::serialise(&twice).expect("and re-serialises");
     assert_eq!(bytes, again, "serialise is not a fixed point");
+}
+
+/// Rewrite an arbitrary video tag payload the way the relay does.
+///
+/// An error is fine: the encoder's bytes are not ours to trust. A panic is
+/// not, and nor is a rewrite that no longer reads as the frame it came from,
+/// because the relay forwards whatever comes back.
+pub fn inject_video_tag(data: &[u8]) {
+    let mut inj = Injector::new(&InjectOptions {
+        carriers: vec![
+            Carrier::SeiUnregistered,
+            Carrier::SeiT35,
+            Carrier::FillerNal,
+        ],
+        ..Default::default()
+    })
+    .expect("these options are valid");
+    let _ = inj.note_sequence_header(data);
+    let Ok(Some(out)) = inj.inject_tag(data, 0) else {
+        return;
+    };
+    let Video::Frame { body, .. } = flv::video(data) else {
+        panic!("a tag that is not a frame was rewritten");
+    };
+    assert_eq!(
+        flv::video(&out),
+        flv::video(data),
+        "the parsed video changed"
+    );
+    assert_eq!(&out[..body], &data[..body], "the tag header changed");
 }
 
 /// A decoded payload re-encodes, and applying it twice changes nothing.
@@ -352,6 +390,7 @@ pub fn h264_nals(data: &[u8]) {
     let _ = h264::nal_units_avcc(body, length_size);
     let _ = h264::nal_units_annexb(body);
     h264::scan_sei_annexb(body, |_, _| {});
+    hevc::scan_sei_annexb(body, |_, _| {});
 
     let escaped = h264::escape_rbsp(body);
     assert_eq!(

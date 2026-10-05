@@ -271,12 +271,9 @@ fn read_into(
 fn consume(ts: &TsAnalyzer, scanner: &mut Scanner, units: Vec<PesUnit>) {
     let now = now_unix_nanos();
     for unit in units {
-        let is_video = ts
-            .streams
-            .get(&unit.pid)
-            .is_some_and(|s| matches!(s.stream_type, 0x1B | 0x24));
-        if is_video {
-            scanner.feed_video_au(&unit.data, now);
+        let codec = ts.streams.get(&unit.pid).and_then(|s| s.video_codec());
+        if let Some(codec) = codec {
+            scanner.feed_video_au(codec, &unit.data, now);
         } else {
             // Anything else still gets a raw sweep: a carrier arriving on a
             // PID we did not expect is exactly the result worth catching.
@@ -407,11 +404,20 @@ fn print_summary(out: &Outcome, amf_tags: Option<&BTreeMap<String, String>>) {
             ev.access_units,
             ev.video_es_bytes as f64 / 1e6
         );
-        print!("  NAL types:");
-        for (ty, n) in &ev.nal_types {
-            print!(" {}={}({})", ty, n, nal_name(*ty));
+        if !ev.nal_types.is_empty() || ev.hevc_nal_types.is_empty() {
+            print!("  NAL types:");
+            for (ty, n) in &ev.nal_types {
+                print!(" {}={}({})", ty, n, nal_name(*ty));
+            }
+            println!();
         }
-        println!();
+        if !ev.hevc_nal_types.is_empty() {
+            print!("  HEVC NAL types:");
+            for (ty, n) in &ev.hevc_nal_types {
+                print!(" {}={}({})", ty, n, hevc_nal_name(*ty));
+            }
+            println!();
+        }
         if ev.sei_payload_types.is_empty() {
             println!("  SEI: none present");
         } else {
@@ -571,6 +577,21 @@ fn nal_name(ty: u8) -> &'static str {
         8 => "PPS",
         9 => "AUD",
         12 => "filler",
+        _ => "?",
+    }
+}
+
+fn hevc_nal_name(ty: u8) -> &'static str {
+    match ty {
+        0..=9 => "slice",
+        16..=21 => "IRAP",
+        32 => "VPS",
+        33 => "SPS",
+        34 => "PPS",
+        35 => "AUD",
+        38 => "filler",
+        39 => "prefix SEI",
+        40 => "suffix SEI",
         _ => "?",
     }
 }

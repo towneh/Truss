@@ -19,6 +19,7 @@ use clap::Parser;
 use std::io::ErrorKind;
 use std::net::{SocketAddr, UdpSocket};
 use truss::carrier::Carrier;
+use truss::codec::VideoCodec;
 use truss::console;
 use truss::detect::ts::TsAnalyzer;
 use truss::h264;
@@ -176,14 +177,10 @@ fn main() -> Result<()> {
             break;
         }
         for unit in ts.feed(&buf[..n]) {
-            let is_video = ts
-                .streams
-                .get(&unit.pid)
-                .is_some_and(|s| matches!(s.stream_type, 0x1B | 0x24));
-            if !is_video {
+            let Some(codec) = ts.streams.get(&unit.pid).and_then(|s| s.video_codec()) else {
                 continue;
-            }
-            for payload in records_in(&unit.data) {
+            };
+            for payload in records_in(codec, &unit.data) {
                 tally.absorb(&payload);
             }
         }
@@ -458,9 +455,9 @@ struct Window {
 /// and the filler carrier exists for measurement rather than for carrying a
 /// show. A record arriving on more than one carrier is applied more than once,
 /// which is harmless because the values are absolute.
-fn records_in(annexb: &[u8]) -> Vec<Vec<u8>> {
+fn records_in(codec: VideoCodec, annexb: &[u8]) -> Vec<Vec<u8>> {
     let mut out = Vec::new();
-    h264::scan_sei_annexb(annexb, |ty, payload| {
+    codec.scan_sei_annexb(annexb, |ty, payload| {
         let carrier = match ty {
             h264::SEI_UNREGISTERED => Carrier::SeiUnregistered,
             h264::SEI_T35 => Carrier::SeiT35,

@@ -96,4 +96,11 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "inject_video_tag"
+path = "fuzz_targets/inject_video_tag.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]

@@ -7,6 +7,7 @@
 //! private-data PID would be a third place, but it is not reachable without
 //! SRT ingest, so it is absent here by necessity rather than by choice.
 
+use crate::codec::VideoCodec;
 use crate::h264;
 use crate::osc;
 use crate::record::{EncodeError, Record};
@@ -33,7 +34,7 @@ pub const AMF_METADATA_KEY: &str = "basisProbe";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum Class {
-    /// Rides inside the H.264 elementary stream. Survives any pure remux that
+    /// Rides inside the video elementary stream. Survives any pure remux that
     /// treats the video payload as opaque.
     InVideoEs,
     /// Rides in the RTMP container alongside the media. Has no defined mapping
@@ -47,7 +48,7 @@ pub enum Class {
 
 /// Where an in-video carrier's NAL belongs within the access unit.
 ///
-/// H.264 puts SEI ahead of the primary coded picture and filler data after the
+/// H.264 and HEVC put SEI ahead of the coded picture and filler data after the
 /// last VCL NAL of it. Getting this wrong does not stop a tolerant decoder, but
 /// it makes a carrier non-conformant in a second way on top of whatever else it
 /// is doing, which muddies what a negative result means.
@@ -67,7 +68,7 @@ pub enum Carrier {
     AmfCustom,
     /// An extra key inside the standard `onMetaData` object.
     AmfMetadataKey,
-    /// Filler-data NAL (type 12) with a non-conformant body.
+    /// Filler-data NAL (type 12 in H.264, 38 in HEVC) with a non-conformant body.
     FillerNal,
     /// An OSC message, `/truss/dmx`, with the record as its one blob argument.
     Osc,
@@ -143,7 +144,7 @@ impl Carrier {
             Self::SeiT35 => "SEI user_data_registered_itu_t_t35 (type 4)",
             Self::AmfCustom => "custom AMF0 data message",
             Self::AmfMetadataKey => "extra key inside onMetaData",
-            Self::FillerNal => "filler-data NAL (type 12), non-conformant body",
+            Self::FillerNal => "filler-data NAL, non-conformant body",
             Self::Osc => "OSC message /truss/dmx, record as a blob",
         }
     }
@@ -156,28 +157,35 @@ impl Carrier {
         !matches!(self, Self::FillerNal | Self::Osc)
     }
 
+    /// Wrap an encoded record in this carrier's framing, with H.264 NAL
+    /// headers for the in-video carriers. See [`Self::frame_for`].
+    pub fn frame(self, record: &Record) -> Result<Vec<u8>, EncodeError> {
+        self.frame_for(VideoCodec::H264, record)
+    }
+
     /// Wrap an encoded record in this carrier's framing.
     ///
-    /// For the in-video carriers this returns the complete NAL, ready to be
-    /// length-prefixed into an AVCC access unit. For the container carriers it
-    /// returns the hex text that goes into the AMF value.
-    pub fn frame(self, record: &Record) -> Result<Vec<u8>, EncodeError> {
+    /// For the in-video carriers this returns the complete NAL for `codec`,
+    /// ready to be length-prefixed into the access unit. For the container
+    /// carriers it returns the hex text that goes into the AMF value, and
+    /// `codec` plays no part.
+    pub fn frame_for(self, codec: VideoCodec, record: &Record) -> Result<Vec<u8>, EncodeError> {
         let body = record.encode()?;
         Ok(match self {
             Self::SeiUnregistered => {
                 let mut payload = Vec::with_capacity(16 + body.len());
                 payload.extend_from_slice(&PROBE_UUID);
                 payload.extend_from_slice(&body);
-                h264::build_sei_nal(h264::SEI_UNREGISTERED, &payload)
+                codec.sei_nal(h264::SEI_UNREGISTERED, &payload)
             }
             Self::SeiT35 => {
                 let mut payload = Vec::with_capacity(3 + body.len());
                 payload.push(T35_COUNTRY_CODE);
                 payload.extend_from_slice(&T35_PROVIDER_CODE.to_be_bytes());
                 payload.extend_from_slice(&body);
-                h264::build_sei_nal(h264::SEI_T35, &payload)
+                codec.sei_nal(h264::SEI_T35, &payload)
             }
-            Self::FillerNal => h264::build_filler_nal(&body),
+            Self::FillerNal => codec.filler_nal(&body),
             Self::AmfCustom | Self::AmfMetadataKey => hex_encode(&body).into_bytes(),
             Self::Osc => osc::encode_blob(osc::ADDRESS, &body)?,
         })

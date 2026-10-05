@@ -15,6 +15,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::Serialize;
 
 use crate::carrier::{self, Carrier};
+use crate::codec::VideoCodec;
 use crate::h264;
 use crate::record::{self, DecodeError, Record};
 
@@ -137,8 +138,11 @@ impl CarrierTally {
 
 #[derive(Debug, Default, Clone, Serialize)]
 pub struct Evidence {
-    /// NAL type -> count, over every access unit seen.
+    /// H.264 NAL type -> count, over every access unit seen.
     pub nal_types: BTreeMap<u8, u64>,
+    /// The same for HEVC, which numbers its types differently.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub hevc_nal_types: BTreeMap<u8, u64>,
     /// SEI payload type -> count, ours and foreign alike.
     pub sei_payload_types: BTreeMap<u64, u64>,
     /// SEI messages of a type we also use, but carrying someone else's data.
@@ -223,41 +227,46 @@ impl Scanner {
     }
 
     /// Feed one video access unit in Annex-B framing.
-    pub fn feed_video_au(&mut self, annexb: &[u8], now_unix_nanos: u64) {
+    ///
+    /// The codec comes from the container, not the bytes: an HEVC NAL header
+    /// also parses as an H.264 one, of the wrong type.
+    pub fn feed_video_au(&mut self, codec: VideoCodec, annexb: &[u8], now_unix_nanos: u64) {
         self.report.evidence.access_units += 1;
         self.report.evidence.video_es_bytes += annexb.len() as u64;
 
         for nal in h264::nal_units_annexb(annexb) {
-            let ty = h264::nal_type(nal[0]);
-            *self.report.evidence.nal_types.entry(ty).or_insert(0) += 1;
+            let ty = codec.nal_type(nal[0]);
+            let histogram = match codec {
+                VideoCodec::H264 => &mut self.report.evidence.nal_types,
+                VideoCodec::Hevc => &mut self.report.evidence.hevc_nal_types,
+            };
+            *histogram.entry(ty).or_insert(0) += 1;
 
-            match ty {
-                h264::NAL_SEI => {
-                    let rbsp = h264::unescape_rbsp(&nal[1..]);
-                    let mut messages = Vec::new();
-                    h264::sei_messages(&rbsp, |t, p| messages.push((t, p.to_vec())));
-                    for (payload_type, payload) in messages {
-                        self.feed_sei(payload_type, &payload, now_unix_nanos);
-                    }
-                    self.sweep_nal(&rbsp, now_unix_nanos);
+            // A NAL cut short inside its own header has no body to read.
+            let Some(body) = nal.get(codec.nal_header_len()..) else {
+                continue;
+            };
+            if codec.is_sei(ty) {
+                let rbsp = h264::unescape_rbsp(body);
+                let mut messages = Vec::new();
+                h264::sei_messages(&rbsp, |t, p| messages.push((t, p.to_vec())));
+                for (payload_type, payload) in messages {
+                    self.feed_sei(payload_type, &payload, now_unix_nanos);
                 }
-                h264::NAL_FILLER => {
-                    let rbsp = h264::unescape_rbsp(&nal[1..]);
-                    self.feed_speculative(Carrier::FillerNal, &rbsp, now_unix_nanos);
-                    self.sweep_nal(&rbsp, now_unix_nanos);
-                }
-                _ => {
-                    // Fallback for a carrier that arrived in a framing the
-                    // structured passes do not recognise. The sweep must run
-                    // on the unescaped RBSP: emulation-prevention bytes land
-                    // inside the record body, so scanning the coded bytes
-                    // would find the magic, read a `0x03`-riddled body and
-                    // report a corruption that never happened.
-                    if nal.len() > 1 {
-                        let rbsp = h264::unescape_rbsp(&nal[1..]);
-                        self.sweep_nal(&rbsp, now_unix_nanos);
-                    }
-                }
+                self.sweep_nal(&rbsp, now_unix_nanos);
+            } else if codec.is_filler(ty) {
+                let rbsp = h264::unescape_rbsp(body);
+                self.feed_speculative(Carrier::FillerNal, &rbsp, now_unix_nanos);
+                self.sweep_nal(&rbsp, now_unix_nanos);
+            } else if !body.is_empty() {
+                // Fallback for a carrier that arrived in a framing the
+                // structured passes do not recognise. The sweep must run
+                // on the unescaped RBSP: emulation-prevention bytes land
+                // inside the record body, so scanning the coded bytes
+                // would find the magic, read a `0x03`-riddled body and
+                // report a corruption that never happened.
+                let rbsp = h264::unescape_rbsp(body);
+                self.sweep_nal(&rbsp, now_unix_nanos);
             }
         }
     }
@@ -433,6 +442,7 @@ impl Scanner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hevc;
     use crate::record::DEFAULT_PAYLOAD_LEN;
 
     fn au_with(nals: &[Vec<u8>]) -> Vec<u8> {
@@ -445,8 +455,12 @@ mod tests {
     }
 
     fn probe(c: Carrier, seq: u32, sent: u64) -> Vec<u8> {
+        probe_in(VideoCodec::H264, c, seq, sent)
+    }
+
+    fn probe_in(codec: VideoCodec, c: Carrier, seq: u32, sent: u64) -> Vec<u8> {
         let r = Record::new(c.id(), seq, sent, seq, DEFAULT_PAYLOAD_LEN);
-        c.frame(&r).unwrap()
+        c.frame_for(codec, &r).unwrap()
     }
 
     fn live_record(payload: Vec<u8>) -> Vec<u8> {
@@ -487,6 +501,7 @@ mod tests {
                 values: vec![1; 16],
             }];
             s.feed_video_au(
+                VideoCodec::H264,
                 &au_with(&[live_record(
                     crate::payload::encode(&blocks).expect("test blocks are small"),
                 )]),
@@ -511,6 +526,7 @@ mod tests {
         }];
         let mut s = Scanner::new();
         s.feed_video_au(
+            VideoCodec::H264,
             &au_with(&[live_record(
                 crate::payload::encode(&blocks).expect("test blocks are small"),
             )]),
@@ -534,7 +550,7 @@ mod tests {
         let mut body = crate::payload::encode(&[]).expect("an empty payload encodes");
         body[7] = 1;
         let mut s = Scanner::new();
-        s.feed_video_au(&au_with(&[live_record(body)]), 2);
+        s.feed_video_au(VideoCodec::H264, &au_with(&[live_record(body)]), 2);
 
         let r = s.report();
         assert_eq!(r.carriers["sei-unreg"].ok, 1);
@@ -556,7 +572,7 @@ mod tests {
             probe(Carrier::SeiT35, 1, sent),
             vec![0x65, 0xAA, 0xBB],
         ]);
-        s.feed_video_au(&au, now);
+        s.feed_video_au(VideoCodec::H264, &au, now);
 
         let r = s.report();
         assert_eq!(r.carriers["sei-unreg"].ok, 1);
@@ -576,7 +592,7 @@ mod tests {
         let mut payload = vec![0u8; 16];
         payload.extend_from_slice(b"x264 - core 164");
         let au = au_with(&[h264::build_sei_nal(h264::SEI_UNREGISTERED, &payload)]);
-        s.feed_video_au(&au, 0);
+        s.feed_video_au(VideoCodec::H264, &au, 0);
 
         let r = s.report();
         assert!(r.carriers.get("sei-unreg").is_none_or(|t| t.ok == 0));
@@ -594,7 +610,7 @@ mod tests {
         let mut s = Scanner::new();
         for seq in [1u32, 2, 5] {
             let au = au_with(&[probe(Carrier::SeiUnregistered, seq, 1)]);
-            s.feed_video_au(&au, 1);
+            s.feed_video_au(VideoCodec::H264, &au, 1);
         }
         let t = &s.report().carriers["sei-unreg"];
         assert_eq!(t.ok, 3);
@@ -611,7 +627,7 @@ mod tests {
             payload.extend_from_slice(&r.encode().unwrap());
             h264::build_sei_nal(h264::SEI_UNREGISTERED, &payload)
         };
-        s.feed_video_au(&au_with(&[nal]), 1);
+        s.feed_video_au(VideoCodec::H264, &au_with(&[nal]), 1);
 
         let t = &s.report().carriers["sei-unreg"];
         assert_eq!(t.ok, 1);
@@ -654,7 +670,7 @@ mod tests {
         body[n - 1] ^= 0xFF; // break the CRC
         payload.extend_from_slice(&body);
         let nal = h264::build_sei_nal(h264::SEI_UNREGISTERED, &payload);
-        s.feed_video_au(&au_with(&[nal]), 1);
+        s.feed_video_au(VideoCodec::H264, &au_with(&[nal]), 1);
 
         let t = &s.report().carriers["sei-unreg"];
         assert_eq!(t.ok, 0);
@@ -672,7 +688,7 @@ mod tests {
         let mut payload = carrier::PROBE_UUID.to_vec();
         payload.extend_from_slice(b"VCP-SMOKE-v1");
         let au = au_with(&[h264::build_sei_nal(h264::SEI_UNREGISTERED, &payload)]);
-        s.feed_video_au(&au, 1);
+        s.feed_video_au(VideoCodec::H264, &au, 1);
 
         let t = &s.report().carriers["sei-unreg"];
         assert_eq!(t.marker, 1);
@@ -686,7 +702,7 @@ mod tests {
         let mut s = Scanner::new();
         let mut filler = vec![h264::NAL_FILLER];
         filler.extend_from_slice(&[0xFF; 40]);
-        s.feed_video_au(&au_with(&[filler]), 1);
+        s.feed_video_au(VideoCodec::H264, &au_with(&[filler]), 1);
 
         assert!(
             !s.report().carriers.contains_key("filler-nal"),
@@ -699,7 +715,7 @@ mod tests {
     fn filler_carrier_is_picked_up_from_nal_12() {
         let mut s = Scanner::new();
         let au = au_with(&[probe(Carrier::FillerNal, 3, 1)]);
-        s.feed_video_au(&au, 1);
+        s.feed_video_au(VideoCodec::H264, &au, 1);
         assert_eq!(s.report().carriers["filler-nal"].ok, 1);
         assert_eq!(s.report().unattributed.ok, 0);
     }
@@ -714,7 +730,7 @@ mod tests {
             .unwrap();
         let mut slice = vec![0x65u8];
         slice.extend_from_slice(&h264::escape_rbsp(&body));
-        s.feed_video_au(&au_with(&[slice]), 1);
+        s.feed_video_au(VideoCodec::H264, &au_with(&[slice]), 1);
 
         assert_eq!(s.report().unattributed.ok, 1);
         assert!(
@@ -742,7 +758,7 @@ mod tests {
             "the fixture must actually contain escape bytes"
         );
 
-        s.feed_video_au(&au_with(&[nal]), 1);
+        s.feed_video_au(VideoCodec::H264, &au_with(&[nal]), 1);
 
         let rep = s.report();
         assert_eq!(rep.carriers["sei-unreg"].ok, 1);
@@ -765,5 +781,73 @@ mod tests {
             .unwrap();
         s.feed_hex_text(Carrier::AmfCustom, &text, 5);
         assert_eq!(s.report().carriers["amf-custom"].ok, 1);
+    }
+
+    #[test]
+    fn attributes_each_sei_carrier_in_hevc() {
+        let mut s = Scanner::new();
+        let mut suffix = probe_in(VideoCodec::Hevc, Carrier::SeiT35, 1, 1);
+        suffix[0] = hevc::NAL_SUFFIX_SEI << 1;
+        let au = au_with(&[
+            vec![hevc::NAL_AUD << 1, 0x01, 0x50],
+            probe_in(VideoCodec::Hevc, Carrier::SeiUnregistered, 1, 1),
+            suffix,
+            vec![19 << 1, 0x01, 0xAA, 0xBB], // IDR_W_RADL
+        ]);
+        s.feed_video_au(VideoCodec::Hevc, &au, 2);
+
+        let r = s.report();
+        assert_eq!(r.carriers["sei-unreg"].ok, 1);
+        assert_eq!(r.carriers["sei-t35"].ok, 1);
+        assert_eq!(r.unattributed.ok, 0, "structured pass claimed both");
+        assert_eq!(r.evidence.hevc_nal_types[&hevc::NAL_PREFIX_SEI], 1);
+        assert_eq!(r.evidence.hevc_nal_types[&hevc::NAL_SUFFIX_SEI], 1);
+        assert_eq!(r.evidence.hevc_nal_types[&19], 1);
+        assert!(
+            r.evidence.nal_types.is_empty(),
+            "HEVC must not land in the H.264 histogram"
+        );
+    }
+
+    #[test]
+    fn hevc_filler_carrier_is_picked_up_from_nal_38() {
+        let mut s = Scanner::new();
+        let au = au_with(&[probe_in(VideoCodec::Hevc, Carrier::FillerNal, 3, 1)]);
+        s.feed_video_au(VideoCodec::Hevc, &au, 1);
+        assert_eq!(s.report().carriers["filler-nal"].ok, 1);
+        assert_eq!(s.report().unattributed.ok, 0);
+    }
+
+    #[test]
+    fn an_hevc_sei_needing_emulation_prevention_reads_back_clean() {
+        let mut s = Scanner::new();
+        let mut r = Record::new(Carrier::SeiUnregistered.id(), 1, 1, 1, 24);
+        r.payload = vec![0u8; 24];
+        let mut payload = carrier::PROBE_UUID.to_vec();
+        payload.extend_from_slice(&r.encode().unwrap());
+        let nal = hevc::build_sei_nal(h264::SEI_UNREGISTERED, &payload);
+        assert!(
+            nal.windows(3).any(|w| w == [0, 0, 3]),
+            "the fixture must actually contain escape bytes"
+        );
+
+        s.feed_video_au(VideoCodec::Hevc, &au_with(&[nal]), 1);
+
+        let rep = s.report();
+        assert_eq!(rep.carriers["sei-unreg"].ok, 1);
+        assert_eq!(rep.carriers["sei-unreg"].corrupt, 0);
+        assert_eq!(rep.unattributed.corrupt, 0, "no phantom corruption");
+    }
+
+    #[test]
+    fn an_hevc_nal_cut_inside_its_header_is_counted_not_read() {
+        let mut s = Scanner::new();
+        s.feed_video_au(
+            VideoCodec::Hevc,
+            &[0, 0, 0, 1, hevc::NAL_PREFIX_SEI << 1],
+            1,
+        );
+        assert_eq!(s.report().evidence.hevc_nal_types[&hevc::NAL_PREFIX_SEI], 1);
+        assert!(s.report().carriers.is_empty());
     }
 }

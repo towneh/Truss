@@ -1,18 +1,18 @@
 //! Plant carriers into an already-encoded FLV.
 //!
-//! The in-video carriers are NAL units, so they go into the AVCC access unit
-//! alongside the slices. Placement follows the spec's ordering rules: an
-//! access-unit delimiter stays first if one is present, SEI goes after it and
-//! before the primary coded picture, and filler data goes after the last VCL
-//! NAL. A carrier planted in the wrong position would be non-conformant on top
-//! of whatever else it is doing, which muddies what a negative result means.
+//! The in-video carriers are NAL units, so they go into the length-prefixed
+//! access unit alongside the slices. Placement follows the spec's ordering
+//! rules: an access-unit delimiter stays first if one is present, SEI goes after
+//! it and before the coded picture, and filler data goes after the last VCL NAL.
+//! A carrier planted in the wrong position would be non-conformant on top of
+//! whatever else it is doing, which muddies what a negative result means.
 
 use std::collections::BTreeMap;
 
 use anyhow::{Result, bail};
 
 use crate::carrier::{Carrier, Class, Placement};
-use crate::flv::Flv;
+use crate::flv::{self, Flv, Video};
 use crate::h264;
 use crate::record::{DEFAULT_PAYLOAD_LEN, MAX_PAYLOAD_LEN, Record};
 
@@ -49,6 +49,9 @@ pub struct InjectStats {
     /// still data the far end will not see, so it is counted rather than
     /// swallowed.
     pub oversize_skipped: u64,
+    /// The video's codec, when records cannot ride in it. Its frames pass
+    /// through untouched.
+    pub unsupported_codec: Option<String>,
 }
 
 impl InjectStats {
@@ -117,9 +120,12 @@ impl Injector {
         })
     }
 
-    /// Learn the NAL length size from an `AVCDecoderConfigurationRecord`.
+    /// Learn the NAL length size from a sequence header's configuration
+    /// record. Any other tag is left alone.
     pub fn note_sequence_header(&mut self, tag_data: &[u8]) -> Result<()> {
-        self.length_size = crate::flv::nal_length_size(crate::flv::avc_body_of(tag_data))?;
+        if let Video::Config { codec, body } = flv::video(tag_data) {
+            self.length_size = flv::nal_length_size(codec, &tag_data[body..])?;
+        }
         Ok(())
     }
 
@@ -140,26 +146,37 @@ impl Injector {
         now_unix_nanos: u64,
         payload: Option<&[u8]>,
     ) -> Result<Option<Vec<u8>>> {
-        if !crate::flv::is_avc_nalu_data(tag_data) {
-            return Ok(None);
-        }
+        let (codec, keyframe, header_len) = match flv::video(tag_data) {
+            Video::Frame {
+                codec,
+                keyframe,
+                body,
+            } => (codec, keyframe, body),
+            Video::Unsupported(codec) => {
+                self.stats.unsupported_codec = Some(codec);
+                return Ok(None);
+            }
+            Video::Config { .. } | Video::Other => return Ok(None),
+        };
         let frame_index = self.stats.video_frames as u32;
         self.stats.video_frames += 1;
 
-        let is_keyframe = tag_data[0] >> 4 == 1;
-        if (self.keyframes_only && !is_keyframe) || !frame_index.is_multiple_of(self.every_n_frames)
-        {
+        if (self.keyframes_only && !keyframe) || !frame_index.is_multiple_of(self.every_n_frames) {
             return Ok(None);
         }
 
-        let body = crate::flv::avc_body_of(tag_data);
+        let body = &tag_data[header_len..];
         let Some(nals) = h264::nal_units_avcc(body, self.length_size) else {
-            bail!("video tag is not consistently AVCC framed");
+            bail!("video tag is not consistently length-prefixed");
         };
         let owned: Vec<Vec<u8>> = nals.into_iter().map(<[u8]>::to_vec).collect();
 
         // An access-unit delimiter stays first when one is present.
-        let insert_at = usize::from(owned.first().is_some_and(|n| h264::nal_type(n[0]) == 9));
+        let insert_at = usize::from(
+            owned
+                .first()
+                .is_some_and(|n| codec.is_aud(codec.nal_type(n[0]))),
+        );
 
         let mut before = Vec::new();
         let mut after = Vec::new();
@@ -175,7 +192,7 @@ impl Injector {
             // its lane, not the broadcast. The sequence number is left where it
             // is so a gap in the detector's count still means loss in transit
             // rather than a frame the injector declined to send.
-            let framed = match c.frame(&record) {
+            let framed = match c.frame_for(codec, &record) {
                 Ok(f) => f,
                 Err(_) => {
                     self.stats.oversize_skipped += 1;
@@ -216,8 +233,8 @@ impl Injector {
         }
         self.stats.added_bytes += added;
 
-        let mut out = Vec::with_capacity(5 + rebuilt.len());
-        out.extend_from_slice(&tag_data[..5]);
+        let mut out = Vec::with_capacity(header_len + rebuilt.len());
+        out.extend_from_slice(&tag_data[..header_len]);
         out.extend_from_slice(&rebuilt);
         Ok(Some(out))
     }
@@ -225,15 +242,15 @@ impl Injector {
 
 pub fn inject(flv: &mut Flv, opts: &InjectOptions) -> Result<InjectStats> {
     let mut injector = Injector::new(opts)?;
-    if let Some(header) = flv.tags.iter().find(|t| t.is_avc_sequence_header()) {
-        injector.note_sequence_header(&header.data)?;
-    }
     injector.stats.duration_ms = flv.tags.last().map(|t| t.timestamp).unwrap_or(0);
 
     for tag in flv.tags.iter_mut() {
-        if tag.kind != crate::flv::TAG_VIDEO {
+        if tag.kind != flv::TAG_VIDEO {
             continue;
         }
+        // Every sequence header, not just the first: a later one can change
+        // the length size.
+        injector.note_sequence_header(&tag.data)?;
         // Zero send time: see the note on `Injector`.
         if let Some(rewritten) = injector.inject_tag(&tag.data, 0)? {
             tag.data = rewritten;
@@ -245,6 +262,7 @@ pub fn inject(flv: &mut Flv, opts: &InjectOptions) -> Result<InjectStats> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::codec::VideoCodec;
     use crate::detect::scan::Scanner;
     use crate::flv::{AVC_NALU, AVC_SEQUENCE_HEADER, TAG_VIDEO, Tag};
 
@@ -361,7 +379,7 @@ mod tests {
 
         let mut scanner = Scanner::new();
         for tag in flv.tags.iter().filter(|t| t.is_avc_nalu()) {
-            scanner.feed_video_au(&annexb_of(tag), 0);
+            scanner.feed_video_au(VideoCodec::H264, &annexb_of(tag), 0);
         }
         let r = scanner.report();
         assert_eq!(r.carriers["sei-unreg"].ok, 3);
@@ -413,7 +431,7 @@ mod tests {
         let mut recovered = Vec::new();
         for tag in flv.tags.iter().filter(|t| t.is_avc_nalu()) {
             let au = annexb_of(tag);
-            scanner.feed_video_au(&au, 0);
+            scanner.feed_video_au(VideoCodec::H264, &au, 0);
             h264::scan_sei_annexb(&au, |ty, sei| {
                 if ty == h264::SEI_UNREGISTERED
                     && let Some(body) = Carrier::SeiUnregistered.unframe_sei(sei)
@@ -545,6 +563,131 @@ mod tests {
         let stats = inject(&mut flv, &InjectOptions::default()).unwrap();
         assert!(stats.added_kbps() > 0.0);
         assert_eq!(stats.duration_ms, 66);
+    }
+
+    /// An Enhanced RTMP HEVC stream: hvcC with 4-byte lengths, a keyframe as
+    /// CodedFrames (composition time present) and an inter frame as
+    /// CodedFramesX (none).
+    fn hevc_flv() -> Flv {
+        let mut hvcc = vec![1u8; 23];
+        hvcc[21] = 0x0F;
+        let mut config = vec![0x90, b'h', b'v', b'c', b'1'];
+        config.extend_from_slice(&hvcc);
+        let mut key = vec![0x91, b'h', b'v', b'c', b'1', 0, 0, 0];
+        key.extend_from_slice(&avcc(&[&[0x46, 0x01, 0x10], &[0x26, 0x01, 0xAA]]));
+        let mut inter = vec![0xA3, b'h', b'v', b'c', b'1'];
+        inter.extend_from_slice(&avcc(&[&[0x02, 0x01, 0xBB]]));
+        let tag = |timestamp, data| Tag {
+            kind: TAG_VIDEO,
+            timestamp,
+            data,
+        };
+        Flv {
+            header: b"FLV\x01\x01\x00\x00\x00\x09".to_vec(),
+            tags: vec![tag(0, config), tag(0, key), tag(33, inter)],
+        }
+    }
+
+    fn hevc_nals(tag: &Tag) -> Vec<Vec<u8>> {
+        let Video::Frame { body, .. } = flv::video(&tag.data) else {
+            panic!("not a frame tag");
+        };
+        h264::nal_units_avcc(&tag.data[body..], 4)
+            .expect("framed")
+            .into_iter()
+            .map(<[u8]>::to_vec)
+            .collect()
+    }
+
+    #[test]
+    fn hevc_carriers_land_in_place_and_read_back() {
+        let mut flv = hevc_flv();
+        let opts = InjectOptions {
+            carriers: vec![
+                Carrier::SeiUnregistered,
+                Carrier::SeiT35,
+                Carrier::FillerNal,
+            ],
+            ..Default::default()
+        };
+        let stats = inject(&mut flv, &opts).expect("injects");
+        assert_eq!(stats.video_frames, 2);
+        assert_eq!(stats.unsupported_codec, None);
+
+        let key = &flv.tags[1];
+        assert_eq!(&key.data[..8], &[0x91, b'h', b'v', b'c', b'1', 0, 0, 0]);
+        let types: Vec<u8> = hevc_nals(key)
+            .iter()
+            .map(|n| VideoCodec::Hevc.nal_type(n[0]))
+            .collect();
+        assert_eq!(
+            types,
+            vec![35, 39, 39, 19, 38],
+            "AUD first, prefix SEI before the picture, filler after it"
+        );
+        assert_eq!(&flv.tags[2].data[..5], &[0xA3, b'h', b'v', b'c', b'1']);
+
+        let mut scanner = Scanner::new();
+        for tag in &flv.tags[1..] {
+            let mut au = Vec::new();
+            for nal in hevc_nals(tag) {
+                au.extend_from_slice(&[0, 0, 0, 1]);
+                au.extend_from_slice(&nal);
+            }
+            scanner.feed_video_au(VideoCodec::Hevc, &au, 0);
+        }
+        let r = scanner.report();
+        for c in ["sei-unreg", "sei-t35", "filler-nal"] {
+            assert_eq!(r.carriers[c].ok, 2, "{c}");
+        }
+        assert_eq!(r.unattributed.ok, 0);
+    }
+
+    #[test]
+    fn a_later_sequence_header_changes_the_length_size() {
+        let mut flv = hevc_flv();
+        let mut second = flv.tags[0].data.clone();
+        second[5 + 21] = 0x0D; // 2-byte lengths from here on
+        let mut inter = vec![0xA3, b'h', b'v', b'c', b'1'];
+        inter.extend_from_slice(&h264::avcc_wrap(&[0x02, 0x01, 0xCC], 2));
+        flv.tags.push(Tag {
+            kind: TAG_VIDEO,
+            timestamp: 66,
+            data: second,
+        });
+        flv.tags.push(Tag {
+            kind: TAG_VIDEO,
+            timestamp: 66,
+            data: inter,
+        });
+
+        let stats = inject(&mut flv, &InjectOptions::default()).expect("injects");
+        assert_eq!(stats.video_frames, 3);
+        let last = &flv.tags[4].data;
+        let nals = h264::nal_units_avcc(&last[5..], 2).expect("framed with 2-byte lengths");
+        assert_eq!(VideoCodec::Hevc.nal_type(nals[0][0]), 39);
+    }
+
+    #[test]
+    fn hevc_under_the_legacy_codec_id_is_injected_too() {
+        let mut data = vec![0x1C, AVC_NALU, 0, 0, 0];
+        data.extend_from_slice(&avcc(&[&[0x26, 0x01, 0xAA]]));
+        let mut inj = Injector::new(&InjectOptions::default()).expect("injector");
+        let out = inj
+            .inject_tag(&data, 0)
+            .expect("injects")
+            .expect("rewritten");
+        let nals = h264::nal_units_avcc(&out[5..], 4).expect("framed");
+        assert_eq!(VideoCodec::Hevc.nal_type(nals[0][0]), 39);
+    }
+
+    #[test]
+    fn an_unsupported_codec_passes_through_and_is_named() {
+        let data = vec![0x91, b'a', b'v', b'0', b'1', 0, 0, 0, 0x12, 0x00];
+        let mut inj = Injector::new(&InjectOptions::default()).expect("injector");
+        assert_eq!(inj.inject_tag(&data, 0).expect("not an error"), None);
+        assert_eq!(inj.stats.unsupported_codec.as_deref(), Some("av01"));
+        assert_eq!(inj.stats.video_frames, 0);
     }
 
     #[test]

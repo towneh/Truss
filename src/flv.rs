@@ -11,6 +11,8 @@
 
 use anyhow::{Result, bail};
 
+use crate::codec::VideoCodec;
+
 /// Largest tag body an FLV can declare, fixed by the 24-bit DataSize field.
 pub const MAX_TAG_SIZE: usize = 0x00FF_FFFF;
 /// Signature, version, flags and DataOffset. Nothing valid points inside it.
@@ -23,6 +25,104 @@ pub const TAG_SCRIPT: u8 = 18;
 /// AVC packet type inside a video tag payload.
 pub const AVC_SEQUENCE_HEADER: u8 = 0;
 pub const AVC_NALU: u8 = 1;
+
+/// Legacy CodecID for HEVC. Outside the FLV spec, but some encoders send it.
+const CODEC_ID_HEVC: u8 = 12;
+/// Enhanced RTMP: the top bit of a video tag's first byte marks the extended
+/// header, a packet type and a FourCC in place of a CodecID.
+const EX_HEADER: u8 = 0x80;
+const EX_SEQUENCE_START: u8 = 0;
+const EX_CODED_FRAMES: u8 = 1;
+const EX_CODED_FRAMES_X: u8 = 3;
+/// A frame type that carries a command rather than a picture.
+const FRAME_TYPE_COMMAND: u8 = 5;
+
+/// What a video tag payload holds, read from its header. `body` is where the
+/// config record or the length-prefixed NAL units start.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Video {
+    /// A decoder configuration record (avcC or hvcC).
+    Config { codec: VideoCodec, body: usize },
+    /// The NAL units of one access unit.
+    Frame {
+        codec: VideoCodec,
+        keyframe: bool,
+        body: usize,
+    },
+    /// A codec records cannot ride in, named for a log line.
+    Unsupported(String),
+    /// Anything else of a known codec: end of sequence, metadata, multitrack,
+    /// or a tag too short to hold what its header says.
+    Other,
+}
+
+/// Read a video tag payload's header, in the legacy layout (AVC, or HEVC as
+/// CodecID 12) or the Enhanced RTMP one (`avc1` and `hvc1`).
+///
+/// Takes the payload rather than a `Tag` because the relay receives exactly
+/// these bytes from an RTMP session, with no surrounding tag header.
+pub fn video(data: &[u8]) -> Video {
+    let Some(&first) = data.first() else {
+        return Video::Other;
+    };
+    enum Packet {
+        Config,
+        Frame,
+    }
+    let (codec, packet, keyframe, body) = if first & EX_HEADER != 0 {
+        // Checked before the FourCC: a multitrack packet has its own byte at
+        // offset 1, so bytes 1..5 are not a FourCC there.
+        let packet_type = first & 0x0F;
+        if !matches!(
+            packet_type,
+            EX_SEQUENCE_START | EX_CODED_FRAMES | EX_CODED_FRAMES_X
+        ) {
+            return Video::Other;
+        }
+        let Some(fourcc) = data.get(1..5) else {
+            return Video::Other;
+        };
+        let codec = match fourcc {
+            b"avc1" => VideoCodec::H264,
+            b"hvc1" => VideoCodec::Hevc,
+            other => return Video::Unsupported(String::from_utf8_lossy(other).into_owned()),
+        };
+        let frame_type = (first >> 4) & 0x07;
+        if frame_type == FRAME_TYPE_COMMAND {
+            return Video::Other;
+        }
+        match packet_type {
+            EX_SEQUENCE_START => (codec, Packet::Config, false, 5),
+            // CodedFrames has a composition time ahead of the NAL units.
+            EX_CODED_FRAMES => (codec, Packet::Frame, frame_type == 1, 8),
+            EX_CODED_FRAMES_X => (codec, Packet::Frame, frame_type == 1, 5),
+            _ => return Video::Other,
+        }
+    } else {
+        let codec = match first & 0x0F {
+            7 => VideoCodec::H264,
+            CODEC_ID_HEVC => VideoCodec::Hevc,
+            id => return Video::Unsupported(format!("FLV codec id {id}")),
+        };
+        let packet = match data.get(1) {
+            Some(&AVC_SEQUENCE_HEADER) => Packet::Config,
+            Some(&AVC_NALU) => Packet::Frame,
+            _ => return Video::Other,
+        };
+        (codec, packet, first >> 4 == 1, 5)
+    };
+    if data.len() <= body {
+        return Video::Other;
+    }
+    match packet {
+        Packet::Config => Video::Config { codec, body },
+        Packet::Frame => Video::Frame {
+            codec,
+            keyframe,
+            body,
+        },
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct Tag {
@@ -42,11 +142,6 @@ pub fn is_avc_nalu_data(data: &[u8]) -> bool {
 
 pub fn is_avc_sequence_header_data(data: &[u8]) -> bool {
     data.len() > 5 && data[0] & 0x0F == 7 && data[1] == AVC_SEQUENCE_HEADER
-}
-
-/// The AVCC body of a video tag payload: everything past the 5-byte AVC header.
-pub fn avc_body_of(data: &[u8]) -> &[u8] {
-    &data[5..]
 }
 
 impl Tag {
@@ -162,14 +257,18 @@ pub fn serialise(flv: &Flv) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// NAL length size from an AVCDecoderConfigurationRecord, which sits in the
-/// AVC sequence-header tag. Everything in the file is framed this way, so
-/// guessing 4 and being wrong would corrupt every access unit.
-pub fn nal_length_size(sequence_header_body: &[u8]) -> Result<usize> {
-    if sequence_header_body.len() < 5 {
-        bail!("AVCDecoderConfigurationRecord too short");
-    }
-    Ok(((sequence_header_body[4] & 0x03) + 1) as usize)
+/// NAL length size from the decoder configuration record in the sequence
+/// header: byte 4 of an avcC, byte 21 of an hvcC. Every access unit is framed
+/// with it, so guessing 4 and being wrong would corrupt all of them.
+pub fn nal_length_size(codec: VideoCodec, config: &[u8]) -> Result<usize> {
+    let (at, name) = match codec {
+        VideoCodec::H264 => (4, "AVCDecoderConfigurationRecord"),
+        VideoCodec::Hevc => (21, "HEVCDecoderConfigurationRecord"),
+    };
+    let Some(&byte) = config.get(at) else {
+        bail!("{name} too short");
+    };
+    Ok(((byte & 0x03) + 1) as usize)
 }
 
 #[cfg(test)]
@@ -291,9 +390,99 @@ mod tests {
     #[test]
     fn reads_nal_length_size_from_the_config_record() {
         // lengthSizeMinusOne lives in the low two bits of byte 4.
-        assert_eq!(nal_length_size(&[1, 0x42, 0xC0, 0x1F, 0xFF]).unwrap(), 4);
-        assert_eq!(nal_length_size(&[1, 0x42, 0xC0, 0x1F, 0xFC]).unwrap(), 1);
-        assert!(nal_length_size(&[1, 2]).is_err());
+        let h264 = VideoCodec::H264;
+        assert_eq!(
+            nal_length_size(h264, &[1, 0x42, 0xC0, 0x1F, 0xFF]).unwrap(),
+            4
+        );
+        assert_eq!(
+            nal_length_size(h264, &[1, 0x42, 0xC0, 0x1F, 0xFC]).unwrap(),
+            1
+        );
+        assert!(nal_length_size(h264, &[1, 2]).is_err());
+    }
+
+    #[test]
+    fn reads_hevc_nal_length_size_from_byte_21() {
+        let mut hvcc = vec![0u8; 23];
+        hvcc[21] = 0x0F; // constantFrameRate 0, 1 temporal layer, nested, lengthSizeMinusOne 3
+        assert_eq!(nal_length_size(VideoCodec::Hevc, &hvcc).unwrap(), 4);
+        hvcc[21] = 0x0D;
+        assert_eq!(nal_length_size(VideoCodec::Hevc, &hvcc).unwrap(), 2);
+        assert!(nal_length_size(VideoCodec::Hevc, &hvcc[..21]).is_err());
+    }
+
+    #[test]
+    fn reads_every_video_header_layout() {
+        use VideoCodec::{H264, Hevc};
+        let frame = |codec, keyframe, body| Video::Frame {
+            codec,
+            keyframe,
+            body,
+        };
+
+        assert_eq!(video(&[0x17, 1, 0, 0, 0, 0xAA]), frame(H264, true, 5));
+        assert_eq!(
+            video(&[0x17, 0, 0, 0, 0, 0xAA]),
+            Video::Config {
+                codec: H264,
+                body: 5
+            }
+        );
+        assert_eq!(video(&[0x2C, 1, 0, 0, 0, 0xAA]), frame(Hevc, false, 5));
+
+        // Enhanced RTMP: CodedFrames keeps a composition time, CodedFramesX does not.
+        assert_eq!(
+            video(&[0x91, b'h', b'v', b'c', b'1', 0, 0, 0, 0xAA]),
+            frame(Hevc, true, 8)
+        );
+        assert_eq!(
+            video(&[0xA3, b'h', b'v', b'c', b'1', 0xAA]),
+            frame(Hevc, false, 5)
+        );
+        assert_eq!(
+            video(&[0x90, b'h', b'v', b'c', b'1', 0xAA]),
+            Video::Config {
+                codec: Hevc,
+                body: 5
+            }
+        );
+        assert_eq!(
+            video(&[0x91, b'a', b'v', b'c', b'1', 0, 0, 0, 0xAA]),
+            frame(H264, true, 8)
+        );
+    }
+
+    #[test]
+    fn names_a_codec_records_cannot_ride_in() {
+        assert_eq!(
+            video(&[0x91, b'a', b'v', b'0', b'1', 0, 0, 0, 0xAA]),
+            Video::Unsupported("av01".into())
+        );
+        assert_eq!(
+            video(&[0x14, 1, 0, 0, 0, 0xAA]),
+            Video::Unsupported("FLV codec id 4".into())
+        );
+    }
+
+    #[test]
+    fn leaves_non_picture_tags_alone() {
+        // End of sequence, a command frame, and a CodedFrames tag with no body.
+        assert_eq!(video(&[0x17, 2, 0, 0, 0, 0]), Video::Other);
+        // Multitrack, one track of CodedFrames: the FourCC sits at byte 2.
+        assert_eq!(
+            video(&[0x96, 0x01, b'h', b'v', b'c', b'1', 0, 0, 0, 0xAA]),
+            Video::Other
+        );
+        assert_eq!(
+            video(&[0xD1, b'h', b'v', b'c', b'1', 0, 0, 0, 0]),
+            Video::Other
+        );
+        assert_eq!(
+            video(&[0x91, b'h', b'v', b'c', b'1', 0, 0, 0]),
+            Video::Other
+        );
+        assert_eq!(video(&[]), Video::Other);
     }
 
     #[test]

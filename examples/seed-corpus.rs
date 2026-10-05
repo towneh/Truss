@@ -46,6 +46,12 @@ fn main() -> std::io::Result<()> {
     write(root, "artnet_poll", &artnet_poll_seeds(), inv::artnet_poll)?;
     write(root, "osc_message", &osc_seeds(), inv::osc_message)?;
     write(root, "h264_nals", &h264_seeds(), inv::h264_nals)?;
+    write(
+        root,
+        "inject_video_tag",
+        &video_tag_seeds(),
+        inv::inject_video_tag,
+    )?;
 
     Ok(())
 }
@@ -153,6 +159,33 @@ fn record_seeds() -> Vec<Vec<u8>> {
     let r = Record::with_payload(1, 8, 1, 8, live);
     out.push(r.encode().expect("one universe fits a record"));
     out
+}
+
+/// One of each header layout the injector reads: legacy AVC, legacy HEVC,
+/// and Enhanced RTMP `hvc1` as a config, CodedFrames and CodedFramesX.
+fn video_tag_seeds() -> Vec<Vec<u8>> {
+    let au =
+        |nals: &[&[u8]]| -> Vec<u8> { nals.iter().flat_map(|n| h264::avcc_wrap(n, 4)).collect() };
+    let with = |header: &[u8], body: Vec<u8>| -> Vec<u8> {
+        let mut out = header.to_vec();
+        out.extend_from_slice(&body);
+        out
+    };
+    let mut hvcc = vec![1u8; 23];
+    hvcc[21] = 0x0F;
+    vec![
+        with(
+            &[0x17, flv::AVC_NALU, 0, 0, 0],
+            au(&[&[0x09, 0x10], &[0x65, 0xAA]]),
+        ),
+        with(&[0x1C, flv::AVC_NALU, 0, 0, 0], au(&[&[0x26, 0x01, 0xAA]])),
+        with(&[0x90, b'h', b'v', b'c', b'1'], hvcc),
+        with(
+            &[0x91, b'h', b'v', b'c', b'1', 0, 0, 0],
+            au(&[&[0x46, 0x01, 0x10], &[0x26, 0x01, 0xAA]]),
+        ),
+        with(&[0xA3, b'h', b'v', b'c', b'1'], au(&[&[0x02, 0x01, 0xBB]])),
+    ]
 }
 
 fn flv_seeds() -> Vec<Vec<u8>> {

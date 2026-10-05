@@ -70,6 +70,9 @@ fn main() -> Result<()> {
         keyframes_only: cli.keyframes_only,
     };
     let stats = inject(&mut flv, &opts)?;
+    if let Some(codec) = &stats.unsupported_codec {
+        bail!("the video is {codec}; records go into H.264 or HEVC only");
+    }
 
     println!("carriers:");
     for c in &carriers {

@@ -38,6 +38,7 @@ jobs:
           - artnet_poll
           - osc_message
           - h264_nals
+          - inject_video_tag
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly

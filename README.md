@@ -1,6 +1,6 @@
 # Truss
 
-DMX lighting control carried inside a live video stream, as H.264 SEI user data.
+DMX lighting control carried inside a live video stream, as H.264 or HEVC SEI user data.
 
 A lighting desk speaks Art-Net across the local network, and that traffic does
 not leave the building, where video does. Truss takes what the desk is sending,
@@ -24,9 +24,10 @@ Check your own path before anything else:
 truss-detect rtmp://your-egress/live/stream --max-seconds 30
 ```
 
-This reads your own egress and reports what arrived. It distinguishes the three
-outcomes that matter: nothing arrived, something arrived but was damaged,
-something arrived intact. Only the last is a basis for running a show.
+This reads your own egress, H.264 or HEVC, and reports what arrived. It
+distinguishes the three outcomes that matter: nothing arrived, something arrived
+but was damaged, something arrived intact. Only the last is a basis for running
+a show.
 
 The scheme picks the reader. `rtsp://` and `rtmp://` go through ffmpeg, which
 needs to be on your PATH; `http://`, `https://`, a file path or `-` for stdin
@@ -48,7 +49,7 @@ ffmpeg -re -i carried.flv -c copy -f flv rtmp://ingest.example.net/live/<key>
 
 `-c copy` publishes the file as it stands, so what reaches the egress is what
 `truss-inject` wrote, and `truss-detect` against the egress then scores the path
-itself.
+itself. `-c:v libx265` in place of `libx264` checks an HEVC path instead.
 
 The same file can also be read back without leaving the machine, which separates
 a fault in the carrier from a fault in the network:
@@ -82,6 +83,10 @@ given.
 
 Point your encoder at `rtmp://127.0.0.1/live` with any stream key. Truss holds
 the real one, so it need never be entered into the encoder.
+
+The encoder can send H.264 or HEVC. OBS sends HEVC over Enhanced RTMP from
+version 29.1. Any other codec goes through the relay untouched, with no records
+in it, and the relay warns that it is doing so.
 
 Point the lighting desk at the machine's Art-Net port, 6454 by default. Truss
 retains the newest value for each universe and packs as much as will fit into
