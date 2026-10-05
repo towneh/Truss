@@ -275,6 +275,26 @@ pub struct Universe {
     pub captured: Instant,
     pub packets: u64,
     sequence: u8,
+    window_packets: u32,
+    window_late: u32,
+    two_senders: bool,
+}
+
+/// Packets of one universe judged together when deciding whether two senders
+/// share it: a few seconds of one desk.
+const SENDER_WINDOW: u32 = 200;
+
+impl Universe {
+    fn note_order(&mut self, late: bool) {
+        self.window_packets += 1;
+        self.window_late += u32::from(late);
+        if self.window_packets == SENDER_WINDOW {
+            // A tenth is well above anything one sender reorders on a LAN.
+            self.two_senders = self.window_late * 10 > SENDER_WINDOW;
+            self.window_packets = 0;
+            self.window_late = 0;
+        }
+    }
 }
 
 /// The current value of every universe seen so far.
@@ -325,17 +345,23 @@ impl Latch {
             captured: now,
             packets: 0,
             sequence: 0,
+            window_packets: 0,
+            window_late: 0,
+            two_senders: false,
         });
 
         // Sequence 0 means the sender does not implement ordering, so every
         // packet is current. Otherwise the difference is signed modulo 256:
         // anything not ahead of what we hold arrived late and is stale.
-        if dmx.sequence != 0 && entry.sequence != 0 {
-            let delta = dmx.sequence.wrapping_sub(entry.sequence) as i8;
-            if delta <= 0 {
-                self.out_of_order += 1;
-                return false;
-            }
+        let late = dmx.sequence != 0
+            && entry.sequence != 0
+            && (dmx.sequence.wrapping_sub(entry.sequence) as i8) <= 0;
+        // Judged per universe: clean traffic on the rest of the patch would
+        // otherwise dilute one universe's conflict below the threshold.
+        entry.note_order(late);
+        if late {
+            self.out_of_order += 1;
+            return false;
         }
 
         entry.values[..dmx.values.len()].copy_from_slice(dmx.values);
@@ -344,6 +370,14 @@ impl Latch {
         entry.sequence = dmx.sequence;
         entry.packets += 1;
         true
+    }
+
+    /// Whether any universe's last full window of packets had a steady share
+    /// arriving late: two senders carrying it, each putting the other's
+    /// packets behind its own. Judged on recent packets rather than the whole
+    /// run, so it clears once one sender stops.
+    pub fn two_senders(&self) -> bool {
+        self.universes.values().any(|u| u.two_senders)
     }
 
     pub fn universe_count(&self) -> usize {
@@ -852,6 +886,97 @@ mod tests {
         assert!(!latch.accept(&art_dmx(0, 9, &[2]), now));
         assert_eq!(latch.out_of_order, 1);
         assert_eq!(latch.snapshot(now, 4096)[0].values, vec![1]);
+    }
+
+    /// Two senders a sequence number apart, as a desk sending both to a node
+    /// and to localhost delivers them: every other packet is behind the one
+    /// before it.
+    fn feed_two_senders(latch: &mut Latch, packets: u32, now: Instant) {
+        for i in 0..packets {
+            let seq = (i / 2 % 254 + 1) as u8;
+            latch.accept(&art_dmx(0, seq, &[1]), now);
+        }
+    }
+
+    fn feed_one_sender(latch: &mut Latch, packets: u32, now: Instant) {
+        let start = latch.universes.get(&0).map_or(0, |u| u.sequence);
+        for i in 0..packets {
+            let seq = ((start as u32 + i) % 255 + 1) as u8;
+            latch.accept(&art_dmx(0, seq, &[1]), now);
+        }
+    }
+
+    #[test]
+    fn two_senders_are_judged_only_on_a_full_window() {
+        let mut latch = Latch::default();
+        let now = Instant::now();
+        feed_two_senders(&mut latch, 199, now);
+        assert!(latch.out_of_order > 90);
+        assert!(!latch.two_senders());
+        feed_two_senders(&mut latch, 1, now);
+        assert!(latch.two_senders());
+    }
+
+    #[test]
+    fn one_conflicted_universe_is_not_hidden_by_clean_ones() {
+        let mut latch = Latch::default();
+        let now = Instant::now();
+        // Universe 0 has two senders, universes 1 to 9 one each, interleaved
+        // as a desk sends a patch.
+        let mut clean = [0u8; 10];
+        for i in 0..SENDER_WINDOW {
+            latch.accept(&art_dmx(0, (i / 2 % 254 + 1) as u8, &[1]), now);
+            for u in 1..10u16 {
+                let seq = &mut clean[usize::from(u)];
+                *seq = *seq % 255 + 1;
+                latch.accept(&art_dmx(u, *seq, &[1]), now);
+            }
+        }
+        assert!(
+            latch.out_of_order * 10 < latch.packets,
+            "late packets are well under a tenth of all traffic"
+        );
+        assert!(latch.two_senders());
+    }
+
+    #[test]
+    fn two_senders_clear_once_one_stops() {
+        let mut latch = Latch::default();
+        let now = Instant::now();
+        feed_two_senders(&mut latch, 400, now);
+        assert!(latch.two_senders());
+        let late = latch.out_of_order;
+
+        feed_one_sender(&mut latch, 400, now);
+        assert_eq!(latch.out_of_order, late, "one sender is never late");
+        assert!(
+            !latch.two_senders(),
+            "a clean window clears it, however many late packets came before"
+        );
+    }
+
+    #[test]
+    fn a_tenth_late_is_one_sender_and_just_over_is_two() {
+        let now = Instant::now();
+        for (late, expected) in [(20, false), (21, true)] {
+            let mut latch = Latch::default();
+            let mut seq = 1u8;
+            latch.accept(&art_dmx(0, seq, &[1]), now);
+            for i in 1..SENDER_WINDOW {
+                if i <= late {
+                    latch.accept(&art_dmx(0, seq, &[1]), now);
+                } else {
+                    seq = seq % 254 + 1;
+                    latch.accept(&art_dmx(0, seq, &[1]), now);
+                }
+            }
+            assert_eq!(latch.out_of_order, late as u64);
+            assert_eq!(
+                latch.two_senders(),
+                expected,
+                "{late} late of {SENDER_WINDOW}"
+            );
+        }
     }
 
     #[test]

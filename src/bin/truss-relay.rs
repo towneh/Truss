@@ -411,7 +411,7 @@ impl IdleStatus {
             latch.last_controller,
             latch.error.clone(),
             latch.reply_errors > 0,
-            duplicate_senders(&latch),
+            latch.two_senders(),
             osc.is_some_and(|o| o.failed > 0),
         );
         if self.last.as_ref() == Some(&key) {
@@ -435,13 +435,6 @@ fn osc_status(o: &osc::Sender) -> String {
         s.push_str(&format!(" ({} failed)", o.failed));
     }
     s
-}
-
-/// Two senders on one universe each put the other's packets behind their
-/// own. A tenth is well above anything one sender reorders on a LAN, and 200
-/// packets is a couple of seconds of one desk, enough to judge by.
-fn duplicate_senders(latch: &artnet::Latch) -> bool {
-    latch.packets >= 200 && latch.out_of_order * 10 > latch.packets
 }
 
 /// The Art-Net fragment of a status line, and a note when the lane needs
@@ -484,7 +477,7 @@ fn artnet_status(latch: &artnet::Latch) -> (String, Option<String>) {
         })
     });
     let note = note.or_else(|| {
-        duplicate_senders(latch).then(|| {
+        latch.two_senders().then(|| {
             "a steady share of packets arrive late: two senders are carrying the same \
              universes, as a desk does when set to send both to this node and to localhost"
                 .into()
