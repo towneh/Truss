@@ -1,15 +1,12 @@
 //! Resolving a stream key, and keeping it out of everything else.
 //!
 //! An RTMP publish URL is `rtmp://host/app/<key>`, so the key *is* the URL.
-//! Anything that prints a URL prints the credential with it, and the obvious
-//! places that happens are not ones a caller controls: ffmpeg writes the publish
-//! URL into its stderr, and a panic or an I/O error will happily carry a URL in
-//! its message.
+//! Anything that prints a URL prints the credential with it, and a panic or an
+//! I/O error will happily carry a URL in its message.
 //!
 //! So the key is held apart from the host and app it belongs with. The relay
 //! speaks RTMP itself, sends the key only in the publish request, and shows the
-//! ingest as host and app alone. [`Redactor`] is for a caller that has to show
-//! text which might contain the key, such as a child process's stderr.
+//! ingest as host and app alone.
 //!
 //! # Where a key may come from
 //!
@@ -150,113 +147,6 @@ impl StreamKey {
     }
 }
 
-/// Rewrites a secret out of text before it is shown.
-///
-/// For a caller that surfaces a child process's stderr. Swallowing ffmpeg's
-/// output turns "ffmpeg refused the stream" into a report identical to "nothing
-/// arrived", but ffmpeg prints the URL it was given, and a publish URL has the
-/// key in it. Passing the output through here lets both hold.
-#[derive(Clone)]
-pub struct Redactor {
-    secrets: Vec<String>,
-}
-
-/// What a redacted secret is replaced with.
-pub const REDACTED: &str = "<redacted>";
-
-impl Redactor {
-    pub fn new() -> Self {
-        Self {
-            secrets: Vec::new(),
-        }
-    }
-
-    /// Add a secret to strip. Short values are ignored: a two-character secret
-    /// would match half the words in a log and redact the very message that
-    /// explains what went wrong.
-    pub fn hide(&mut self, secret: &str) -> &mut Self {
-        if secret.len() >= 6 {
-            self.secrets.push(secret.to_owned());
-        }
-        self
-    }
-
-    pub fn hide_key(&mut self, key: &StreamKey) -> &mut Self {
-        self.hide(key.expose())
-    }
-
-    /// Replace every known secret in `text`.
-    pub fn apply(&self, text: &str) -> String {
-        let mut out = text.to_owned();
-        for secret in &self.secrets {
-            if out.contains(secret.as_str()) {
-                out = out.replace(secret.as_str(), REDACTED);
-            }
-        }
-        out
-    }
-
-    /// Print to stderr with the secrets removed. The one function child output
-    /// should reach the console through.
-    pub fn eprintln(&self, text: &str) {
-        eprintln!("{}", self.apply(text));
-    }
-}
-
-impl Default for Redactor {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// An RTMP publish target, held in pieces so the key is never sitting in a
-/// string that something might decide to log.
-#[derive(Clone)]
-pub struct PublishTarget {
-    pub host: String,
-    pub app: String,
-    key: StreamKey,
-}
-
-impl std::fmt::Debug for PublishTarget {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // Safe to print anywhere: everything but the key.
-        write!(f, "rtmp://{}/{}/{REDACTED}", self.host, self.app)
-    }
-}
-
-impl PublishTarget {
-    pub fn new(host: impl Into<String>, app: impl Into<String>, key: StreamKey) -> Self {
-        Self {
-            host: host.into(),
-            app: app.into(),
-            key,
-        }
-    }
-
-    /// The full URL. Composed here and nowhere else, and not to be stored,
-    /// logged, or put in an error message.
-    pub fn publish_url(&self) -> String {
-        format!("rtmp://{}/{}/{}", self.host, self.app, self.key.expose())
-    }
-
-    /// The same target with the key removed, for anything a human will read.
-    pub fn display_url(&self) -> String {
-        format!("rtmp://{}/{}/{REDACTED}", self.host, self.app)
-    }
-
-    pub fn key(&self) -> &StreamKey {
-        &self.key
-    }
-
-    /// A redactor primed with this target's key.
-    pub fn redactor(&self) -> Redactor {
-        let mut r = Redactor::new();
-        r.hide_key(&self.key);
-        r
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -270,52 +160,6 @@ mod tests {
             "Debug leaked the key: {shown}"
         );
         assert!(shown.contains("22 chars"), "{shown}");
-    }
-
-    #[test]
-    fn a_target_never_prints_its_key() {
-        let target = PublishTarget::new(
-            "ingest.example.net",
-            "live",
-            StreamKey::new("super-secret-key-value").unwrap(),
-        );
-        for shown in [format!("{target:?}"), target.display_url()] {
-            assert!(!shown.contains("super-secret"), "leaked: {shown}");
-            assert!(shown.contains("ingest.example.net"), "{shown}");
-        }
-        // The composed URL is the one place it appears, and only on request.
-        assert!(target.publish_url().contains("super-secret-key-value"));
-    }
-
-    #[test]
-    fn ffmpeg_style_output_is_scrubbed() {
-        // The shape ffmpeg actually prints, which is how the key escaped before.
-        let target = PublishTarget::new(
-            "ingest.example.net",
-            "live",
-            StreamKey::new("super-secret-key-value").unwrap(),
-        );
-        let line = format!(
-            "[rtmp @ 0000] Opening '{}' for writing",
-            target.publish_url()
-        );
-        let scrubbed = target.redactor().apply(&line);
-        assert!(!scrubbed.contains("super-secret-key-value"), "{scrubbed}");
-        assert!(scrubbed.contains(REDACTED), "{scrubbed}");
-        // The rest of the message survives, which is the point of redacting
-        // rather than suppressing.
-        assert!(scrubbed.contains("Opening"), "{scrubbed}");
-        assert!(scrubbed.contains("ingest.example.net"), "{scrubbed}");
-    }
-
-    #[test]
-    fn a_short_secret_is_not_redacted() {
-        let mut r = Redactor::new();
-        r.hide("abc");
-        assert_eq!(
-            r.apply("abc is a common substring"),
-            "abc is a common substring"
-        );
     }
 
     #[test]
