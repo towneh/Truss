@@ -72,6 +72,9 @@ pub enum DecodeError {
         declared: u32,
         computed: u32,
     },
+    /// Not checked: [`find_records`] had spent its CRC budget for the
+    /// haystack before reaching this candidate.
+    OverBudget,
 }
 
 impl fmt::Display for DecodeError {
@@ -93,6 +96,7 @@ impl fmt::Display for DecodeError {
                     "crc mismatch: declared {declared:#010x}, computed {computed:#010x}"
                 )
             }
+            Self::OverBudget => write!(f, "not checked: the scan's crc budget was spent"),
         }
     }
 }
@@ -187,28 +191,12 @@ impl Record {
 
     /// Decode a record anchored at the start of `buf`.
     pub fn decode(buf: &[u8]) -> Result<Self, DecodeError> {
-        if buf.len() < HEADER_LEN {
-            return Err(DecodeError::TooShort);
-        }
-        if buf[..8] != MAGIC {
-            return Err(DecodeError::BadMagic);
-        }
-        if buf[8] != VERSION {
-            return Err(DecodeError::BadVersion(buf[8]));
-        }
+        let end = crc_end(buf)?;
         let carrier = buf[9];
         let seq = u32::from_be_bytes(buf[10..14].try_into().unwrap());
         let send_unix_nanos = u64::from_be_bytes(buf[14..22].try_into().unwrap());
         let frame_index = u32::from_be_bytes(buf[22..26].try_into().unwrap());
-        let payload_len = u16::from_be_bytes(buf[26..28].try_into().unwrap()) as usize;
 
-        let end = HEADER_LEN + payload_len;
-        if buf.len() < end + CRC_LEN {
-            return Err(DecodeError::Truncated {
-                declared: payload_len,
-                available: buf.len().saturating_sub(HEADER_LEN),
-            });
-        }
         let declared = u32::from_be_bytes(buf[end..end + CRC_LEN].try_into().unwrap());
         let computed = crc32fast::hash(&buf[..end]);
         if declared != computed {
@@ -246,18 +234,33 @@ pub struct Hit {
 /// single detector score carriers whose framing we do not control. A hit that
 /// fails to decode is still reported: "the magic arrived but the body did not"
 /// is a different verdict from "nothing arrived".
+///
+/// A candidate that fails is stepped past by its magic alone, because its
+/// length may be the damaged field and the next real record could sit inside
+/// the span it claims. That lets candidates overlap, each claiming up to 64 KB
+/// of CRC, so the total CRC work is capped at [`CRC_BUDGET_PER_BYTE`] times
+/// the haystack. Records that decode never overlap, so an undamaged haystack
+/// spends at most its own length. Candidates past the cap are reported as
+/// [`DecodeError::OverBudget`].
 pub fn find_records(haystack: &[u8]) -> Vec<Hit> {
     let mut hits = Vec::new();
     if haystack.len() < MAGIC.len() {
         return hits;
     }
+    let mut budget = haystack.len().saturating_mul(CRC_BUDGET_PER_BYTE);
     let mut i = 0usize;
     while i + MAGIC.len() <= haystack.len() {
         if haystack[i..i + MAGIC.len()] != MAGIC {
             i += 1;
             continue;
         }
-        let result = Record::decode(&haystack[i..]);
+        let cost = crc_span(&haystack[i..]);
+        let result = if cost > budget {
+            Err(DecodeError::OverBudget)
+        } else {
+            budget -= cost;
+            Record::decode(&haystack[i..])
+        };
         let advance = match &result {
             Ok(r) => Record::encoded_len(r.payload.len()),
             Err(_) => MAGIC.len(),
@@ -266,6 +269,40 @@ pub fn find_records(haystack: &[u8]) -> Vec<Hit> {
         i += advance;
     }
     hits
+}
+
+/// CRC work [`find_records`] may spend per byte of haystack.
+pub const CRC_BUDGET_PER_BYTE: usize = 4;
+
+/// How many bytes [`Record::decode`] would run through the CRC for a candidate
+/// at the start of `buf`: none when it would stop at the header first.
+fn crc_span(buf: &[u8]) -> usize {
+    crc_end(buf).unwrap_or(0)
+}
+
+/// The checks [`Record::decode`] makes before the CRC, in its order, and on
+/// success the end of the range the CRC covers, read from the length field.
+/// [`crc_span`] uses the same checks, so the budget charges what decoding
+/// will actually cost.
+fn crc_end(buf: &[u8]) -> Result<usize, DecodeError> {
+    if buf.len() < HEADER_LEN {
+        return Err(DecodeError::TooShort);
+    }
+    if buf[..8] != MAGIC {
+        return Err(DecodeError::BadMagic);
+    }
+    if buf[8] != VERSION {
+        return Err(DecodeError::BadVersion(buf[8]));
+    }
+    let payload_len = usize::from(u16::from_be_bytes([buf[26], buf[27]]));
+    let end = HEADER_LEN + payload_len;
+    if buf.len() < end + CRC_LEN {
+        return Err(DecodeError::Truncated {
+            declared: payload_len,
+            available: buf.len().saturating_sub(HEADER_LEN),
+        });
+    }
+    Ok(end)
 }
 
 /// Deterministic payload bytes for a sequence number (xorshift32).
@@ -375,6 +412,58 @@ mod tests {
             u32::from_be_bytes(hdr[10..14].try_into().unwrap()),
             good_seq
         );
+    }
+
+    #[test]
+    fn overlapping_decoys_cannot_run_the_crc_past_its_budget() {
+        // Every 14 bytes a magic and version, with a length that reads 0xFFFF,
+        // so each candidate would claim a 64 KB CRC.
+        let mut period = MAGIC.to_vec();
+        period.extend_from_slice(&[VERSION, 0, 0, 0, 0xFF, 0xFF]);
+        let mut hay = sample().encode().unwrap();
+        hay.extend(period.iter().copied().cycle().take(512 * 1024));
+
+        let hits = find_records(&hay);
+        assert_eq!(hits[0].result.as_ref().unwrap(), &sample());
+        let spent: usize = hits
+            .iter()
+            .filter(|h| !matches!(h.result, Err(DecodeError::OverBudget)))
+            .map(|h| crc_span(&hay[h.offset..]))
+            .sum();
+        assert!(spent <= hay.len() * CRC_BUDGET_PER_BYTE);
+        assert!(
+            hits.iter()
+                .any(|h| matches!(h.result, Err(DecodeError::OverBudget)))
+        );
+    }
+
+    #[test]
+    fn the_budget_charges_what_decode_hashes() {
+        let good = sample().encode().unwrap();
+        let hashed = HEADER_LEN + DEFAULT_PAYLOAD_LEN;
+        assert_eq!(crc_span(&good), hashed);
+        let mut bad_crc = good.clone();
+        *bad_crc.last_mut().unwrap() ^= 0xFF;
+        assert_eq!(crc_span(&bad_crc), hashed);
+        assert_eq!(crc_span(&good[..good.len() - 1]), 0, "truncated");
+        let mut bad_version = good.clone();
+        bad_version[8] = VERSION + 1;
+        assert_eq!(crc_span(&bad_version), 0);
+    }
+
+    #[test]
+    fn a_haystack_of_records_stays_inside_the_budget() {
+        let mut hay = Vec::new();
+        for seq in 0..50 {
+            hay.extend_from_slice(
+                &Record::new(1, seq, 1, seq, MAX_PAYLOAD_LEN / 64)
+                    .encode()
+                    .unwrap(),
+            );
+        }
+        let hits = find_records(&hay);
+        assert_eq!(hits.len(), 50);
+        assert!(hits.iter().all(|h| h.result.is_ok()));
     }
 
     #[test]
