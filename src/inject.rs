@@ -44,7 +44,8 @@ pub struct InjectStats {
     pub injected: BTreeMap<&'static str, u64>,
     pub added_bytes: u64,
     pub duration_ms: u32,
-    /// Records that would not fit the 16-bit length field and were left out.
+    /// Records left out because they would not fit the record's 16-bit length
+    /// field or the stream's NAL length field.
     /// A frame without its lane beats a relay that stops mid-show, but it is
     /// still data the far end will not see, so it is counted rather than
     /// swallowed.
@@ -193,8 +194,8 @@ impl Injector {
             // is so a gap in the detector's count still means loss in transit
             // rather than a frame the injector declined to send.
             let framed = match c.frame_for(codec, &record) {
-                Ok(f) => f,
-                Err(_) => {
+                Ok(f) if h264::fits_avcc(f.len(), self.length_size) => f,
+                _ => {
                     self.stats.oversize_skipped += 1;
                     continue;
                 }
@@ -361,6 +362,35 @@ mod tests {
         assert!(ok.len() > tag.data.len());
         assert_eq!(inj.stats.injected["sei-unreg"], 1);
         assert_eq!(inj.stats.oversize_skipped, 1);
+    }
+
+    #[test]
+    fn a_record_too_long_for_a_one_byte_nal_length_is_skipped_not_cut() {
+        let mut inj = Injector::new(&InjectOptions {
+            carriers: vec![Carrier::SeiUnregistered],
+            ..Default::default()
+        })
+        .expect("valid options");
+        let mut config = vec![0x17u8, AVC_SEQUENCE_HEADER, 0, 0, 0];
+        config.extend_from_slice(&[1, 0x42, 0xC0, 0x1F, 0xFC, 0xE1]); // lengthSize 1
+        inj.note_sequence_header(&config).expect("config");
+        let mut data = vec![0x17, AVC_NALU, 0, 0, 0];
+        data.extend_from_slice(&h264::avcc_wrap(&[0x65, 0xAA], 1));
+
+        let out = inj
+            .inject_tag_with(&data, 0, Some(&[0u8; 300]))
+            .expect("not fatal")
+            .expect("the frame still goes out");
+        assert_eq!(inj.stats.oversize_skipped, 1);
+        let nals = h264::nal_units_avcc(&out[5..], 1).expect("still framed");
+        assert_eq!(nals, vec![&[0x65, 0xAA][..]]);
+
+        let out = inj
+            .inject_tag_with(&data, 0, Some(b"small"))
+            .expect("injects")
+            .expect("rewritten");
+        assert_eq!(inj.stats.injected["sei-unreg"], 1);
+        assert_eq!(h264::nal_units_avcc(&out[5..], 1).expect("framed").len(), 2);
     }
 
     #[test]

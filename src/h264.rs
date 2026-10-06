@@ -92,7 +92,16 @@ pub fn nal_units_avcc(data: &[u8], length_size: usize) -> Option<Vec<&[u8]>> {
     Some(out)
 }
 
-/// Prefix a NAL with its AVCC length field.
+/// Whether a NAL of `len` bytes can be written with a `length_size` byte
+/// length field. The stream's configuration record picks the size, and one or
+/// two bytes is too few for a large record.
+pub fn fits_avcc(len: usize, length_size: usize) -> bool {
+    length_size >= 8 || (len as u64) >> (8 * length_size) == 0
+}
+
+/// Prefix a NAL with its AVCC length field. The length is cut to
+/// `length_size` bytes, so check [`fits_avcc`] first for a NAL that is not
+/// already from the stream.
 pub fn avcc_wrap(nal: &[u8], length_size: usize) -> Vec<u8> {
     let mut out = Vec::with_capacity(length_size + nal.len());
     let len = nal.len();
