@@ -2,8 +2,7 @@
 
 DMX lighting control carried inside a live video stream, as H.264 or HEVC SEI user data.
 
-A lighting desk speaks Art-Net, which stays on the local network. Video leaves
-the building. Truss takes what the desk is sending and packs it into the video
+Truss takes the Art-Net from a lighting desk and packs it into the video
 as that passes through an RTMP relay, and it arrives wherever the video
 arrives. The data rides inside each access unit rather than alongside it, and
 stays locked to the picture.
