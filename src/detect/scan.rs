@@ -129,9 +129,13 @@ impl CarrierTally {
         self.first_seq = Some(self.first_seq.map_or(r.seq, |f| f.min(r.seq)));
         self.last_seq = Some(self.last_seq.map_or(r.seq, |l| l.max(r.seq)));
         self.seqs.insert(r.seq);
-        if r.send_unix_nanos > 0 {
-            self.latencies_ns
-                .push(now_unix_nanos as i64 - r.send_unix_nanos as i64);
+        // The send time is whatever the stream says it is, so a difference
+        // that does not fit is left out rather than wrapped.
+        let latency = i128::from(now_unix_nanos) - i128::from(r.send_unix_nanos);
+        if r.send_unix_nanos > 0
+            && let Ok(ns) = i64::try_from(latency)
+        {
+            self.latencies_ns.push(ns);
         }
     }
 }
@@ -583,6 +587,29 @@ mod tests {
 
         let (_, med, _) = r.carriers["sei-unreg"].latency_percentiles_ms().unwrap();
         assert!((med - 250.0).abs() < 0.001, "median was {med}");
+    }
+
+    #[test]
+    fn a_send_time_past_i64_neither_panics_nor_wraps() {
+        let now = 1_000_000_000u64;
+        let tally = |sent: u64| {
+            let mut s = Scanner::new();
+            let au = au_with(&[probe(Carrier::SeiUnregistered, 1, sent)]);
+            s.feed_video_au(VideoCodec::H264, &au, now);
+            s.report().carriers["sei-unreg"].clone()
+        };
+
+        // The cast made this i64::MIN, and the subtraction overflowed. The
+        // true difference fits, so it is recorded as it is.
+        let t = tally(1 << 63);
+        assert_eq!(t.ok, 1);
+        assert_eq!(t.latencies_ns, vec![i64::MIN + now as i64]);
+
+        // The cast made this -1, which passed for a second's latency. The true
+        // difference does not fit, so the record counts and is not timed.
+        let t = tally(u64::MAX);
+        assert_eq!(t.ok, 1);
+        assert!(t.latencies_ns.is_empty());
     }
 
     #[test]
