@@ -307,9 +307,9 @@ impl TsAnalyzer {
             return;
         }
         let body = &section[8..section.len() - 4];
-        for entry in body.chunks_exact(4) {
-            let program = u16::from_be_bytes([entry[0], entry[1]]);
-            let pid = (((entry[2] & 0x1F) as u16) << 8) | entry[3] as u16;
+        for &[p0, p1, p2, p3] in body.as_chunks::<4>().0 {
+            let program = u16::from_be_bytes([p0, p1]);
+            let pid = (((p2 & 0x1F) as u16) << 8) | p3 as u16;
             if program != 0 {
                 self.pmt_pids.insert(pid);
             }

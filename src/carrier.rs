@@ -234,8 +234,10 @@ pub fn hex_decode(text: &[u8]) -> Option<Vec<u8>> {
             _ => None,
         }
     }
-    text.chunks_exact(2)
-        .map(|p| Some((nibble(p[0])? << 4) | nibble(p[1])?))
+    text.as_chunks::<2>()
+        .0
+        .iter()
+        .map(|&[hi, lo]| Some((nibble(hi)? << 4) | nibble(lo)?))
         .collect()
 }
 
