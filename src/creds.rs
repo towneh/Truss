@@ -6,9 +6,10 @@
 //! URL into its stderr, and a panic or an I/O error will happily carry a URL in
 //! its message.
 //!
-//! So the key is held apart from the host and app it belongs with, composed only
-//! at the moment of connecting, and [`Redactor`] sits between anything that might
-//! contain it and anything that displays it.
+//! So the key is held apart from the host and app it belongs with. The relay
+//! speaks RTMP itself, sends the key only in the publish request, and shows the
+//! ingest as host and app alone. [`Redactor`] is for a caller that has to show
+//! text which might contain the key, such as a child process's stderr.
 //!
 //! # Where a key may come from
 //!
@@ -19,10 +20,10 @@
 //!    `LoadCredential=` puts the secret on a tmpfs readable only by the unit,
 //!    and Docker and Compose secrets appear as files too. Nothing else on the
 //!    machine can read it and it never enters the process table.
-//! 2. **The OS credential store**, once `truss login` has put it there —
-//!    Credential Manager on Windows, Keychain on macOS, Secret Service on Linux.
-//!    Right for a desktop. Not available on a headless Linux box, which usually
-//!    has no keyring daemon and no session bus, so it cannot be the only route.
+//! 2. **The OS credential store**: Credential Manager on Windows, Keychain on
+//!    macOS, Secret Service on Linux. Not wired yet; the lookup always falls
+//!    through (see `from_os_store`). Right for a desktop, but not available on
+//!    a headless Linux box, so it cannot be the only route.
 //! 3. **An environment variable**, `TRUSS_STREAM_KEY`. Convenient and weaker:
 //!    on Linux the environment of a process is readable through `/proc`, and it
 //!    lands in crash dumps.
@@ -103,9 +104,9 @@ impl StreamKey {
             return Self::prompt();
         }
         bail!(
-            "no stream key. Give --stream-key-file (or `-` for stdin), run `truss login`, \
-             or set {ENV_VAR}. There is deliberately no flag that takes the key itself: \
-             it would be visible to anything that can list processes"
+            "no stream key. Give --stream-key-file (or `-` for stdin), or set {ENV_VAR}. \
+             There is deliberately no flag that takes the key itself: it would be visible \
+             to anything that can list processes"
         )
     }
 
@@ -151,12 +152,10 @@ impl StreamKey {
 
 /// Rewrites a secret out of text before it is shown.
 ///
-/// The case this exists for: `truss detect` and the relay both surface a child
-/// process's stderr, on purpose — swallowing ffmpeg's output turns "ffmpeg
-/// refused the stream" into a report identical to "nothing arrived", which is
-/// the exact confusion these tools exist to prevent. But ffmpeg prints the
-/// publish URL, and the key is in it. Both things can be true only if the output
-/// passes through here on the way out.
+/// For a caller that surfaces a child process's stderr. Swallowing ffmpeg's
+/// output turns "ffmpeg refused the stream" into a report identical to "nothing
+/// arrived", but ffmpeg prints the URL it was given, and a publish URL has the
+/// key in it. Passing the output through here lets both hold.
 #[derive(Clone)]
 pub struct Redactor {
     secrets: Vec<String>,

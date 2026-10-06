@@ -321,7 +321,7 @@ cargo build --release
 cargo test
 ```
 
-Rust 1.87 or newer. Windows and Linux are both supported, and CI builds and
+Rust 1.88 or newer. Windows and Linux are both supported, and CI builds and
 tests both. None of the code is platform-specific.
 
 Every parser here reads bytes it did not choose, so there is generative cover

@@ -88,16 +88,18 @@ struct Cli {
         default_missing_value = "0.0.0.0",
     )]
     artnet: Option<String>,
-    /// Largest DMX payload to put in one frame. The default is the largest
-    /// size measured crossing a remuxing CDN intact; more is untested rather than known
-    /// to fail. Universes that do not fit are sent on the following frames.
+    /// Largest DMX payload to put in one frame. The default sits below the
+    /// 10,448 bytes measured crossing a remuxing CDN intact; more than that is
+    /// untested rather than known to fail. Universes that do not fit are sent
+    /// on the following frames.
     #[arg(long, default_value_t = DEFAULT_ARTNET_MAX_PAYLOAD)]
     artnet_max_payload: usize,
     /// Warn when the outgoing stream averages above this many kb/s.
     #[arg(long, default_value_t = 5500.0, requires = "publish")]
     warn_kbps: f64,
-    /// Stop the relay if the outgoing stream sustains this rate. Off by
-    /// default: see the note where this is used.
+    /// Drop the session if the outgoing stream sustains this rate; the relay
+    /// then waits for the encoder again. Off by default: see the note where
+    /// this is used.
     #[arg(long, requires = "publish")]
     abort_kbps: Option<f64>,
     /// Relay without injecting, to measure what the relay itself costs.
