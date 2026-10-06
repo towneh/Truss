@@ -1,0 +1,127 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1120 420" width="1120" height="420" font-family="-apple-system, 'Segoe UI', system-ui, Helvetica, Arial, sans-serif">
+  <title>Reading Truss records back</title>
+  <desc>The Basis Media Player reads a stream carrying Truss records, finds the records in the SEI as it demuxes, and hands each one on as playback reaches it. VRSL decodes the record and writes the universes into the DMX buffer on the GPU, which the DMX Realtime Light fixtures read. Records sent over OSC enter VRSL directly and take the same path from there.</desc>
+  <style>
+    .text  { fill: #1f2328; }
+    .muted { fill: #59636e; }
+    .box   { fill: #f6f8fa; stroke: #d0d7de; stroke-width: 1.5; }
+    .group { fill: none; stroke: #8c959f; stroke-width: 1.5; stroke-dasharray: 6 4; }
+    .video { stroke: #0969da; }
+    .dmx   { stroke: #bf8700; }
+    .osc   { stroke: #8250df; }
+    .bad   { stroke: #cf222e; }
+    .line  { fill: none; stroke-width: 2.5; }
+    .fill-video { fill: #0969da; }
+    .fill-dmx   { fill: #bf8700; }
+    .fill-osc   { fill: #8250df; }
+    .fill-bad   { fill: #cf222e; }
+    .frame { fill: #ddf4ff; stroke: #0969da; stroke-width: 1.5; }
+    .lost  { fill: #ffebe9; stroke: #cf222e; stroke-width: 1.5; }
+      .text  { fill: #e6edf3; }
+      .muted { fill: #9198a1; }
+      .box   { fill: #161b22; stroke: #3d444d; }
+      .group { stroke: #656c76; }
+      .video { stroke: #4493f8; }
+      .dmx   { stroke: #d29922; }
+      .osc   { stroke: #ab7df8; }
+      .bad   { stroke: #f85149; }
+      .fill-video { fill: #4493f8; }
+      .fill-dmx   { fill: #d29922; }
+      .fill-osc   { fill: #ab7df8; }
+      .fill-bad   { fill: #f85149; }
+      .frame { fill: #0c2d6b; stroke: #4493f8; }
+      .lost  { fill: #3c1618; stroke: #f85149; }
+    .h  { font-size: 15px; font-weight: 600; }
+    .s  { font-size: 12.5px; }
+    .xs { font-size: 11px; }
+  </style>
+  <defs>
+    <marker id="a-video" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="fill-video"/></marker>
+    <marker id="a-dmx" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="fill-dmx"/></marker>
+    <marker id="a-osc" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="fill-osc"/></marker>
+    <marker id="a-bad" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="fill-bad"/></marker>
+    <!-- a video frame carrying a record: the picture, with the SEI block inside it -->
+    <g id="frame-carried">
+      <rect x="0" y="0" width="34" height="46" rx="3" class="frame"/>
+      <rect x="5" y="32" width="24" height="9" rx="1.5" class="fill-dmx"/>
+    </g>
+    <g id="frame-stripped">
+      <rect x="0" y="0" width="34" height="46" rx="3" class="frame"/>
+      <rect x="5" y="32" width="24" height="9" rx="1.5" fill="none" class="bad" stroke-width="1.2" stroke-dasharray="3 2"/>
+    </g>
+  </defs>
+
+  <!-- inputs -->
+  <rect x="20" y="50" width="150" height="56" rx="8" class="box"/>
+  <text x="95" y="75" text-anchor="middle" class="text h">truss-relay</text>
+  <text x="95" y="93" text-anchor="middle" class="muted s">OSC lane</text>
+
+  <rect x="20" y="170" width="150" height="64" rx="8" class="box"/>
+  <text x="95" y="197" text-anchor="middle" class="text h">Stream</text>
+  <text x="95" y="216" text-anchor="middle" class="muted s">RTSP · MPEG-TS · HLS</text>
+  <text x="95" y="254" text-anchor="middle" class="muted xs">from Truss, via your CDN</text>
+
+  <!-- the player -->
+  <rect x="200" y="120" width="380" height="250" rx="12" class="group"/>
+  <text x="390" y="146" text-anchor="middle" class="text h">Basis Media Player</text>
+
+  <rect x="220" y="170" width="155" height="64" rx="8" class="box"/>
+  <text x="297" y="194" text-anchor="middle" class="text h">SEI scan</text>
+  <text x="297" y="211" text-anchor="middle" class="muted xs">finds the records as it</text>
+  <text x="297" y="225" text-anchor="middle" class="muted xs">demuxes, before decode</text>
+
+  <rect x="398" y="170" width="164" height="64" rx="8" class="box"/>
+  <text x="480" y="194" text-anchor="middle" class="text h">Release</text>
+  <text x="480" y="211" text-anchor="middle" class="muted xs">as playback reaches it,</text>
+  <text x="480" y="225" text-anchor="middle" class="muted xs">raises OnUserDataReceived</text>
+
+  <rect x="220" y="290" width="155" height="56" rx="8" class="box"/>
+  <text x="297" y="314" text-anchor="middle" class="text h">Video decoder</text>
+  <text x="297" y="332" text-anchor="middle" class="muted xs">picture to the screen</text>
+
+  <path d="M170,202 L216,202" class="line video" marker-end="url(#a-video)"/>
+  <path d="M297,234 L297,286" class="line video" marker-end="url(#a-video)"/>
+  <path d="M375,202 L394,202" class="line dmx" marker-end="url(#a-dmx)"/>
+
+  <!-- VRSL -->
+  <rect x="600" y="20" width="500" height="350" rx="12" class="group"/>
+  <text x="1084" y="44" text-anchor="end" class="text h">VRSL</text>
+
+  <rect x="615" y="50" width="220" height="56" rx="8" class="box"/>
+  <text x="725" y="75" text-anchor="middle" class="text h">VRSL Truss OSC DMX Source</text>
+  <text x="725" y="93" text-anchor="middle" class="muted xs">listens for /truss/dmx</text>
+
+  <rect x="615" y="170" width="220" height="64" rx="8" class="box"/>
+  <text x="725" y="196" text-anchor="middle" class="text h">VRSL Truss SEI DMX Output</text>
+  <text x="725" y="215" text-anchor="middle" class="muted xs">takes records from the player</text>
+  <text x="725" y="262" text-anchor="middle" class="muted xs">both decode the record and check its CRC;</text>
+  <text x="725" y="276" text-anchor="middle" class="muted xs">a damaged record is dropped whole</text>
+
+  <rect x="865" y="170" width="220" height="64" rx="8" class="box"/>
+  <text x="975" y="194" text-anchor="middle" class="text h">URP Light Manager</text>
+  <text x="975" y="211" text-anchor="middle" class="muted xs">writes the universes into the</text>
+  <text x="975" y="225" text-anchor="middle" class="muted xs">DMX buffer on the GPU</text>
+
+  <rect x="865" y="290" width="220" height="56" rx="8" class="box"/>
+  <text x="975" y="314" text-anchor="middle" class="text h">DMX Realtime Light</text>
+  <text x="975" y="332" text-anchor="middle" class="muted xs">fixtures read their channels</text>
+
+  <path d="M562,202 L611,202" class="line dmx" marker-end="url(#a-dmx)"/>
+  <path d="M835,202 L861,202" class="line dmx" marker-end="url(#a-dmx)"/>
+  <path d="M975,234 L975,286" class="line dmx" marker-end="url(#a-dmx)"/>
+
+  <!-- OSC lane -->
+  <path d="M170,78 L611,78" class="line osc" stroke-dasharray="7 5" marker-end="url(#a-osc)"/>
+  <text x="390" y="68" text-anchor="middle" class="muted xs">OSC /truss/dmx, UDP 12100</text>
+  <path d="M835,78 L975,78 L975,166" class="line osc" stroke-dasharray="7 5" marker-end="url(#a-osc)"/>
+
+  <!-- key -->
+  <g transform="translate(20,400)">
+    <line x1="0" y1="0" x2="26" y2="0" class="line dmx"/>
+    <text x="34" y="4" class="muted xs">DMX</text>
+    <line x1="80" y1="0" x2="106" y2="0" class="line video"/>
+    <text x="114" y="4" class="muted xs">video</text>
+    <line x1="166" y1="0" x2="192" y2="0" class="line osc" stroke-dasharray="7 5"/>
+    <text x="200" y="4" class="muted xs">OSC</text>
+  </g>
+</svg>

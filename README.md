@@ -11,6 +11,22 @@ it, so it stays locked to the picture.
 The picture itself is unaltered. What Truss adds sits in a part of the bitstream
 a decoder is required to skip over.
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/how-truss-works-dark.svg">
+  <img alt="A lighting desk sends Art-Net to truss-relay, which packs the DMX into each video frame from the encoder as SEI. A CDN that remuxes delivers the records intact; one that transcodes strips them with no warning. The relay also sends each record to an OSC listener." src="docs/how-truss-works-light.svg">
+</picture>
+
+Truss's part ends at the stream. The records are read back by other products
+at the far end: the Basis Media Player finds them in the SEI and hands each one
+on as playback reaches it, and VRSL decodes it into DMX for the fixtures. Both
+were built to the record format Truss defines in `src/record.rs` and
+`src/payload.rs`.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/reading-truss-records-dark.svg">
+  <img alt="The Basis Media Player finds Truss records in the SEI as it demuxes the stream and raises OnUserDataReceived as playback reaches each record. VRSL decodes the record, checks its CRC and writes the universes into the DMX buffer on the GPU, which the DMX Realtime Light fixtures read. Records sent over OSC enter VRSL directly and take the same path from there." src="docs/reading-truss-records-light.svg">
+</picture>
+
 ## Will it work on your path
 
 SEI survives a remux. It does not survive a transcode. A CDN that repackages the
