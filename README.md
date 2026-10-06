@@ -3,23 +3,22 @@
 DMX lighting control carried inside a live video stream, as H.264 or HEVC SEI user data.
 
 Truss takes the Art-Net from a lighting desk and packs it into the video
-as that passes through an RTMP relay, and it arrives wherever the video
-arrives. The data rides inside each access unit rather than alongside it, and
-stays locked to the picture.
+as that passes through an RTMP relay. The DMX then travels inside each access
+unit, through the ingest and the CDN to every viewer, locked to the picture.
 
-The picture itself is unaltered. What Truss adds sits in a part of the bitstream
-a decoder is required to skip over.
+It goes into the SEI, the part of each access unit set aside for extra data,
+which decoders pass over when they draw the frame. The picture reaches viewers
+exactly as the encoder made it.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/how-truss-works-dark.svg">
   <img alt="A lighting desk sends Art-Net to truss-relay, which packs the DMX into each video frame from the encoder as SEI. A CDN that remuxes delivers the records intact; one that transcodes strips them with no warning. The relay also sends each record to an OSC listener." src="docs/how-truss-works-light.svg">
 </picture>
 
-Truss's part ends at the stream. Other products read the records back at the
-far end: the Basis Media Player finds them in the SEI and hands each one on as
-playback reaches it, and VRSL decodes it into DMX for the fixtures. Both were
-built to the record format Truss defines, set out in
-[docs/format.md](docs/format.md).
+At the far end, other products read the records back: the Basis Media Player
+finds them in the SEI and hands each one on as playback reaches it, and VRSL
+decodes it into DMX for the fixtures. Both were built to the record format
+Truss defines, set out in [docs/format.md](docs/format.md).
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/reading-truss-records-dark.svg">
@@ -71,9 +70,9 @@ truss-inject --input plain.flv --output carried.flv
 ffmpeg -re -i carried.flv -c copy -f flv rtmp://ingest.example.net/live/<key>
 ```
 
-`-c copy` publishes the file as it stands, so what reaches the egress is what
-`truss-inject` wrote, and `truss-detect` against the egress scores the path
-itself. Use `-c:v libx265` in place of `libx264` to check an HEVC path.
+`-c copy` publishes the file as it stands, and the egress receives exactly the
+records `truss-inject` wrote, so `truss-detect` against the egress scores the
+path itself. Use `-c:v libx265` in place of `libx264` to check an HEVC path.
 
 Reading the same file back without leaving the machine separates a fault in
 the carrier from a fault in the network:
@@ -179,9 +178,9 @@ truss-dmxmon osc:// --universe 0
 ```
 
 Each record goes out as one OSC message, `/truss/dmx`, with the record as its
-blob argument, carrying the same payload as the stream's. While a publisher is connected the lane
-runs at the video's frame rate; with none it runs at `--osc-rate`, 30 a second
-by default. The lane numbers its own records, so loss and order are scored on
+blob argument, carrying the same payload as the stream's. While a publisher is
+connected the lane runs at the video's frame rate; with none it runs at
+`--osc-rate`, 30 a second by default. The lane numbers its own records, so loss and order are scored on
 the lane rather than on the stream.
 
 `--osc` on the relay takes an address and a port. On the listening side,
@@ -199,8 +198,8 @@ truss-relay --artnet --osc 127.0.0.1:12100
 ```
 
 `truss-detect osc:// --max-seconds 10` scores the lane the way it scores a
-stream. Nothing on this path crosses a CDN, so a gap here is the relay's, and a
-gap only in the stream is the path's.
+stream. Nothing on this path crosses a CDN. A gap on the lane points at the
+relay; a gap in the stream that the lane doesn't show points at the CDN path.
 
 ## With no ingest to point at
 
@@ -288,8 +287,8 @@ every frame:
 | 20 | 10,448 B | 2,508 kb/s | 40% |
 
 The ceiling in the last column is an example: 6,000 kb/s of video and 320 of
-audio, counted together. Your own figure moves the shares without changing the
-shape. At twenty universes on every frame the lane takes roughly two fifths of
+audio, counted together. With your own ceiling the percentages change; the
+bitrates don't. At twenty universes on every frame the lane takes roughly two fifths of
 the ceiling, and the encoder has to be set for the rest. The relay's default
 `--artnet-max-payload` of 9,216 bytes fits 17 universes in a frame, and more
 than that on every frame needs it raised.
@@ -343,10 +342,10 @@ runs each target and keeps its corpus and any input that crashes it.
 
 ## Status
 
-The carrier is measured rather than assumed. Across RTSP, MPEG-TS and RTMP
-egress on a remuxing CDN: no loss in steady state, no corruption, payloads up
-to 10,448 bytes per frame, a median end-to-end latency of around 112 ms, and
-47,038 consecutive frames across half an hour without a gap. Live desk data has
+Across RTSP, MPEG-TS and RTMP egress on a remuxing CDN: no loss in steady
+state, no corruption, payloads up to 10,448 bytes per frame, a median
+end-to-end latency of around 112 ms, and 47,038 consecutive frames across half
+an hour without a gap. Live desk data has
 run the full path at twenty universes.
 
 Discovery has been exercised against SoundSwitch on the relay's own machine,
