@@ -5,8 +5,9 @@ name: Fuzz
 # is what catches a regression on the way in. This is for finding things that
 # cover does not know to look for.
 #
-# Nightly and Linux only: cargo-fuzz needs the former, and libFuzzer is happiest
-# on the latter. The stable Windows-and-Linux matrix in ci.yml is untouched.
+# Nightly and Linux only: AddressSanitizer needs the former, and libFuzzer is
+# happiest on the latter. The stable Windows-and-Linux matrix in ci.yml is
+# untouched.
 on:
   schedule:
     - cron: "17 3 * * 0" # Sundays, early

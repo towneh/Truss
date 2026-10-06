@@ -1,7 +1,7 @@
 # Deliberately its own crate, with its own `[workspace]`, so the root
-# `cargo build`, `cargo test` and `cargo clippy` never see it. Fuzzing needs a
-# nightly toolchain and libFuzzer, neither of which the stable CI that gates a
-# merge should have to carry.
+# `cargo build`, `cargo test` and `cargo clippy` never see it. Fuzzing under
+# AddressSanitizer needs a nightly toolchain, and libFuzzer needs a C++
+# toolchain to build; the stable CI that gates a merge should carry neither.
 #
 # The parent crate forbids `unsafe_code`; that is a package-level lint and does
 # not reach here, which matters because `fuzz_target!` generates an entry point

@@ -328,8 +328,8 @@ alongside the unit tests. The properties live in `truss::invariants`, and
 on stable and with no extra toolchain. The run is deterministic, so a failure
 names the case that caused it.
 
-libFuzzer drives the same properties for a deeper search. It needs nightly and
-is happiest on Linux:
+libFuzzer drives the same properties for a deeper search. It's happiest on
+Linux, and the default build turns on AddressSanitizer, which needs nightly:
 
 ```sh
 cargo run --example seed-corpus
