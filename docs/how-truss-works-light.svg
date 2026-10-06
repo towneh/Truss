@@ -62,12 +62,12 @@
   <path d="M375,115 L375,191" class="line dmx" marker-end="url(#a-dmx)"/>
 
   <path d="M180,85 L266,85" class="line dmx" marker-end="url(#a-dmx)"/>
-  <text x="223" y="76" text-anchor="middle" class="muted xs">Art-Net</text>
-  <text x="223" y="101" text-anchor="middle" class="muted xs">UDP 6454</text>
+  <text x="215" y="76" text-anchor="middle" class="muted xs">Art-Net</text>
+  <text x="215" y="101" text-anchor="middle" class="muted xs">UDP 6454</text>
 
   <path d="M180,230 L266,230" class="line video" marker-end="url(#a-video)"/>
-  <text x="223" y="221" text-anchor="middle" class="muted xs">RTMP</text>
-  <text x="223" y="246" text-anchor="middle" class="muted xs">H.264 / HEVC</text>
+  <text x="215" y="221" text-anchor="middle" class="muted xs">RTMP</text>
+  <text x="215" y="246" text-anchor="middle" class="muted xs">H.264/HEVC</text>
 
   <!-- out of the relay: frames with the records inside them -->
   <path d="M480,230 L676,230" class="line video" marker-end="url(#a-video)"/>
