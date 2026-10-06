@@ -147,11 +147,13 @@ impl ArtPoll {
     }
 }
 
-/// The most universes a node advertises. Each reply packet names up to four, so
-/// this is eight packets per poll, and a bound on how much a poll can cost
-/// once a hostile sender has filled the latch with universes.
-pub const MAX_ADVERTISED_PORTS: usize = 32;
+/// The most `ArtPollReply` packets one poll is answered with, and so a bound on
+/// how much a poll can cost once a hostile sender has filled the latch with
+/// universes.
+pub const MAX_REPLY_PACKETS: usize = 8;
 const PORTS_PER_REPLY: usize = 4;
+/// The most universes a node advertises: [`MAX_REPLY_PACKETS`] full packets.
+pub const MAX_ADVERTISED_PORTS: usize = MAX_REPLY_PACKETS * PORTS_PER_REPLY;
 
 /// The port addresses this node advertises: the lowest universes the latch
 /// holds, or universe 0 before it holds any.
@@ -161,8 +163,27 @@ const PORTS_PER_REPLY: usize = 4;
 /// is what the node reports rather than what it accepts. Advertising the
 /// latched universes keeps a desk that searches by universe able to find the
 /// node, from the next poll after the first packet of that universe arrives.
+///
+/// A reply packet holds ports from one net and sub-net only, so universes
+/// spread across sub-nets take a packet each. The ports stop where
+/// [`poll_replies`] would need a packet past [`MAX_REPLY_PACKETS`], which is
+/// at most [`MAX_ADVERTISED_PORTS`] and as few as eight.
 pub fn advertised_ports(latched: impl IntoIterator<Item = u16>) -> Vec<u16> {
-    let mut ports: Vec<u16> = latched.into_iter().take(MAX_ADVERTISED_PORTS).collect();
+    let mut ports: Vec<u16> = Vec::new();
+    let mut packets = 0;
+    let mut in_packet = 0;
+    for p in latched {
+        let joins = in_packet < PORTS_PER_REPLY && ports.last().is_some_and(|&l| l >> 4 == p >> 4);
+        if joins {
+            in_packet += 1;
+        } else if packets == MAX_REPLY_PACKETS {
+            break;
+        } else {
+            packets += 1;
+            in_packet = 1;
+        }
+        ports.push(p);
+    }
     if ports.is_empty() {
         ports.push(0);
     }
@@ -1214,12 +1235,20 @@ mod tests {
         let many = advertised_ports(0..100);
         assert_eq!(many.len(), MAX_ADVERTISED_PORTS);
         let packets = poll_replies(Ipv4Addr::LOCALHOST, DEFAULT_PORT, 1, 100, &many);
-        assert_eq!(packets.len(), MAX_ADVERTISED_PORTS / PORTS_PER_REPLY);
+        assert_eq!(packets.len(), MAX_REPLY_PACKETS);
         assert_eq!(
             packets.last().unwrap()[211],
             8,
             "bind indexes run to the last packet"
         );
+    }
+
+    #[test]
+    fn universes_one_per_sub_net_still_get_no_more_than_the_packet_cap() {
+        let sparse = advertised_ports((0..32).map(|u| u << 4));
+        assert_eq!(sparse, (0..8).map(|u| u << 4).collect::<Vec<_>>());
+        let packets = poll_replies(Ipv4Addr::LOCALHOST, DEFAULT_PORT, 1, 32, &sparse);
+        assert_eq!(packets.len(), MAX_REPLY_PACKETS);
     }
 
     #[test]

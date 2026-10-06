@@ -126,10 +126,13 @@ starve.
 
 A desk that lists nodes rather than broadcasting will find one named Truss;
 pick it and assign it the universes to carry. The relay answers `ArtPoll` with
-an address on the desk's own subnet, and advertises up to 32 of the universes
-it has heard (universe 0 before any), so a desk that searches by universe finds
-it too. Until DMX arrives the relay shows which controller found the node,
-which tells a desk that has not been patched apart from one that is not there.
+an address on the desk's own subnet, and advertises the lowest universes it
+has heard (universe 0 before any), so a desk that searches by universe finds it
+too. A reply names up to four universes from one sub-net and a poll gets eight
+replies at most, so that is 32 when the universes share sub-nets and fewer when
+they are spread out. Until DMX arrives the relay shows which controller found
+the node, which tells a desk that has not been patched apart from one that is
+not there.
 
 `--artnet` on its own listens on every adapter. `--artnet 192.168.1.20` listens
 on that adapter only and tells every desk to use that address; add `:port` when

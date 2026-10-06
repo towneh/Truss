@@ -294,6 +294,7 @@ pub fn artnet_poll(data: &[u8]) {
         data.len(),
         &ports,
     );
+    assert!(packets.len() <= artnet::MAX_REPLY_PACKETS);
 
     let mut advertised = Vec::new();
     for (i, reply) in packets.iter().enumerate() {
