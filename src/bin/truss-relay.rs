@@ -584,6 +584,9 @@ impl Dashboard {
                         "video is {codec}, which records cannot ride in: passing it through"
                     ));
                 }
+                if let Some(note) = s.injector.and_then(|i| oversize_note(i, cli)) {
+                    warnings.push(note);
+                }
                 if kbps > cli.warn_kbps {
                     warnings.push(format!(
                         "{kbps:.0} kb/s is above {:.0}: lower the encoder bitrate or raise --every",
@@ -1313,6 +1316,24 @@ fn client_handshake(socket: &mut TcpStream) -> Result<Vec<u8>> {
     }
 }
 
+/// The warning for records the injector left out as too large, if it has.
+/// The flags refuse a payload too long for a record, so these are ones too
+/// long for the NAL length field the encoder chose.
+fn oversize_note(injector: &Injector, cli: &Cli) -> Option<String> {
+    let n = injector.stats.oversize_skipped;
+    (n > 0).then(|| {
+        format!(
+            "{} records were too large for the encoder's NAL length field and were left out: lower {}",
+            console::count(n),
+            if cli.artnet.is_some() {
+                "--artnet-max-payload"
+            } else {
+                "--payload-len"
+            }
+        )
+    })
+}
+
 fn report(
     meter: &RateMeter,
     injector: Option<&Injector>,
@@ -1368,6 +1389,9 @@ fn report(
         console::log(format!(
             "  WARNING: video is {codec}, which records cannot ride in: passing it through"
         ));
+    }
+    if let Some(note) = injector.and_then(|i| oversize_note(i, cli)) {
+        console::log(format!("  WARNING: {note}"));
     }
     if kbps > cli.warn_kbps {
         console::log(format!(

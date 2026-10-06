@@ -73,6 +73,13 @@ fn main() -> Result<()> {
     if let Some(codec) = &stats.unsupported_codec {
         bail!("the video is {codec}; records go into H.264 or HEVC only");
     }
+    if stats.oversize_skipped > 0 {
+        bail!(
+            "{} records were too large for the video's NAL length field and were left out; \
+             lower --payload-len",
+            stats.oversize_skipped
+        );
+    }
 
     println!("carriers:");
     for c in &carriers {
