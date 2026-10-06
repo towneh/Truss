@@ -21,7 +21,7 @@ use std::net::{SocketAddr, UdpSocket};
 use truss::carrier::Carrier;
 use truss::codec::VideoCodec;
 use truss::console;
-use truss::detect::ts::TsAnalyzer;
+use truss::detect::ts::{PesUnit, TsAnalyzer};
 use truss::h264;
 use truss::monitor::DmxState;
 use truss::record::Record;
@@ -176,14 +176,8 @@ fn main() -> Result<()> {
         if n == 0 {
             break;
         }
-        for unit in ts.feed(&buf[..n]) {
-            let Some(codec) = ts.streams.get(&unit.pid).and_then(|s| s.video_codec()) else {
-                continue;
-            };
-            for payload in records_in(codec, &unit.data) {
-                tally.absorb(&payload);
-            }
-        }
+        let units = ts.feed(&buf[..n]);
+        consume(&ts, &mut tally, units);
 
         if live && last_report.elapsed() >= interval {
             tally.status(
@@ -196,6 +190,9 @@ fn main() -> Result<()> {
             last_report = Instant::now();
         }
     }
+    // The last access unit is still held, waiting for one that never starts.
+    let tail = ts.flush();
+    consume(&ts, &mut tally, tail);
 
     println!(
         "\nstream ended after {:.1}s",
@@ -203,6 +200,17 @@ fn main() -> Result<()> {
     );
     tally.finish(started.elapsed().as_secs_f64(), live, common.universe);
     Ok(())
+}
+
+fn consume(ts: &TsAnalyzer, tally: &mut Tally, units: Vec<PesUnit>) {
+    for unit in units {
+        let Some(codec) = ts.streams.get(&unit.pid).and_then(|s| s.video_codec()) else {
+            continue;
+        };
+        for payload in records_in(codec, &unit.data) {
+            tally.absorb(&payload);
+        }
+    }
 }
 
 /// Watch the relay's OSC lane instead of a stream: the same records, sent
