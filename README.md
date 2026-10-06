@@ -180,8 +180,8 @@ truss-dmxmon osc:// --universe 0
 Each record goes out as one OSC message, `/truss/dmx`, with the record as its
 blob argument, carrying the same payload as the stream's. While a publisher is
 connected the lane runs at the video's frame rate; with none it runs at
-`--osc-rate`, 30 a second by default. The lane numbers its own records, so loss and order are scored on
-the lane rather than on the stream.
+`--osc-rate`, 30 a second by default. The lane numbers its own records, so
+loss and order are scored on the lane rather than on the stream.
 
 `--osc` on the relay takes an address and a port. On the listening side,
 `osc://` alone listens on every adapter on port 12100, clear of Art-Net, the
@@ -288,8 +288,8 @@ every frame:
 
 The ceiling in the last column is an example: 6,000 kb/s of video and 320 of
 audio, counted together. With your own ceiling the percentages change; the
-bitrates don't. At twenty universes on every frame the lane takes roughly two fifths of
-the ceiling, and the encoder has to be set for the rest. The relay's default
+bitrates don't. At twenty universes on every frame the lane takes roughly two
+fifths of the ceiling, and the encoder has to be set for the rest. The relay's default
 `--artnet-max-payload` of 9,216 bytes fits 17 universes in a frame, and more
 than that on every frame needs it raised.
 
