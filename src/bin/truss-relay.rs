@@ -1201,11 +1201,24 @@ fn connect_upstream(cli: &Cli) -> Result<Upstream> {
     })
 }
 
+/// How long a publisher has to complete the RTMP handshake. Publishers are
+/// served one at a time, so a connection that opens and then says nothing
+/// would otherwise hold the only slot, and the Art-Net lane with it, for as
+/// long as it stays open. The deadline covers the whole exchange rather than
+/// each read, so a peer trickling a byte at a time runs out too.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+
 fn server_handshake(socket: &mut TcpStream) -> Result<Vec<u8>> {
+    let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
     let mut handshake = Handshake::new(PeerType::Server);
     let mut buf = vec![0u8; 4096];
-    loop {
-        let n = socket.read(&mut buf).context("handshake read")?;
+    let result = loop {
+        socket.set_read_timeout(Some(handshake_time_left(deadline)?))?;
+        let n = match socket.read(&mut buf) {
+            Ok(n) => n,
+            Err(ref e) if timed_out(e) => return Err(handshake_expired()),
+            Err(e) => return Err(e).context("handshake read"),
+        };
         if n == 0 {
             bail!("publisher closed during handshake");
         }
@@ -1214,23 +1227,53 @@ fn server_handshake(socket: &mut TcpStream) -> Result<Vec<u8>> {
             .map_err(|e| anyhow!("handshake: {e:?}"))?
         {
             HandshakeProcessResult::InProgress { response_bytes } => {
-                socket
-                    .write_all(&response_bytes)
-                    .context("handshake write")?;
+                handshake_write(socket, &response_bytes, deadline)?;
             }
             HandshakeProcessResult::Completed {
                 response_bytes,
                 remaining_bytes,
             } => {
                 if !response_bytes.is_empty() {
-                    socket
-                        .write_all(&response_bytes)
-                        .context("handshake write")?;
+                    handshake_write(socket, &response_bytes, deadline)?;
                 }
-                return Ok(remaining_bytes);
+                break remaining_bytes;
             }
         }
+    };
+    socket.set_read_timeout(None)?;
+    socket.set_write_timeout(None)?;
+    Ok(result)
+}
+
+/// Write a handshake response with no more than what is left of `deadline`,
+/// so a publisher that stops reading runs out of time as one that stops
+/// sending does.
+fn handshake_write(socket: &mut TcpStream, bytes: &[u8], deadline: Instant) -> Result<()> {
+    socket.set_write_timeout(Some(handshake_time_left(deadline)?))?;
+    match socket.write_all(bytes) {
+        Err(ref e) if timed_out(e) => Err(handshake_expired()),
+        other => other.context("handshake write"),
     }
+}
+
+fn handshake_time_left(deadline: Instant) -> Result<Duration> {
+    let left = deadline.saturating_duration_since(Instant::now());
+    if left.is_zero() {
+        return Err(handshake_expired());
+    }
+    Ok(left)
+}
+
+fn handshake_expired() -> anyhow::Error {
+    anyhow!(
+        "publisher did not complete the handshake within {}s",
+        HANDSHAKE_TIMEOUT.as_secs()
+    )
+}
+
+/// A socket timeout is WouldBlock on Unix and TimedOut on Windows.
+fn timed_out(e: &std::io::Error) -> bool {
+    matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut)
 }
 
 fn client_handshake(socket: &mut TcpStream) -> Result<Vec<u8>> {
