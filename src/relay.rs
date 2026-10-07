@@ -35,9 +35,10 @@ impl Ingest {
     ///
     /// The application is the only path the URL may carry. The stream key
     /// rides nowhere on the command line, so a URL with a second path
-    /// segment, a query, a fragment or a user and password is refused, and
-    /// refused without being echoed: an argument is visible to anything that
-    /// can list processes, and so is an error message that repeats it.
+    /// segment, a query, a fragment or a user and password is refused. No
+    /// error quotes anything after the scheme: an argument is visible to
+    /// anything that can list processes, and so is an error message that
+    /// repeats it.
     pub fn parse(publish: &str) -> Result<Self> {
         let Some((scheme, rest)) = publish.trim().split_once("://") else {
             bail!(
@@ -96,12 +97,12 @@ fn parse_authority(authority: &str) -> Result<String> {
             bail!("--publish has an IPv6 address with no closing bracket");
         };
         inside.parse::<std::net::Ipv6Addr>().map_err(|_| {
-            anyhow!("--publish has {inside:?} in brackets, which is not an IPv6 address")
+            anyhow!("--publish has something in brackets that is not an IPv6 address")
         })?;
         let port = match after {
             "" => None,
             p => Some(p.strip_prefix(':').ok_or_else(|| {
-                anyhow!("--publish has {after:?} after the address, where only :port may follow")
+                anyhow!("--publish has more than :port after the bracketed address")
             })?),
         };
         (format!("[{inside}]"), port)
@@ -119,13 +120,14 @@ fn parse_authority(authority: &str) -> Result<String> {
     }
     let hostname = |b: u8| b.is_ascii_alphanumeric() || b == b'-' || b == b'.';
     if !host.starts_with('[') && !host.bytes().all(hostname) {
-        bail!("--publish has {host:?} as the host, which is not a host name or an address");
+        bail!("--publish has a host that is not a host name or an address");
     }
     let port = match port {
         None => DEFAULT_RTMP_PORT,
-        Some(p) => p.parse::<u16>().ok().filter(|&n| n != 0).ok_or_else(|| {
-            anyhow!("--publish has {p:?} as the port, which is not a port number")
-        })?,
+        Some(p) => match p.parse::<u16>() {
+            Ok(n) if n != 0 => n,
+            _ => bail!("--publish has a port that is not a number from 1 to 65535"),
+        },
     };
     Ok(format!("{host}:{port}"))
 }
@@ -505,17 +507,33 @@ mod tests {
     #[test]
     fn a_host_or_port_that_a_socket_could_not_be_given_is_refused_by_name() {
         for (url, says) in [
-            ("rtmp://ingest.example.net:70000/live", "not a port number"),
-            ("rtmp://ingest.example.net:0/live", "not a port number"),
-            ("rtmp://ingest.example.net:abc/live", "not a port number"),
+            ("rtmp://ingest.example.net:70000/live", "1 to 65535"),
+            ("rtmp://ingest.example.net:0/live", "1 to 65535"),
+            ("rtmp://ingest.example.net:abc/live", "1 to 65535"),
             ("rtmp://::1/live", "without brackets"),
             ("rtmp://[not-an-address]/live", "not an IPv6 address"),
-            ("rtmp://[::1]x/live", "after the address"),
+            ("rtmp://[::1]x/live", "after the bracketed address"),
             ("rtmp://[::1/live", "no closing bracket"),
             ("rtmp://bad host/live", "not a host name"),
         ] {
             let e = Ingest::parse(url).unwrap_err().to_string();
             assert!(e.contains(says), "{url}: {e}");
+        }
+    }
+
+    #[test]
+    fn a_key_typed_into_the_host_or_port_is_not_repeated() {
+        for url in [
+            "rtmp://ingest.example.net:sk_secret_123/live",
+            "rtmp://sk_secret_123!/live",
+            "rtmp://[sk_secret_123]/live",
+            "rtmp://[::1]sk_secret_123/live",
+        ] {
+            let e = Ingest::parse(url).unwrap_err().to_string();
+            assert!(
+                !e.contains("sk_secret"),
+                "the error must not echo the key: {e}"
+            );
         }
     }
 }

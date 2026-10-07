@@ -350,6 +350,7 @@ fn main() -> Result<()> {
             key.as_ref(),
             &peer,
             &mut dash,
+            PUBLISHER_IDLE_TIMEOUT,
         ) {
             Ok(()) => console::event("-- session ended cleanly"),
             Err(e) => console::event(format!("-- session ended: {e:#}")),
@@ -734,10 +735,11 @@ fn relay_one(
     key: Option<&creds::StreamKey>,
     peer: &str,
     dash: &mut Dashboard,
+    idle_timeout: Duration,
 ) -> Result<()> {
     let started = Instant::now();
     obs.set_nodelay(true).ok();
-    let leftover = server_handshake(&mut obs)?;
+    let leftover = server_handshake(&mut obs, HANDSHAKE_TIMEOUT)?;
 
     let (mut server, initial) = ServerSession::new(ServerSessionConfig::new())
         .map_err(|e| anyhow!("creating server session: {e:?}"))?;
@@ -775,6 +777,7 @@ fn relay_one(
     // every line: a desk sending the same way for an hour is said once.
     let mut last_note: Option<String> = None;
     let mut buf = vec![0u8; 32 * 1024];
+    let mut heard = Instant::now();
     obs.set_nonblocking(true)?;
 
     loop {
@@ -802,6 +805,7 @@ fn relay_one(
             }
             Ok(n) => {
                 idle = false;
+                heard = Instant::now();
                 let results = server
                     .handle_input(&buf[..n])
                     .map_err(|e| anyhow!("server handle_input: {e:?}"))?;
@@ -827,7 +831,11 @@ fn relay_one(
                     }
                 }
             }
-            Err(ref e) if e.kind() == ErrorKind::WouldBlock => {}
+            Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
+                if heard.elapsed() >= idle_timeout {
+                    bail!("publisher sent nothing for {idle_timeout:?}");
+                }
+            }
             Err(e) => return Err(e).context("reading from publisher"),
         }
 
@@ -1170,7 +1178,7 @@ fn connect_upstream(cli: &Cli) -> Result<Upstream> {
     let mut socket = TcpStream::connect(&cli.target.authority)
         .with_context(|| format!("connecting to {}", cli.target.authority))?;
     socket.set_nodelay(true).ok();
-    let leftover = client_handshake(&mut socket)?;
+    let leftover = client_handshake(&mut socket, INGEST_HANDSHAKE_TIMEOUT)?;
 
     let mut config = ClientSessionConfig::new();
     config.tc_url = Some(cli.target.url());
@@ -1211,17 +1219,25 @@ fn connect_upstream(cli: &Cli) -> Result<Upstream> {
 /// each read, so a peer trickling a byte at a time runs out too.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
-fn server_handshake(socket: &mut TcpStream) -> Result<Vec<u8>> {
-    let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
+/// How long a publisher can send nothing, once the handshake is done, before
+/// it is dropped. Any stream key is accepted, so without this a connection
+/// could complete the handshake, go quiet and hold the only slot. With no TCP
+/// keepalive, it is also what notices a publisher that vanished without
+/// closing the connection.
+const PUBLISHER_IDLE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// How long the ingest server has to complete the RTMP handshake. The relay
+/// waits for it on its only thread, so an ingest that accepts the connection
+/// and then stalls would otherwise stop everything. Longer than the
+/// publisher's because the ingest is usually remote.
+const INGEST_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+fn server_handshake(socket: &mut TcpStream, timeout: Duration) -> Result<Vec<u8>> {
+    let clock = HandshakeClock::start(timeout, "publisher");
     let mut handshake = Handshake::new(PeerType::Server);
     let mut buf = vec![0u8; 4096];
     let result = loop {
-        socket.set_read_timeout(Some(handshake_time_left(deadline)?))?;
-        let n = match socket.read(&mut buf) {
-            Ok(n) => n,
-            Err(ref e) if timed_out(e) => return Err(handshake_expired()),
-            Err(e) => return Err(e).context("handshake read"),
-        };
+        let n = clock.read(socket, &mut buf)?;
         if n == 0 {
             bail!("publisher closed during handshake");
         }
@@ -1230,14 +1246,14 @@ fn server_handshake(socket: &mut TcpStream) -> Result<Vec<u8>> {
             .map_err(|e| anyhow!("handshake: {e:?}"))?
         {
             HandshakeProcessResult::InProgress { response_bytes } => {
-                handshake_write(socket, &response_bytes, deadline)?;
+                clock.write(socket, &response_bytes)?;
             }
             HandshakeProcessResult::Completed {
                 response_bytes,
                 remaining_bytes,
             } => {
                 if !response_bytes.is_empty() {
-                    handshake_write(socket, &response_bytes, deadline)?;
+                    clock.write(socket, &response_bytes)?;
                 }
                 break remaining_bytes;
             }
@@ -1248,30 +1264,54 @@ fn server_handshake(socket: &mut TcpStream) -> Result<Vec<u8>> {
     Ok(result)
 }
 
-/// Write a handshake response with no more than what is left of `deadline`,
-/// so a publisher that stops reading runs out of time as one that stops
-/// sending does.
-fn handshake_write(socket: &mut TcpStream, bytes: &[u8], deadline: Instant) -> Result<()> {
-    socket.set_write_timeout(Some(handshake_time_left(deadline)?))?;
-    match socket.write_all(bytes) {
-        Err(ref e) if timed_out(e) => Err(handshake_expired()),
-        other => other.context("handshake write"),
-    }
+/// One deadline across every read and write of a handshake, and the peer to
+/// name when it runs out.
+struct HandshakeClock {
+    deadline: Instant,
+    timeout: Duration,
+    peer: &'static str,
 }
 
-fn handshake_time_left(deadline: Instant) -> Result<Duration> {
-    let left = deadline.saturating_duration_since(Instant::now());
-    if left.is_zero() {
-        return Err(handshake_expired());
+impl HandshakeClock {
+    fn start(timeout: Duration, peer: &'static str) -> Self {
+        Self {
+            deadline: Instant::now() + timeout,
+            timeout,
+            peer,
+        }
     }
-    Ok(left)
-}
 
-fn handshake_expired() -> anyhow::Error {
-    anyhow!(
-        "publisher did not complete the handshake within {}s",
-        HANDSHAKE_TIMEOUT.as_secs()
-    )
+    fn read(&self, socket: &mut TcpStream, buf: &mut [u8]) -> Result<usize> {
+        socket.set_read_timeout(Some(self.left()?))?;
+        match socket.read(buf) {
+            Err(ref e) if timed_out(e) => Err(self.expired()),
+            other => other.context("handshake read"),
+        }
+    }
+
+    fn write(&self, socket: &mut TcpStream, bytes: &[u8]) -> Result<()> {
+        socket.set_write_timeout(Some(self.left()?))?;
+        match socket.write_all(bytes) {
+            Err(ref e) if timed_out(e) => Err(self.expired()),
+            other => other.context("handshake write"),
+        }
+    }
+
+    fn left(&self) -> Result<Duration> {
+        let left = self.deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(self.expired());
+        }
+        Ok(left)
+    }
+
+    fn expired(&self) -> anyhow::Error {
+        anyhow!(
+            "{} did not complete the handshake within {:?}",
+            self.peer,
+            self.timeout
+        )
+    }
 }
 
 /// A socket timeout is WouldBlock on Unix and TimedOut on Windows.
@@ -1279,16 +1319,17 @@ fn timed_out(e: &std::io::Error) -> bool {
     matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut)
 }
 
-fn client_handshake(socket: &mut TcpStream) -> Result<Vec<u8>> {
+fn client_handshake(socket: &mut TcpStream, timeout: Duration) -> Result<Vec<u8>> {
+    let clock = HandshakeClock::start(timeout, "the ingest server");
     let mut handshake = Handshake::new(PeerType::Client);
     let start = handshake
         .generate_outbound_p0_and_p1()
         .map_err(|e| anyhow!("handshake start: {e:?}"))?;
-    socket.write_all(&start).context("handshake write")?;
+    clock.write(socket, &start)?;
 
     let mut buf = vec![0u8; 4096];
-    loop {
-        let n = socket.read(&mut buf).context("handshake read")?;
+    let result = loop {
+        let n = clock.read(socket, &mut buf)?;
         if n == 0 {
             bail!("the ingest server closed during handshake");
         }
@@ -1297,23 +1338,22 @@ fn client_handshake(socket: &mut TcpStream) -> Result<Vec<u8>> {
             .map_err(|e| anyhow!("handshake: {e:?}"))?
         {
             HandshakeProcessResult::InProgress { response_bytes } => {
-                socket
-                    .write_all(&response_bytes)
-                    .context("handshake write")?;
+                clock.write(socket, &response_bytes)?;
             }
             HandshakeProcessResult::Completed {
                 response_bytes,
                 remaining_bytes,
             } => {
                 if !response_bytes.is_empty() {
-                    socket
-                        .write_all(&response_bytes)
-                        .context("handshake write")?;
+                    clock.write(socket, &response_bytes)?;
                 }
-                return Ok(remaining_bytes);
+                break remaining_bytes;
             }
         }
-    }
+    };
+    socket.set_read_timeout(None)?;
+    socket.set_write_timeout(None)?;
+    Ok(result)
 }
 
 /// The warning for records the injector left out as too large, if it has.
@@ -1410,4 +1450,226 @@ fn report(
         bail!("outgoing rate {kbps:.0} kb/s exceeded --abort-kbps {limit:.0}");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::thread;
+
+    use super::*;
+
+    const SHORT: Duration = Duration::from_millis(200);
+
+    /// Both ends of a loopback connection: the one that connected, then the
+    /// one that accepted.
+    fn connected() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let publisher = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (relay, _) = listener.accept().unwrap();
+        (publisher, relay)
+    }
+
+    fn expired(err: &anyhow::Error) -> bool {
+        err.to_string().contains("did not complete the handshake")
+    }
+
+    #[test]
+    fn a_silent_publisher_runs_out_of_handshake_time() {
+        let (_publisher, mut relay) = connected();
+        let started = Instant::now();
+        let err = server_handshake(&mut relay, SHORT).unwrap_err();
+        assert!(expired(&err), "{err:#}");
+        assert!(
+            started.elapsed() < SHORT * 5,
+            "took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn the_handshake_deadline_is_for_the_whole_exchange_not_each_read() {
+        let (mut publisher, mut relay) = connected();
+        let stop = Arc::new(AtomicBool::new(false));
+        let trickle = thread::spawn({
+            let stop = stop.clone();
+            move || {
+                // Version byte 3, then zeros a byte at a time: every read gets
+                // data well inside a per-read timeout, and the handshake still
+                // cannot finish in time.
+                let mut byte = 3u8;
+                while !stop.load(Ordering::Relaxed) && publisher.write_all(&[byte]).is_ok() {
+                    byte = 0;
+                    thread::sleep(Duration::from_millis(20));
+                }
+            }
+        });
+        let started = Instant::now();
+        let err = server_handshake(&mut relay, SHORT).unwrap_err();
+        stop.store(true, Ordering::Relaxed);
+        trickle.join().unwrap();
+        assert!(expired(&err), "{err:#}");
+        assert!(
+            started.elapsed() < SHORT * 5,
+            "took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn a_completed_handshake_keeps_what_follows_and_clears_the_timeouts() {
+        let (mut publisher, mut relay) = connected();
+        let encoder = thread::spawn(move || {
+            client_handshake(&mut publisher, Duration::from_secs(5)).unwrap();
+            assert_eq!(publisher.read_timeout().unwrap(), None);
+            assert_eq!(publisher.write_timeout().unwrap(), None);
+            publisher.write_all(b"after").unwrap();
+            publisher
+        });
+        let mut got = server_handshake(&mut relay, Duration::from_secs(5)).unwrap();
+        assert_eq!(relay.read_timeout().unwrap(), None);
+        assert_eq!(relay.write_timeout().unwrap(), None);
+        // The bytes after C2 can arrive with it or after it, so whatever the
+        // handshake did not hand back has to still be on the socket.
+        relay
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut buf = [0u8; 16];
+        while got.len() < 5 {
+            let n = relay.read(&mut buf).unwrap();
+            assert_ne!(n, 0, "closed after {got:?}");
+            got.extend_from_slice(&buf[..n]);
+        }
+        assert_eq!(got, b"after");
+        drop(encoder.join().unwrap());
+    }
+
+    #[test]
+    fn an_ingest_that_stalls_the_handshake_runs_out_of_time() {
+        // The ingest end accepts and then never answers C0 and C1.
+        let (mut relay, _ingest) = connected();
+        let started = Instant::now();
+        let err = client_handshake(&mut relay, SHORT).unwrap_err();
+        assert!(expired(&err), "{err:#}");
+        assert!(err.to_string().contains("ingest"), "{err:#}");
+        assert!(
+            started.elapsed() < SHORT * 5,
+            "took {:?}",
+            started.elapsed()
+        );
+    }
+
+    fn passthrough_cli() -> Cli {
+        // Nothing here gets as far as publishing, so the ingest is never dialled.
+        let mut cli = Cli::try_parse_from([
+            "truss-relay",
+            "--publish",
+            "rtmp://127.0.0.1:9/live",
+            "--passthrough",
+        ])
+        .unwrap();
+        cli.target = Ingest::parse(cli.publish.as_deref().unwrap()).unwrap();
+        cli
+    }
+
+    fn run_session(relay: TcpStream, idle_timeout: Duration) -> Result<()> {
+        let cli = passthrough_cli();
+        let carriers = parse_carriers(&cli.carriers).unwrap();
+        relay_one(
+            relay,
+            &cli,
+            &carriers,
+            None,
+            &mut None,
+            None,
+            "test",
+            &mut Dashboard::default(),
+            idle_timeout,
+        )
+    }
+
+    #[test]
+    fn a_publisher_that_goes_quiet_after_the_handshake_is_dropped() {
+        let (mut publisher, relay) = connected();
+        let (done, wait) = std::sync::mpsc::channel::<()>();
+        let encoder = thread::spawn(move || {
+            client_handshake(&mut publisher, Duration::from_secs(5)).unwrap();
+            // Holds the connection open, sending nothing, until the test ends.
+            let _ = wait.recv();
+        });
+        let started = Instant::now();
+        let err = run_session(relay, SHORT).unwrap_err();
+        drop(done);
+        encoder.join().unwrap();
+        assert!(err.to_string().contains("sent nothing"), "{err:#}");
+        assert!(
+            started.elapsed() < SHORT * 10,
+            "took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn a_publisher_that_keeps_sending_is_not_dropped() {
+        let (mut publisher, relay) = connected();
+        let idle_timeout = Duration::from_millis(300);
+        let encoder = thread::spawn(move || {
+            client_handshake(&mut publisher, Duration::from_secs(5)).unwrap();
+            let (mut session, initial) = ClientSession::new(ClientSessionConfig::new()).unwrap();
+            let mut bytes = Vec::new();
+            let connect = session.request_connection("live".into()).unwrap();
+            for r in initial.into_iter().chain([connect]) {
+                if let ClientSessionResult::OutboundResponse(p) = r {
+                    bytes.extend_from_slice(&p.bytes);
+                }
+            }
+            // 12 pieces a third of the timeout apart: four timeouts in all,
+            // with no gap long enough to end the session.
+            for piece in bytes.chunks(bytes.len().div_ceil(12)) {
+                publisher.write_all(piece).unwrap();
+                thread::sleep(idle_timeout / 3);
+            }
+            // On Windows, closing with the relay's replies unread resets the
+            // connection instead of ending it. Shut down the write side, then
+            // drain until the relay hangs up.
+            publisher.shutdown(std::net::Shutdown::Write).unwrap();
+            let mut sink = [0u8; 4096];
+            while matches!(publisher.read(&mut sink), Ok(n) if n > 0) {}
+        });
+        let started = Instant::now();
+        run_session(relay, idle_timeout).unwrap();
+        encoder.join().unwrap();
+        assert!(
+            started.elapsed() > idle_timeout * 3,
+            "ended after {:?}, before the publisher did",
+            started.elapsed()
+        );
+    }
+
+    fn injector_with_oversize(skipped: u64) -> Injector {
+        let mut injector = Injector::new(&InjectOptions {
+            carriers: vec![Carrier::SeiUnregistered],
+            every_n_frames: 1,
+            payload_len: DEFAULT_PAYLOAD_LEN,
+            keyframes_only: false,
+        })
+        .unwrap();
+        injector.stats.oversize_skipped = skipped;
+        injector
+    }
+
+    #[test]
+    fn the_oversize_warning_names_the_flag_that_sizes_the_payload() {
+        let mut cli = passthrough_cli();
+        assert_eq!(oversize_note(&injector_with_oversize(0), &cli), None);
+
+        let note = oversize_note(&injector_with_oversize(1_234), &cli).unwrap();
+        assert!(note.starts_with("1,234 records"), "{note}");
+        assert!(note.ends_with("lower --payload-len"), "{note}");
+
+        cli.artnet = Some("0.0.0.0".into());
+        let note = oversize_note(&injector_with_oversize(1), &cli).unwrap();
+        assert!(note.ends_with("lower --artnet-max-payload"), "{note}");
+    }
 }

@@ -113,6 +113,11 @@ after it when it is not 1935, and the application, `live` when none is given.
 Point your encoder at `rtmp://127.0.0.1/live` with any stream key. The relay
 holds the real one; it never needs entering into the encoder.
 
+The relay serves one encoder at a time, and with any key accepted, anything
+that can reach `--listen` can take that slot. Keep it on loopback, or behind a
+firewall when it has to listen wider. An encoder that sends nothing for 15
+seconds is dropped and the slot freed.
+
 The encoder can send H.264 or HEVC; OBS sends HEVC over Enhanced RTMP from
 version 29.1. Any other codec passes through the relay untouched, with no
 records in it, and the relay warns that it is doing so.
