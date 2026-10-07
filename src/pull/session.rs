@@ -157,6 +157,11 @@ pub(super) async fn run(spec: Spec, tx: Tx) -> Result<(), String> {
         }
 
         if matches!(align, Align::Waiting) && Instant::now() >= align_by {
+            let risk = if tracks[AUDIO].index.is_some() {
+                ", so audio and video may be out of step"
+            } else {
+                ""
+            };
             if tracks
                 .iter()
                 .all(|t| t.index.is_none() || t.last_report.is_some())
@@ -170,7 +175,7 @@ pub(super) async fn run(spec: Spec, tx: Tx) -> Result<(), String> {
                     &tx,
                     SourceEvent::Note(format!(
                         "the source's sender reports did not agree within {ALIGN_LIMIT:?}; \
-                         aligned on the latest, so audio and video may be out of step"
+                         aligned on the latest{risk}"
                     )),
                 )
                 .await?;
@@ -180,7 +185,7 @@ pub(super) async fn run(spec: Spec, tx: Tx) -> Result<(), String> {
                     &tx,
                     SourceEvent::Note(format!(
                         "no sender reports from the source within {ALIGN_LIMIT:?}; aligned \
-                         on arrival, so audio and video may be out of step"
+                         on arrival{risk}"
                     )),
                 )
                 .await?;
