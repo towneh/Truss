@@ -367,4 +367,6 @@ degraded uplink.
 
 ## Licence
 
-MIT or Apache-2.0, at your option.
+MIT or Apache-2.0, at your option. `third_party/retina` and the code it
+carries from the Basis media player are under the same terms; see
+[THIRD_PARTY.md](THIRD_PARTY.md).

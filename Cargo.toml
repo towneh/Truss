@@ -46,6 +46,13 @@ bytes = "1"
 socket2 = { version = "0.6.5", features = ["all"] }
 if-addrs = "0.15"
 crossterm = { version = "0.29", default-features = false, features = ["windows"] }
+# RTSP, for the relay to pull from a source.
+retina = "0.4.19"
 
 [dev-dependencies]
 rosc = "0.11"
+
+# Retina with the Basis media player's patches; third_party/retina/PATCHES.md
+# lists them. VRCDN's RTSP edge needs the first.
+[patch.crates-io]
+retina = { path = "third_party/retina" }

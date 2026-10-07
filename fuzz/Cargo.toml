@@ -104,3 +104,8 @@ doc = false
 bench = false
 
 [workspace]
+
+# The parent crate's patched retina; a [patch] there does not reach this
+# workspace.
+[patch.crates-io]
+retina = { path = "../third_party/retina" }
