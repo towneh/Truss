@@ -3,6 +3,7 @@
 
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
+use std::time::Instant;
 
 use h264_reader::avcc::AvcDecoderConfigurationRecord;
 use h264_reader::nal::sps::SeqParameterSet;
@@ -106,11 +107,27 @@ pub struct Rebase {
     origin: Option<i64>,
     last: [Option<u32>; 2],
     pub held: u64,
+    /// When the source's session ended, if a new one is yet to place a frame.
+    paused: Option<Instant>,
 }
 
 impl Rebase {
     /// The output timestamp for a frame at `us` on `stream`.
     pub fn place(&mut self, stream: usize, us: i64) -> u32 {
+        self.place_at(stream, us, Instant::now())
+    }
+
+    /// As [`Rebase::place`], at `now`. After a [`Rebase::pause`] the first
+    /// frame is placed after the last by however long the gap lasted, and
+    /// the rest of the new timeline follows from it.
+    pub fn place_at(&mut self, stream: usize, us: i64, now: Instant) -> u32 {
+        if let Some(at) = self.paused.take() {
+            let gap = u32::try_from(now.saturating_duration_since(at).as_millis())
+                .unwrap_or(u32::MAX)
+                .max(1);
+            let resume = self.last(0).max(self.last(1)).saturating_add(gap);
+            self.origin = Some(us - i64::from(resume) * 1000);
+        }
         let ms = self.ms(us);
         let ms = match self.last[stream] {
             Some(last) if ms < last => {
@@ -133,6 +150,15 @@ impl Rebase {
     /// The last timestamp placed on `stream`, or 0 before any.
     pub fn last(&self, stream: usize) -> u32 {
         self.last[stream].unwrap_or(0)
+    }
+
+    /// The source's session ended at `at`, and the next will bring a
+    /// timeline of its own. A pause before any frame was placed changes
+    /// nothing: the first frame sets the origin anyway.
+    pub fn pause(&mut self, at: Instant) {
+        if self.origin.is_some() {
+            self.paused = Some(at);
+        }
     }
 }
 
@@ -212,6 +238,22 @@ mod tests {
         assert_eq!(r.place(VIDEO, 5_000_000), 0);
         assert_eq!(r.place(AUDIO, 5_021_333), 21);
         assert_eq!(r.place(VIDEO, 5_033_333), 33);
+        assert_eq!(r.held, 0);
+    }
+
+    #[test]
+    fn a_new_session_continues_after_the_last_frame_by_the_gap() {
+        let t0 = Instant::now();
+        let mut r = Rebase::default();
+        r.place_at(VIDEO, 5_000_000, t0);
+        r.place_at(AUDIO, 6_980_000, t0);
+        assert_eq!(r.place_at(VIDEO, 7_000_000, t0), 2_000);
+        r.pause(t0);
+        // The new session's clock starts anywhere, here far behind the old.
+        let resumed = t0 + std::time::Duration::from_millis(3_500);
+        assert_eq!(r.place_at(VIDEO, 100_000, resumed), 5_500);
+        assert_eq!(r.place_at(AUDIO, 120_000, resumed), 5_520);
+        assert_eq!(r.place_at(VIDEO, 133_333, resumed), 5_533);
         assert_eq!(r.held, 0);
     }
 

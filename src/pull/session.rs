@@ -73,17 +73,14 @@ enum Align {
     Arrival,
 }
 
-pub(super) async fn run(spec: Spec, tx: Tx) -> Result<(), String> {
-    send(&tx, SourceEvent::State(SourceState::Connecting)).await?;
-    let (session, mut tracks) =
-        timeout(OPEN_DEADLINE, open(&spec, &tx))
-            .await
-            .map_err(|_| {
-                format!(
-                    "the source did not answer DESCRIBE, SETUP and PLAY within {OPEN_DEADLINE:?}"
-                )
-            })??;
-    send(&tx, SourceEvent::State(SourceState::Aligning)).await?;
+/// One session, from DESCRIBE until it ends. `relayed` is set once frames
+/// have gone to the relay.
+pub(super) async fn run(spec: &Spec, tx: &Tx, relayed: &mut bool) -> Result<(), String> {
+    send(tx, SourceEvent::State(SourceState::Connecting)).await?;
+    let (session, mut tracks) = timeout(OPEN_DEADLINE, open(spec, tx)).await.map_err(|_| {
+        format!("the source did not answer DESCRIBE, SETUP and PLAY within {OPEN_DEADLINE:?}")
+    })??;
+    send(tx, SourceEvent::State(SourceState::Aligning)).await?;
 
     let started = Instant::now();
     let align_by = started + ALIGN_LIMIT;
@@ -132,7 +129,7 @@ pub(super) async fn run(spec: Spec, tx: Tx) -> Result<(), String> {
                 } else {
                     track.last_report = Some(at_zero);
                     send(
-                        &tx,
+                        tx,
                         SourceEvent::Note(format!(
                             "the {} sender report moved its timeline by {:+.3} s; waiting \
                              for the next to agree",
@@ -151,7 +148,7 @@ pub(super) async fn run(spec: Spec, tx: Tx) -> Result<(), String> {
             {
                 rebase_anchors(&mut tracks);
                 align = Align::Reports;
-                send(&tx, SourceEvent::State(SourceState::WaitingForKeyframe)).await?;
+                send(tx, SourceEvent::State(SourceState::WaitingForKeyframe)).await?;
             }
             continue;
         }
@@ -172,7 +169,7 @@ pub(super) async fn run(spec: Spec, tx: Tx) -> Result<(), String> {
                 rebase_anchors(&mut tracks);
                 align = Align::Reports;
                 send(
-                    &tx,
+                    tx,
                     SourceEvent::Note(format!(
                         "the source's sender reports did not agree within {ALIGN_LIMIT:?}; \
                          aligned on the latest{risk}"
@@ -182,7 +179,7 @@ pub(super) async fn run(spec: Spec, tx: Tx) -> Result<(), String> {
             } else {
                 align = Align::Arrival;
                 send(
-                    &tx,
+                    tx,
                     SourceEvent::Note(format!(
                         "no sender reports from the source within {ALIGN_LIMIT:?}; aligned \
                          on arrival{risk}"
@@ -190,7 +187,7 @@ pub(super) async fn run(spec: Spec, tx: Tx) -> Result<(), String> {
                 )
                 .await?;
             }
-            send(&tx, SourceEvent::State(SourceState::WaitingForKeyframe)).await?;
+            send(tx, SourceEvent::State(SourceState::WaitingForKeyframe)).await?;
         }
 
         match item {
@@ -205,7 +202,7 @@ pub(super) async fn run(spec: Spec, tx: Tx) -> Result<(), String> {
                 if frame.loss() > 0 && !key && !opening && !awaiting_key {
                     awaiting_key = true;
                     send(
-                        &tx,
+                        tx,
                         SourceEvent::Note(
                             "the source skipped video; holding the picture until the next \
                              keyframe"
@@ -222,18 +219,19 @@ pub(super) async fn run(spec: Spec, tx: Tx) -> Result<(), String> {
                     let Some(event) = video_parameters(&demuxed, tracks[VIDEO].index) else {
                         continue;
                     };
-                    send(&tx, event).await?;
+                    send(tx, event).await?;
                 }
                 if opening {
                     gate = Some(pts);
                     if let Some(event) = audio_parameters(&demuxed, tracks[AUDIO].index) {
-                        send(&tx, event).await?;
+                        send(tx, event).await?;
                         audio_described = true;
                     }
-                    send(&tx, SourceEvent::State(SourceState::Relaying)).await?;
+                    send(tx, SourceEvent::State(SourceState::Relaying)).await?;
+                    *relayed = true;
                 }
                 send(
-                    &tx,
+                    tx,
                     SourceEvent::VideoFrame {
                         data: frame.into_data(),
                         pts_us: pts,
@@ -255,11 +253,11 @@ pub(super) async fn run(spec: Spec, tx: Tx) -> Result<(), String> {
                     let Some(event) = audio_parameters(&demuxed, tracks[AUDIO].index) else {
                         continue;
                     };
-                    send(&tx, event).await?;
+                    send(tx, event).await?;
                     audio_described = true;
                 }
                 send(
-                    &tx,
+                    tx,
                     SourceEvent::AudioFrame {
                         data: frame.data().to_vec(),
                         pts_us: pts,

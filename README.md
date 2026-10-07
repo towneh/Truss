@@ -202,8 +202,15 @@ of the source's sender reports in a row to agree, so the audio and video it
 publishes are in step, and then for a keyframe. A server can begin a session
 with a report that is seconds out, as VRCDN does when a pull starts soon after
 the last one ended, and waiting for the next one costs another 5 seconds. The
-panel says which wait it is in. When the source ends, the relay stops; it does
-not reconnect yet.
+panel says which wait it is in.
+
+When the source drops, the relay reconnects: six times, waiting about 24
+seconds in all between attempts (longer if a server is slow to answer), with
+the publish held open, so viewers see a pause, then every 8 seconds with the
+publish ended until the source plays again. Timestamps carry on across the
+gap. An ingest that closes a silent publish sooner ends the session there, as
+MediaMTX does after 10 seconds, and the relay starts again when the source is
+back.
 
 ## Watching the desk with nothing else running
 

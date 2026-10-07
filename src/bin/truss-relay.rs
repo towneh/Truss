@@ -311,17 +311,25 @@ fn main() -> Result<()> {
     let mut next_tick = Instant::now();
 
     if let Some(spec) = cli.pull.clone() {
-        console::log("");
-        console::event(format!("-- pulling from {}", spec.display()));
-        return session_pull(
-            spec,
-            &cli,
-            &carriers,
-            artnet.as_ref(),
-            &mut osc,
-            key.as_ref(),
-            &mut dash,
-        );
+        // The source reconnects on its own; a session ends here only when
+        // the ingest side fails, and then the relay starts again.
+        loop {
+            console::log("");
+            console::event(format!("-- pulling from {}", spec.display()));
+            match session_pull(
+                spec.clone(),
+                &cli,
+                &carriers,
+                artnet.as_ref(),
+                &mut osc,
+                key.as_ref(),
+                &mut dash,
+            ) {
+                Ok(()) => console::event("-- session ended cleanly"),
+                Err(e) => console::event(format!("-- session ended: {e:#}")),
+            }
+            std::thread::sleep(pull::RECONNECT_CAP);
+        }
     }
 
     let Some(listener) = listener else {
@@ -854,6 +862,13 @@ impl<'a> Onward<'a> {
         Ok(())
     }
 
+    /// End the publish, so the ingest shows the stream as ended rather than
+    /// holding it open with nothing in it. The next [`Onward::connect`]
+    /// publishes afresh.
+    fn disconnect(&mut self) {
+        self.upstream = None;
+    }
+
     fn metadata(&mut self, metadata: &StreamMetadata) -> Result<()> {
         if let Some(up) = self.upstream.as_mut() {
             forward_metadata(up, metadata)?;
@@ -1134,7 +1149,7 @@ fn session_pull(
     let started = Instant::now();
     let mut source = pull::spawn(spec).context("starting the source thread")?;
     let mut onward = Onward::new(cli, carriers, artnet, osc, key)?;
-    let mut state = SourceState::Connecting;
+    let mut state = SourceState::Connecting.describe();
     let mut dts: Option<DtsWindow> = None;
     let mut rebase = Rebase::default();
     // The relay writes the onMetaData an encoder would have sent, from what
@@ -1155,8 +1170,8 @@ fn session_pull(
             idle = false;
             match event {
                 SourceEvent::State(s) => {
-                    console::event(format!("source {}", s.describe()));
-                    state = s;
+                    state = s.describe();
+                    console::event(format!("source {state}"));
                 }
                 SourceEvent::Note(note) => console::event(format!("source: {note}")),
                 SourceEvent::Video {
@@ -1238,8 +1253,18 @@ fn session_pull(
                     )?;
                 }
                 SourceEvent::Lost(why) => {
-                    onward.report(0)?;
-                    bail!("{why}");
+                    // The publish stays open through the quick reconnects:
+                    // an ingest commonly refuses a second publish while it
+                    // still counts the first, and viewers see a pause.
+                    console::event(format!("source lost: {why}"));
+                    dts = None;
+                    rebase.pause(Instant::now());
+                }
+                SourceEvent::Down => {
+                    console::event("source down: ending the publish until it plays again");
+                    onward.disconnect();
+                    dts = None;
+                    rebase = Rebase::default();
                 }
             }
         }
@@ -1249,7 +1274,7 @@ fn session_pull(
         }
         dash.tick(
             cli,
-            Some(onward.view(state.describe(), started)),
+            Some(onward.view(&state, started)),
             artnet,
             onward.osc.as_ref(),
         );
