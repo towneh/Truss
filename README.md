@@ -118,6 +118,11 @@ that can reach `--listen` can take that slot. Keep it on loopback, or behind a
 firewall when it has to listen wider. An encoder that sends nothing for 15
 seconds is dropped and the slot freed.
 
+When the upload to the ingest falls behind, by about half a second of stream,
+the relay stops reading from the encoder until it catches up. The encoder then
+drops frames or lowers its bitrate, as it would publishing directly, rather
+than the relay queueing more and more behind it.
+
 The encoder can send H.264 or HEVC; OBS sends HEVC over Enhanced RTMP from
 version 29.1. Any other codec passes through the relay untouched, with no
 records in it, and the relay warns that it is doing so.
@@ -258,6 +263,10 @@ in `key.txt` can be anything; the stand-in accepts whatever it is given.
 `--artnet` to the relay puts a desk in the same loop. None of it leaves the
 machine.
 
+`--passthrough` relays without injecting anything. Set against a publish
+straight to the ingest it shows what the relay itself costs, and against a
+normal run what the records do.
+
 ## The stream key
 
 No flag accepts the key. An argument is visible to anything that can list
@@ -392,8 +401,21 @@ OSC lane has run at the set rate with no publisher and at the video's frame rate
 with one, with no gaps on loopback, into the VRSL-URP source and into
 `truss-detect`.
 
-Nothing longer than a thirty-minute publish has been measured, and nothing on a
-degraded uplink.
+`--source` has pulled VRCDN's RTSP egress for five minutes with a record on
+every one of 8,825 frames, no gaps and no decode errors, and through MediaMTX a
+source with B-frames and one with no audio.
+
+On an emulated slow or lossy uplink, with 100 to 300 ms of round trip and 0.05%
+to 0.5% packet loss between the relay and the ingest, no record was lost: every
+leg is TCP, so loss costs time rather than data. Median latency went from
+125 ms to between 174 and 324 ms, and to about 4 seconds at 300 ms with 0.5%
+loss. With the uplink capped below the stream's bitrate, the relay held the
+encoder back and latency settled at about 3 seconds instead of climbing. Each
+of those is one run of under two minutes on loopback.
+
+Nothing longer than a thirty-minute publish has been measured, nor a real
+degraded uplink, and OBS's own frame dropping behind the relay has not been
+watched yet.
 
 ## Licence
 

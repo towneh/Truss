@@ -203,6 +203,49 @@ impl OutBuf {
     }
 }
 
+/// How much of the stream may queue for the ingest before the relay stops
+/// reading from the encoder.
+const HOLD_SECONDS: f64 = 0.5;
+/// The least that may queue before holding, so a low bitrate does not hold
+/// the encoder back over a single keyframe.
+const HOLD_FLOOR: usize = 256 * 1024;
+
+/// Whether to stop reading from the encoder because the ingest is behind.
+///
+/// Reading regardless hides a slow uplink from the encoder: it writes to a
+/// local socket that never fills, so its own frame dropping and bitrate
+/// control never engage, and the backlog grows in the relay instead. Not
+/// reading lets TCP push back on the encoder, which then behaves as it would
+/// publishing directly. Reading resumes once the queue is down to half the
+/// limit, so the relay does not switch on every frame.
+///
+/// The limit is set from the rate when a hold starts and kept until it ends.
+/// Nothing is read while holding, so the measured rate falls the longer a
+/// hold lasts, and following it would keep pushing the release point down.
+#[derive(Debug, Default)]
+pub struct Backpressure {
+    holding: bool,
+    limit: usize,
+}
+
+impl Backpressure {
+    /// Update for `queued` bytes waiting for the ingest with the stream at
+    /// `kbps`, and return whether to hold off reading.
+    pub fn hold(&mut self, queued: usize, kbps: f64) -> bool {
+        if self.holding {
+            self.holding = queued > self.limit / 2;
+        } else {
+            self.limit = HOLD_FLOOR.max((kbps.max(0.0) * 125.0 * HOLD_SECONDS) as usize);
+            self.holding = queued > self.limit;
+        }
+        self.holding
+    }
+
+    pub fn holding(&self) -> bool {
+        self.holding
+    }
+}
+
 /// Bytes on the wire, averaged over a sliding window.
 ///
 /// The relay adds to a stream the encoder has already sized, so a correctly
@@ -360,6 +403,30 @@ mod tests {
         let mut sink = ScriptedSink::new(vec![Step::Closed]);
         let err = out.pump(&mut sink).unwrap_err().to_string();
         assert!(err.contains("closed"), "{err}");
+    }
+
+    #[test]
+    fn the_encoder_is_held_past_half_a_second_queued_and_released_at_half_that() {
+        let mut b = Backpressure::default();
+        // 4,000 kb/s is 500,000 bytes a second, so the limit is 250,000,
+        // under the floor: 256 kB holds and half of it releases.
+        assert!(!b.hold(200_000, 4000.0));
+        assert!(b.hold(300_000, 4000.0));
+        assert!(b.hold(200_000, 4000.0), "still above half the limit");
+        assert!(!b.hold(100_000, 4000.0));
+        // At 8,000 kb/s the limit is half a second, 500,000 bytes.
+        assert!(!b.hold(400_000, 8000.0));
+        assert!(b.hold(600_000, 8000.0));
+    }
+
+    #[test]
+    fn a_hold_keeps_the_limit_it_started_with_while_the_measured_rate_falls() {
+        let mut b = Backpressure::default();
+        assert!(b.hold(600_000, 8000.0), "past half a second at 8,000 kb/s");
+        // Nothing is read while holding, so the meter reads lower each pass.
+        // Releasing at half of 500,000 must not slide down to half the floor.
+        assert!(b.hold(300_000, 1000.0));
+        assert!(!b.hold(240_000, 500.0));
     }
 
     #[test]

@@ -38,7 +38,7 @@ use truss::payload;
 use truss::pull::timing::{AUDIO, DtsWindow, Rebase, VIDEO};
 use truss::pull::{self, SourceEvent, SourceState};
 use truss::record::{DEFAULT_PAYLOAD_LEN, MAX_PAYLOAD_LEN};
-use truss::relay::{Ingest, OutBuf, RateMeter};
+use truss::relay::{Backpressure, Ingest, OutBuf, RateMeter};
 
 #[derive(Parser, Clone)]
 #[command(
@@ -247,8 +247,8 @@ fn main() -> Result<()> {
             None
         }
         (Some(_), None) => {
-            let listener = TcpListener::bind(cli.listen())
-                .with_context(|| format!("binding {}", cli.listen()))?;
+            let listener =
+                bind_listener(cli.listen()).with_context(|| format!("binding {}", cli.listen()))?;
             println!(
                 "relay listening on rtmp://{}/{}  (point the encoder here, any stream key)",
                 cli.listen(),
@@ -508,6 +508,8 @@ struct SessionView<'a> {
     meter: &'a RateMeter,
     injector: Option<&'a Injector>,
     queued: usize,
+    /// Whether the relay is holding the encoder back for the ingest to catch up.
+    holding: bool,
 }
 
 #[derive(Default, Clone, Copy)]
@@ -654,7 +656,13 @@ impl Dashboard {
                         cli.warn_kbps
                     ));
                 }
-                if s.queued > 64 * 1024 {
+                if s.holding {
+                    warnings.push(format!(
+                        "{} kB queued: the upload is not keeping up, so the encoder is held \
+                         back and drops frames as it would publishing directly",
+                        s.queued / 1024
+                    ));
+                } else if s.queued > 64 * 1024 {
                     warnings.push(format!(
                         "{} kB queued: the upload is not keeping up",
                         s.queued / 1024
@@ -801,6 +809,8 @@ struct Onward<'a> {
     /// every line: a desk sending the same way for an hour is said once.
     last_note: Option<String>,
     buf: Vec<u8>,
+    /// Times the encoder was held back since the last report.
+    held_back: u32,
 }
 
 impl<'a> Onward<'a> {
@@ -832,6 +842,7 @@ impl<'a> Onward<'a> {
             last_report: Instant::now(),
             last_note: None,
             buf: vec![0u8; 32 * 1024],
+            held_back: 0,
         })
     }
 
@@ -939,11 +950,13 @@ impl<'a> Onward<'a> {
     }
 
     fn report(&mut self, queued: usize) -> Result<()> {
+        let held_back = std::mem::take(&mut self.held_back);
         report(
             &self.meter,
             self.injector.as_ref(),
             self.cli,
             queued,
+            held_back,
             self.artnet,
             self.osc.as_ref(),
             &mut self.last_note,
@@ -959,6 +972,7 @@ impl<'a> Onward<'a> {
             meter: &self.meter,
             injector: self.injector.as_ref(),
             queued: self.queued(),
+            holding: false,
         }
     }
 }
@@ -1001,6 +1015,10 @@ fn session_listen(
     let mut onward = Onward::new(cli, carriers, artnet, osc, key)?;
     let mut buf = vec![0u8; 32 * 1024];
     let mut heard = Instant::now();
+    let mut backpressure = Backpressure::default();
+    let mut hold_said: Option<Instant> = None;
+    // When the queue last shrank during this hold, and how far.
+    let mut drained: Option<(Instant, usize)> = None;
     obs.set_nonblocking(true)?;
 
     loop {
@@ -1011,35 +1029,71 @@ fn session_listen(
             publisher_event(event, &mut server, &mut obs_out, &mut onward)?;
         }
 
-        match obs.read(&mut buf) {
-            Ok(0) => {
-                console::event("publisher disconnected");
-                break;
+        let held = backpressure.holding();
+        let holding = backpressure.hold(onward.queued(), onward.meter.kbps());
+        if holding && !held {
+            // A marginal uplink holds and releases several times a second,
+            // so this is said once in a while and counted in the report.
+            onward.held_back += 1;
+            if hold_said.is_none_or(|t: Instant| t.elapsed() >= HOLD_NOTICE_EVERY) {
+                console::event(
+                    "the upload is not keeping up: holding the encoder back, so it drops \
+                     frames as it would publishing directly",
+                );
+                hold_said = Some(Instant::now());
             }
-            Ok(n) => {
-                idle = false;
-                heard = Instant::now();
-                let results = server
-                    .handle_input(&buf[..n])
-                    .map_err(|e| anyhow!("server handle_input: {e:?}"))?;
-                for r in results {
-                    match r {
-                        ServerSessionResult::OutboundResponse(p) => {
-                            obs_out.push(&p.bytes);
+        }
+        if holding {
+            // While holding nothing is added, so a queue that has not shrunk
+            // in this long has stopped draining: an ingest that has stopped
+            // reading, which would otherwise hold the session for ever.
+            let queued = onward.queued();
+            let (since, lowest) = drained.get_or_insert((Instant::now(), queued));
+            if queued < *lowest {
+                *since = Instant::now();
+                *lowest = queued;
+            }
+            if since.elapsed() >= idle_timeout {
+                bail!(
+                    "{} kB queued and not draining for {idle_timeout:?}; the upstream \
+                     connection cannot keep up",
+                    onward.queued() / 1024
+                );
+            }
+            // Time spent not reading is not the publisher going quiet.
+            heard = Instant::now();
+        } else {
+            drained = None;
+            match obs.read(&mut buf) {
+                Ok(0) => {
+                    console::event("publisher disconnected");
+                    break;
+                }
+                Ok(n) => {
+                    idle = false;
+                    heard = Instant::now();
+                    let results = server
+                        .handle_input(&buf[..n])
+                        .map_err(|e| anyhow!("server handle_input: {e:?}"))?;
+                    for r in results {
+                        match r {
+                            ServerSessionResult::OutboundResponse(p) => {
+                                obs_out.push(&p.bytes);
+                            }
+                            ServerSessionResult::RaisedEvent(e) => {
+                                publisher_event(e, &mut server, &mut obs_out, &mut onward)?;
+                            }
+                            ServerSessionResult::UnhandleableMessageReceived(_) => {}
                         }
-                        ServerSessionResult::RaisedEvent(e) => {
-                            publisher_event(e, &mut server, &mut obs_out, &mut onward)?;
-                        }
-                        ServerSessionResult::UnhandleableMessageReceived(_) => {}
                     }
                 }
-            }
-            Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
-                if heard.elapsed() >= idle_timeout {
-                    bail!("publisher sent nothing for {idle_timeout:?}");
+                Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
+                    if heard.elapsed() >= idle_timeout {
+                        bail!("publisher sent nothing for {idle_timeout:?}");
+                    }
                 }
+                Err(e) => return Err(e).context("reading from publisher"),
             }
-            Err(e) => return Err(e).context("reading from publisher"),
         }
 
         obs_out.pump(&mut obs).context("writing to publisher")?;
@@ -1049,7 +1103,10 @@ fn session_listen(
 
         dash.tick(
             cli,
-            Some(onward.view(peer, started)),
+            Some(SessionView {
+                holding: backpressure.holding(),
+                ..onward.view(peer, started)
+            }),
             artnet,
             onward.osc.as_ref(),
         );
@@ -1428,11 +1485,60 @@ fn queue_server(out: &mut OutBuf, results: Vec<ServerSessionResult>) {
     }
 }
 
+/// The publisher socket's receive buffer. Left to itself, Windows grows a
+/// loopback socket's buffer into megabytes, which would hide a slow uplink
+/// from the encoder for seconds after the relay stops reading. Set on the
+/// listener, so accepted sockets start with it.
+const PUBLISHER_RECV_BUFFER: usize = 256 * 1024;
+
+/// The ingest socket's send buffer. Left to itself it grows into megabytes,
+/// a backlog the relay cannot see and so cannot hold the encoder back for.
+/// 512 kB covers about 13 Mb/s over a 300 ms round trip, so it does not cap
+/// a real link.
+const UPSTREAM_SEND_BUFFER: usize = 512 * 1024;
+
+/// How often holding the encoder back is announced, at most.
+const HOLD_NOTICE_EVERY: Duration = Duration::from_secs(30);
+
+/// Bind the first of `addr`'s addresses that will, as std's
+/// `TcpListener::bind` does: `localhost` can resolve to `::1` first on a host
+/// without IPv6.
+fn bind_listener(addr: &str) -> Result<TcpListener> {
+    let mut last = None;
+    for addr in addr.to_socket_addrs()? {
+        match bind_one(addr) {
+            Ok(listener) => return Ok(listener),
+            Err(e) => last = Some(e),
+        }
+    }
+    Err(last.unwrap_or_else(|| anyhow!("resolves to no address")))
+}
+
+fn bind_one(addr: SocketAddr) -> Result<TcpListener> {
+    let socket = socket2::Socket::new(
+        socket2::Domain::for_address(addr),
+        socket2::Type::STREAM,
+        Some(socket2::Protocol::TCP),
+    )?;
+    // As std's TcpListener::bind does, so a restart is not refused while the
+    // last session's connections are in TIME_WAIT. On Windows the option
+    // lets another socket take the port, so it stays off there.
+    #[cfg(not(windows))]
+    socket.set_reuse_address(true)?;
+    socket.set_recv_buffer_size(PUBLISHER_RECV_BUFFER)?;
+    socket.bind(&addr.into())?;
+    socket.listen(128)?;
+    Ok(socket.into())
+}
+
 fn connect_upstream(cli: &Cli) -> Result<Upstream> {
     console::event(format!("connecting to {}...", cli.target.authority));
     let mut socket = TcpStream::connect(&cli.target.authority)
         .with_context(|| format!("connecting to {}", cli.target.authority))?;
     socket.set_nodelay(true).ok();
+    socket2::SockRef::from(&socket)
+        .set_send_buffer_size(UPSTREAM_SEND_BUFFER)
+        .ok();
     let leftover = client_handshake(&mut socket, INGEST_HANDSHAKE_TIMEOUT)?;
 
     let mut config = ClientSessionConfig::new();
@@ -1629,11 +1735,13 @@ fn oversize_note(injector: &Injector, cli: &Cli) -> Option<String> {
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn report(
     meter: &RateMeter,
     injector: Option<&Injector>,
     cli: &Cli,
     queued_bytes: usize,
+    held_back: u32,
     artnet: Option<&artnet::Receiver>,
     osc: Option<&osc::Sender>,
     last_note: &mut Option<String>,
@@ -1671,6 +1779,9 @@ fn report(
         // A persistent queue means the upload is not keeping up, which shows
         // up to viewers as stutter long before it shows up as an error.
         line.push_str(&format!("  [{} kB queued]", queued_bytes / 1024));
+    }
+    if held_back > 0 {
+        line.push_str(&format!("  [encoder held back {held_back}x]"));
     }
     console::log(&line);
     if artnet_note != *last_note {
@@ -1724,6 +1835,19 @@ mod tests {
         let publisher = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         let (relay, _) = listener.accept().unwrap();
         (publisher, relay)
+    }
+
+    #[test]
+    fn an_accepted_publisher_keeps_the_listeners_receive_buffer() {
+        let listener = bind_listener("127.0.0.1:0").unwrap();
+        let _publisher = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (relay, _) = listener.accept().unwrap();
+        let size = socket2::SockRef::from(&relay).recv_buffer_size().unwrap();
+        // Linux reports twice what was set, for its own bookkeeping.
+        assert!(
+            (PUBLISHER_RECV_BUFFER..=2 * PUBLISHER_RECV_BUFFER).contains(&size),
+            "{size}"
+        );
     }
 
     fn expired(err: &anyhow::Error) -> bool {
@@ -1926,6 +2050,141 @@ mod tests {
         let cli =
             Cli::try_parse_from(["truss-relay", "--artnet", "--osc", "127.0.0.1:12100"]).unwrap();
         assert!(stream_key(&cli).unwrap().is_none());
+    }
+
+    /// An ingest that accepts the connection and the publish, then stops
+    /// reading, as a stalled one does. It keeps the connection open until
+    /// `done` is dropped.
+    fn stalled_ingest(done: std::sync::mpsc::Receiver<()>) -> (u16, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let ingest = thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut input = server_handshake(&mut socket, Duration::from_secs(5)).unwrap();
+            let (mut session, initial) = ServerSession::new(ServerSessionConfig::new()).unwrap();
+            let mut out = OutBuf::default();
+            queue_server(&mut out, initial);
+            let mut buf = vec![0u8; 4096];
+            let mut published = false;
+            while !published {
+                for r in session.handle_input(&input).unwrap() {
+                    match r {
+                        ServerSessionResult::OutboundResponse(p) => out.push(&p.bytes),
+                        ServerSessionResult::RaisedEvent(
+                            ServerSessionEvent::ConnectionRequested { request_id, .. }
+                            | ServerSessionEvent::ReleaseStreamRequested { request_id, .. },
+                        ) => queue_server(&mut out, session.accept_request(request_id).unwrap()),
+                        ServerSessionResult::RaisedEvent(
+                            ServerSessionEvent::PublishStreamRequested { request_id, .. },
+                        ) => {
+                            queue_server(&mut out, session.accept_request(request_id).unwrap());
+                            published = true;
+                        }
+                        _ => {}
+                    }
+                }
+                out.pump(&mut socket).unwrap();
+                if !published {
+                    let n = socket.read(&mut buf).unwrap();
+                    input = buf[..n].to_vec();
+                }
+            }
+            let _ = done.recv();
+        });
+        (port, ingest)
+    }
+
+    /// Publishes over `socket` until the relay stops taking it and closes.
+    fn flooding_publisher(mut socket: TcpStream) -> thread::JoinHandle<()> {
+        thread::spawn(move || {
+            client_handshake(&mut socket, Duration::from_secs(5)).unwrap();
+            let (mut session, initial) = ClientSession::new(ClientSessionConfig::new()).unwrap();
+            let send = |s: &mut TcpStream, r: ClientSessionResult| {
+                if let ClientSessionResult::OutboundResponse(p) = r {
+                    s.write_all(&p.bytes)
+                } else {
+                    Ok(())
+                }
+            };
+            for r in initial {
+                send(&mut socket, r).unwrap();
+            }
+            let connect = session.request_connection("live".into()).unwrap();
+            send(&mut socket, connect).unwrap();
+            let mut buf = vec![0u8; 4096];
+            let mut publishing = false;
+            while !publishing {
+                let n = socket.read(&mut buf).unwrap();
+                assert_ne!(n, 0, "the relay closed before the publish was accepted");
+                for r in session.handle_input(&buf[..n]).unwrap() {
+                    match r {
+                        ClientSessionResult::RaisedEvent(
+                            ClientSessionEvent::ConnectionRequestAccepted,
+                        ) => {
+                            let publish = session
+                                .request_publishing("anykey".into(), PublishRequestType::Live)
+                                .unwrap();
+                            send(&mut socket, publish).unwrap();
+                        }
+                        ClientSessionResult::RaisedEvent(
+                            ClientSessionEvent::PublishRequestAccepted,
+                        ) => publishing = true,
+                        other => send(&mut socket, other).unwrap(),
+                    }
+                }
+            }
+            // Once the relay holds back, writes time out; once it gives up,
+            // they fail.
+            socket
+                .set_write_timeout(Some(Duration::from_millis(100)))
+                .unwrap();
+            let frame = Bytes::from(vec![0u8; 64 * 1024]);
+            for i in 0u32.. {
+                let r = session
+                    .publish_video_data(frame.clone(), RtmpTimestamp::new(i * 33), false)
+                    .unwrap();
+                match send(&mut socket, r) {
+                    Ok(()) => {}
+                    Err(ref e) if timed_out(e) => {}
+                    Err(_) => return,
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn a_stalled_ingest_ends_the_session_rather_than_holding_for_ever() {
+        let (done, wait) = std::sync::mpsc::channel::<()>();
+        let (port, ingest) = stalled_ingest(wait);
+        let url = format!("rtmp://127.0.0.1:{port}/live");
+        let mut cli =
+            Cli::try_parse_from(["truss-relay", "--publish", &url, "--passthrough"]).unwrap();
+        cli.target = Ingest::parse(&url).unwrap();
+        let key = creds::StreamKey::new("k").unwrap();
+        let (publisher, relay) = connected();
+        let encoder = flooding_publisher(publisher);
+        let started = Instant::now();
+        let err = session_listen(
+            relay,
+            &cli,
+            &parse_carriers(&cli.carriers).unwrap(),
+            None,
+            &mut None,
+            Some(&key),
+            "test",
+            &mut Dashboard::default(),
+            Duration::from_millis(500),
+        )
+        .unwrap_err();
+        drop(done);
+        ingest.join().unwrap();
+        encoder.join().unwrap();
+        assert!(err.to_string().contains("not draining"), "{err:#}");
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "took {:?}",
+            started.elapsed()
+        );
     }
 
     fn injector_with_oversize(skipped: u64) -> Injector {
