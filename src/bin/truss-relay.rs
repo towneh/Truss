@@ -341,7 +341,7 @@ fn main() -> Result<()> {
             .unwrap_or_else(|_| "?".into());
         console::log("");
         console::event(format!("-- publisher connected from {peer}"));
-        match relay_one(
+        match session_listen(
             stream,
             &cli,
             &carriers,
@@ -725,8 +725,187 @@ struct Upstream {
     pending_metadata: Option<StreamMetadata>,
 }
 
+/// The onward half of a session: injection, the publish to the ingest server,
+/// the rate meter and the periodic report. The input side feeds it A/V and
+/// metadata and calls [`Onward::pass`] once per loop.
+struct Onward<'a> {
+    cli: &'a Cli,
+    artnet: Option<&'a artnet::Receiver>,
+    osc: &'a mut Option<osc::Sender>,
+    key: Option<&'a creds::StreamKey>,
+    injector: Option<Injector>,
+    upstream: Option<Upstream>,
+    meter: RateMeter,
+    last_report: Instant,
+    /// The note under the status line is printed when it changes, not with
+    /// every line: a desk sending the same way for an hour is said once.
+    last_note: Option<String>,
+    buf: Vec<u8>,
+}
+
+impl<'a> Onward<'a> {
+    fn new(
+        cli: &'a Cli,
+        carriers: &[Carrier],
+        artnet: Option<&'a artnet::Receiver>,
+        osc: &'a mut Option<osc::Sender>,
+        key: Option<&'a creds::StreamKey>,
+    ) -> Result<Self> {
+        let injector = (!cli.passthrough)
+            .then(|| {
+                Injector::new(&InjectOptions {
+                    carriers: carriers.to_vec(),
+                    every_n_frames: cli.every,
+                    payload_len: cli.payload_len,
+                    keyframes_only: false,
+                })
+            })
+            .transpose()?;
+        Ok(Self {
+            cli,
+            artnet,
+            osc,
+            key,
+            injector,
+            upstream: None,
+            meter: RateMeter::new(),
+            last_report: Instant::now(),
+            last_note: None,
+            buf: vec![0u8; 32 * 1024],
+        })
+    }
+
+    /// Dial the ingest server, once per session.
+    fn connect(&mut self) -> Result<()> {
+        if self.upstream.is_none() {
+            self.upstream = Some(connect_upstream(self.cli)?);
+        }
+        Ok(())
+    }
+
+    fn metadata(&mut self, metadata: &StreamMetadata) -> Result<()> {
+        if let Some(up) = self.upstream.as_mut() {
+            forward_metadata(up, metadata)?;
+        }
+        Ok(())
+    }
+
+    fn video(&mut self, data: Bytes, timestamp: RtmpTimestamp) -> Result<()> {
+        let cli = self.cli;
+        let payload = match self.injector.as_mut() {
+            Some(inj) => {
+                if matches!(truss::flv::video(&data), truss::flv::Video::Config { .. }) {
+                    inj.note_sequence_header(&data)?;
+                    data
+                } else {
+                    let dmx = self.artnet.map(|a| {
+                        let blocks = a.latch().snapshot(Instant::now(), cli.artnet_max_payload);
+                        truss::payload::encode(&blocks)
+                    });
+                    // Three states, and collapsing any two of them is wrong.
+                    // No Art-Net at all means inject the sequence-derived
+                    // body a measurement run wants. A lane that failed to
+                    // encode must skip the frame instead: passing None there
+                    // would put that test body on the wire mid-show.
+                    //
+                    // --artnet-max-payload is checked against the record
+                    // limit at startup and snapshot honours it strictly, so
+                    // the failing arm is unreachable today. It is written out
+                    // because the cost of getting it wrong is a show carrying
+                    // probe data instead of its lighting.
+                    let rewritten = match dmx {
+                        Some(Ok(bytes)) => {
+                            let now = now_unix_nanos();
+                            let rewritten = inj.inject_tag_with(&data, now, Some(&bytes))?;
+                            // The lane carries the payload the stream carries,
+                            // so a frame the injector left alone gets no record.
+                            if rewritten.is_some()
+                                && let Some(o) = self.osc.as_mut()
+                            {
+                                o.send(&bytes, now);
+                            }
+                            rewritten
+                        }
+                        Some(Err(_)) => None,
+                        None => inj.inject_tag_with(&data, now_unix_nanos(), None)?,
+                    };
+                    match rewritten {
+                        Some(rewritten) => Bytes::from(rewritten),
+                        None => data,
+                    }
+                }
+            }
+            None => data,
+        };
+        forward_av(
+            &mut self.upstream,
+            &mut self.meter,
+            true,
+            payload,
+            timestamp,
+        )
+    }
+
+    fn audio(&mut self, data: Bytes, timestamp: RtmpTimestamp) -> Result<()> {
+        forward_av(&mut self.upstream, &mut self.meter, false, data, timestamp)
+    }
+
+    /// One pass over the ingest connection, then the report when it is due.
+    /// Returns whether anything arrived from the ingest or is still queued
+    /// for it, so the caller knows not to sleep.
+    fn pass(&mut self) -> Result<bool> {
+        let mut busy = false;
+        if let Some(up) = self.upstream.as_mut() {
+            // The ingest server sends acknowledgements and pings; ignoring
+            // them stalls the connection once the window fills.
+            busy |= service_upstream(up, self.key, &mut self.meter, &mut self.buf)?;
+            // Drained every pass rather than at the point of each write, so
+            // a momentarily full send buffer costs a millisecond instead of
+            // ending the session.
+            up.out
+                .pump(&mut up.socket)
+                .context("writing to the ingest server")?;
+            busy |= up.out.pending() > 0;
+        }
+        if self.last_report.elapsed() >= Duration::from_secs(5) {
+            self.last_report = Instant::now();
+            self.report(self.queued())?;
+        }
+        Ok(busy)
+    }
+
+    fn queued(&self) -> usize {
+        self.upstream.as_ref().map_or(0, |u| u.out.pending())
+    }
+
+    fn report(&mut self, queued: usize) -> Result<()> {
+        report(
+            &self.meter,
+            self.injector.as_ref(),
+            self.cli,
+            queued,
+            self.artnet,
+            self.osc.as_ref(),
+            &mut self.last_note,
+        )
+    }
+
+    /// The panel's view of this session.
+    fn view<'v>(&'v self, peer: &'v str, since: Instant) -> SessionView<'v> {
+        SessionView {
+            peer,
+            since,
+            publishing: self.upstream.as_ref().is_some_and(|u| u.publishing),
+            meter: &self.meter,
+            injector: self.injector.as_ref(),
+            queued: self.queued(),
+        }
+    }
+}
+
+/// A session fed by an RTMP publisher: the encoder connected to `--listen`.
 #[allow(clippy::too_many_arguments)]
-fn relay_one(
+fn session_listen(
     mut obs: TcpStream,
     cli: &Cli,
     carriers: &[Carrier],
@@ -759,23 +938,7 @@ fn relay_one(
     // Still blocking at this point, so this cannot short-write.
     obs_out.pump(&mut obs)?;
 
-    let mut injector = (!cli.passthrough)
-        .then(|| {
-            Injector::new(&InjectOptions {
-                carriers: carriers.to_vec(),
-                every_n_frames: cli.every,
-                payload_len: cli.payload_len,
-                keyframes_only: false,
-            })
-        })
-        .transpose()?;
-
-    let mut upstream: Option<Upstream> = None;
-    let mut meter = RateMeter::new();
-    let mut last_report = Instant::now();
-    // The note under the status line is printed when it changes, not with
-    // every line: a desk sending the same way for an hour is said once.
-    let mut last_note: Option<String> = None;
+    let mut onward = Onward::new(cli, carriers, artnet, osc, key)?;
     let mut buf = vec![0u8; 32 * 1024];
     let mut heard = Instant::now();
     obs.set_nonblocking(true)?;
@@ -785,17 +948,7 @@ fn relay_one(
 
         // Drain anything already queued from the handshake bytes.
         for event in events.drain(..) {
-            handle_publisher_event(
-                event,
-                &mut server,
-                &mut obs_out,
-                &mut upstream,
-                &mut injector,
-                &mut meter,
-                cli,
-                artnet,
-                osc,
-            )?;
+            publisher_event(event, &mut server, &mut obs_out, &mut onward)?;
         }
 
         match obs.read(&mut buf) {
@@ -815,17 +968,7 @@ fn relay_one(
                             obs_out.push(&p.bytes);
                         }
                         ServerSessionResult::RaisedEvent(e) => {
-                            handle_publisher_event(
-                                e,
-                                &mut server,
-                                &mut obs_out,
-                                &mut upstream,
-                                &mut injector,
-                                &mut meter,
-                                cli,
-                                artnet,
-                                osc,
-                            )?;
+                            publisher_event(e, &mut server, &mut obs_out, &mut onward)?;
                         }
                         ServerSessionResult::UnhandleableMessageReceived(_) => {}
                     }
@@ -839,112 +982,16 @@ fn relay_one(
             Err(e) => return Err(e).context("reading from publisher"),
         }
 
-        // the ingest server sends acknowledgements and pings; ignoring them stalls the
-        // connection once the window fills.
-        if let Some(up) = upstream.as_mut() {
-            match up.socket.read(&mut buf) {
-                Ok(0) => bail!("the ingest server closed the connection"),
-                Ok(n) => {
-                    idle = false;
-                    let results = up
-                        .session
-                        .handle_input(&buf[..n])
-                        .map_err(|e| anyhow!("client handle_input: {e:?}"))?;
-                    let mut just_accepted = false;
-                    for r in results {
-                        match r {
-                            ClientSessionResult::OutboundResponse(p) => {
-                                up.out.push(&p.bytes);
-                            }
-                            ClientSessionResult::RaisedEvent(e) => match e {
-                                ClientSessionEvent::ConnectionRequestAccepted => {
-                                    let res = up
-                                        .session
-                                        .request_publishing(
-                                            key.ok_or_else(|| anyhow!("no stream key resolved"))?
-                                                .expose()
-                                                .to_owned(),
-                                            PublishRequestType::Live,
-                                        )
-                                        .map_err(|e| anyhow!("request_publishing: {e:?}"))?;
-                                    queue_client(&mut up.out, res);
-                                }
-                                ClientSessionEvent::ConnectionRequestRejected { description } => {
-                                    bail!(
-                                        "the ingest server rejected the connection: {description}"
-                                    );
-                                }
-                                ClientSessionEvent::PublishRequestAccepted => {
-                                    console::event("ingest accepted the publish");
-                                    up.publishing = true;
-                                    just_accepted = true;
-                                }
-                                ClientSessionEvent::UnhandleableOnStatusCode { code } => {
-                                    // BadAuth here usually does not mean the key
-                                    // is wrong. an ingest commonly rejects a second publish
-                                    // while it still considers the previous one
-                                    // connected, which is what you hit
-                                    // reconnecting straight after a run.
-                                    if code.contains("BadAuth") || code.contains("BadName") {
-                                        bail!(
-                                            "the ingest server refused the publish ({code}). If the key is                                              right, the previous session is probably still                                              connected: wait for the stream to drop, or press                                              Disconnect in the control panel."
-                                        );
-                                    }
-                                    console::event(format!("ingest status: {code}"));
-                                }
-                                _ => {}
-                            },
-                            ClientSessionResult::UnhandleableMessageReceived(_) => {}
-                        }
-                    }
-                    if just_accepted {
-                        flush_pending(up, &mut meter)?;
-                    }
-                }
-                Err(ref e) if e.kind() == ErrorKind::WouldBlock => {}
-                Err(e) => return Err(e).context("reading from the ingest server"),
-            }
-        }
-
-        // Drain whatever the sockets will take. Doing this every pass, rather
-        // than at the point of each write, is what lets a momentarily full
-        // send buffer cost a millisecond instead of ending the session.
         obs_out.pump(&mut obs).context("writing to publisher")?;
-        if let Some(up) = upstream.as_mut() {
-            up.out
-                .pump(&mut up.socket)
-                .context("writing to the ingest server")?;
-            if up.out.pending() > 0 {
-                idle = false;
-            }
-        }
-
-        if last_report.elapsed() >= Duration::from_secs(5) {
-            last_report = Instant::now();
-            let queued = upstream.as_ref().map_or(0, |u| u.out.pending());
-            report(
-                &meter,
-                injector.as_ref(),
-                cli,
-                queued,
-                artnet,
-                osc.as_ref(),
-                &mut last_note,
-            )?;
+        if onward.pass()? {
+            idle = false;
         }
 
         dash.tick(
             cli,
-            Some(SessionView {
-                peer,
-                since: started,
-                publishing: upstream.as_ref().is_some_and(|u| u.publishing),
-                meter: &meter,
-                injector: injector.as_ref(),
-                queued: upstream.as_ref().map_or(0, |u| u.out.pending()),
-            }),
+            Some(onward.view(peer, started)),
             artnet,
-            osc.as_ref(),
+            onward.osc.as_ref(),
         );
 
         if idle {
@@ -952,29 +999,16 @@ fn relay_one(
         }
     }
 
-    report(
-        &meter,
-        injector.as_ref(),
-        cli,
-        0,
-        artnet,
-        osc.as_ref(),
-        &mut last_note,
-    )?;
-    Ok(())
+    onward.report(0)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn handle_publisher_event(
+/// Act on one event from the publisher's RTMP session: accept its requests,
+/// dial the ingest when it asks to publish, and hand its A/V onward.
+fn publisher_event(
     event: ServerSessionEvent,
     server: &mut ServerSession,
     obs_out: &mut OutBuf,
-    upstream: &mut Option<Upstream>,
-    injector: &mut Option<Injector>,
-    meter: &mut RateMeter,
-    cli: &Cli,
-    artnet: Option<&artnet::Receiver>,
-    osc: &mut Option<osc::Sender>,
+    onward: &mut Onward,
 ) -> Result<()> {
     match event {
         ServerSessionEvent::ConnectionRequested { request_id, .. } => {
@@ -1003,69 +1037,20 @@ fn handle_publisher_event(
                 .accept_request(request_id)
                 .map_err(|e| anyhow!("accept_request: {e:?}"))?;
             queue_server(obs_out, results);
-            if upstream.is_none() {
-                *upstream = Some(connect_upstream(cli)?);
-            }
+            onward.connect()?;
         }
         ServerSessionEvent::StreamMetadataChanged { metadata, .. } => {
-            if let Some(up) = upstream.as_mut() {
-                forward_metadata(up, &metadata)?;
-            }
+            onward.metadata(&metadata)?;
         }
         ServerSessionEvent::VideoDataReceived {
             data, timestamp, ..
         } => {
-            let payload = match injector.as_mut() {
-                Some(inj) => {
-                    if matches!(truss::flv::video(&data), truss::flv::Video::Config { .. }) {
-                        inj.note_sequence_header(&data)?;
-                        data
-                    } else {
-                        let dmx = artnet.map(|a| {
-                            let blocks = a.latch().snapshot(Instant::now(), cli.artnet_max_payload);
-                            truss::payload::encode(&blocks)
-                        });
-                        // Three states, and collapsing any two of them is wrong.
-                        // No Art-Net at all means inject the sequence-derived
-                        // body a measurement run wants. A lane that failed to
-                        // encode must skip the frame instead: passing None there
-                        // would put that test body on the wire mid-show.
-                        //
-                        // --artnet-max-payload is checked against the record
-                        // limit at startup and snapshot honours it strictly, so
-                        // the failing arm is unreachable today. It is written out
-                        // because the cost of getting it wrong is a show carrying
-                        // probe data instead of its lighting.
-                        let rewritten = match dmx {
-                            Some(Ok(bytes)) => {
-                                let now = now_unix_nanos();
-                                let rewritten = inj.inject_tag_with(&data, now, Some(&bytes))?;
-                                // The lane carries the payload the stream carries,
-                                // so a frame the injector left alone gets no record.
-                                if rewritten.is_some()
-                                    && let Some(o) = osc.as_mut()
-                                {
-                                    o.send(&bytes, now);
-                                }
-                                rewritten
-                            }
-                            Some(Err(_)) => None,
-                            None => inj.inject_tag_with(&data, now_unix_nanos(), None)?,
-                        };
-                        match rewritten {
-                            Some(rewritten) => Bytes::from(rewritten),
-                            None => data,
-                        }
-                    }
-                }
-                None => data,
-            };
-            forward_av(upstream, meter, true, payload, timestamp)?;
+            onward.video(data, timestamp)?;
         }
         ServerSessionEvent::AudioDataReceived {
             data, timestamp, ..
         } => {
-            forward_av(upstream, meter, false, data, timestamp)?;
+            onward.audio(data, timestamp)?;
         }
         ServerSessionEvent::PublishStreamFinished { .. } => {
             console::event("publisher stopped");
@@ -1073,6 +1058,76 @@ fn handle_publisher_event(
         _ => {}
     }
     Ok(())
+}
+
+/// Read and act on whatever the ingest server has sent. Returns whether
+/// anything arrived.
+fn service_upstream(
+    up: &mut Upstream,
+    key: Option<&creds::StreamKey>,
+    meter: &mut RateMeter,
+    buf: &mut [u8],
+) -> Result<bool> {
+    let n = match up.socket.read(buf) {
+        Ok(0) => bail!("the ingest server closed the connection"),
+        Ok(n) => n,
+        Err(ref e) if e.kind() == ErrorKind::WouldBlock => return Ok(false),
+        Err(e) => return Err(e).context("reading from the ingest server"),
+    };
+    let results = up
+        .session
+        .handle_input(&buf[..n])
+        .map_err(|e| anyhow!("client handle_input: {e:?}"))?;
+    let mut just_accepted = false;
+    for r in results {
+        match r {
+            ClientSessionResult::OutboundResponse(p) => {
+                up.out.push(&p.bytes);
+            }
+            ClientSessionResult::RaisedEvent(e) => match e {
+                ClientSessionEvent::ConnectionRequestAccepted => {
+                    let res = up
+                        .session
+                        .request_publishing(
+                            key.ok_or_else(|| anyhow!("no stream key resolved"))?
+                                .expose()
+                                .to_owned(),
+                            PublishRequestType::Live,
+                        )
+                        .map_err(|e| anyhow!("request_publishing: {e:?}"))?;
+                    queue_client(&mut up.out, res);
+                }
+                ClientSessionEvent::ConnectionRequestRejected { description } => {
+                    bail!("the ingest server rejected the connection: {description}");
+                }
+                ClientSessionEvent::PublishRequestAccepted => {
+                    console::event("ingest accepted the publish");
+                    up.publishing = true;
+                    just_accepted = true;
+                }
+                ClientSessionEvent::UnhandleableOnStatusCode { code } => {
+                    // BadAuth here usually does not mean the key is wrong. An
+                    // ingest commonly rejects a second publish while it still
+                    // considers the previous one connected, which is what you
+                    // hit reconnecting straight after a run.
+                    if code.contains("BadAuth") || code.contains("BadName") {
+                        bail!(
+                            "the ingest server refused the publish ({code}). If the key is \
+                             right, the previous session is probably still connected: wait \
+                             for the stream to drop, or press Disconnect in the control panel."
+                        );
+                    }
+                    console::event(format!("ingest status: {code}"));
+                }
+                _ => {}
+            },
+            ClientSessionResult::UnhandleableMessageReceived(_) => {}
+        }
+    }
+    if just_accepted {
+        flush_pending(up, meter)?;
+    }
+    Ok(true)
 }
 
 fn forward_av(
@@ -1576,7 +1631,7 @@ mod tests {
     fn run_session(relay: TcpStream, idle_timeout: Duration) -> Result<()> {
         let cli = passthrough_cli();
         let carriers = parse_carriers(&cli.carriers).unwrap();
-        relay_one(
+        session_listen(
             relay,
             &cli,
             &carriers,
