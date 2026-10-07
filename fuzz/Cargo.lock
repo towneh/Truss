@@ -1474,13 +1474,17 @@ dependencies = [
  "clap",
  "crc32fast",
  "crossterm",
+ "futures",
+ "h264-reader",
  "if-addrs",
  "retina",
  "rml_rtmp",
  "serde",
  "serde_json",
  "socket2",
+ "tokio",
  "ureq",
+ "url",
 ]
 
 [[package]]

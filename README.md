@@ -174,6 +174,36 @@ included; `--show-logging` gives scrolling lines instead. Over RTSP it sees
 video only when nothing else on this machine is already reading the stream, so
 close other readers first.
 
+## Pulling from RTSP
+
+```sh
+truss-relay \
+  --source rtsp://stream.example.net/live/channel \
+  --publish rtmp://ingest.example.net/live \
+  --stream-key-file /run/credentials/truss/key \
+  --artnet
+```
+
+`--source` takes the place of `--listen`. Instead of waiting for an encoder,
+the relay pulls an RTSP stream, plants the records and publishes it on. It is
+for a stream that can only be reached as RTSP, such as a CDN's egress, and for
+streams you run or have permission to carry. RTP runs over the RTSP
+connection, so no UDP ports are needed; `rtspt://` is accepted and means the
+same.
+
+The source needs H.264 video. AAC audio is carried, and any other audio is left
+out with a warning. A source that asks for a user and password is not supported
+yet, and nor is one that already carries records: re-relaying a relayed stream
+would give it two sets.
+
+The publish starts 5 to 10 seconds after the relay connects. It waits for two
+of the source's sender reports in a row to agree, so the audio and video it
+publishes are in step, and then for a keyframe. A server can begin a session
+with a report that is seconds out, as VRCDN does when a pull starts soon after
+the last one ended, and waiting for the next one costs another 5 seconds. The
+panel says which wait it is in. When the source ends, the relay stops; it does
+not reconnect yet.
+
 ## Watching the desk with nothing else running
 
 The relay can send every record it builds to an OSC listener as well as into

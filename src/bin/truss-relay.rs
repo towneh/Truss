@@ -35,6 +35,8 @@ use truss::creds;
 use truss::inject::{InjectOptions, Injector};
 use truss::osc;
 use truss::payload;
+use truss::pull::timing::{AUDIO, DtsWindow, Rebase, VIDEO};
+use truss::pull::{self, SourceEvent, SourceState};
 use truss::record::{DEFAULT_PAYLOAD_LEN, MAX_PAYLOAD_LEN};
 use truss::relay::{Ingest, OutBuf, RateMeter};
 
@@ -44,9 +46,23 @@ use truss::relay::{Ingest, OutBuf, RateMeter};
     about = "Relay RTMP, planting DMX in the video on the way through"
 )]
 struct Cli {
-    /// Address to accept the encoder on. Point it at rtmp://<this>/live with any key.
-    #[arg(long, default_value = "127.0.0.1:1935", requires = "publish")]
-    listen: String,
+    /// Address to accept the encoder on, 127.0.0.1:1935 unless given. Point
+    /// the encoder at rtmp://<this>/live with any key.
+    #[arg(long, requires = "publish", value_name = "ADDRESS")]
+    listen: Option<String>,
+    /// Pull the video from this RTSP source instead of accepting an encoder:
+    /// rtsp://host/path, with the port after the host when it is not 554.
+    /// The publish starts once the source's audio and video are lined up and
+    /// a keyframe arrives, 5 to 10 seconds in.
+    #[arg(
+        long,
+        requires = "publish",
+        conflicts_with = "listen",
+        value_name = "URL"
+    )]
+    source: Option<String>,
+    #[arg(skip)]
+    pull: Option<pull::Spec>,
     /// Where to publish the stream: rtmp://host/app, with the port after the
     /// host when it is not 1935, and "live" when no application is given.
     /// The stream key is never part of this: see --stream-key-file.
@@ -123,6 +139,13 @@ struct Cli {
 
 const DEFAULT_ARTNET_MAX_PAYLOAD: usize = 9216;
 const DEFAULT_CARRIERS: &str = "sei-unreg";
+const DEFAULT_LISTEN: &str = "127.0.0.1:1935";
+
+impl Cli {
+    fn listen(&self) -> &str {
+        self.listen.as_deref().unwrap_or(DEFAULT_LISTEN)
+    }
+}
 
 fn now_unix_nanos() -> u64 {
     SystemTime::now()
@@ -150,6 +173,9 @@ fn main() -> Result<()> {
     let mut cli = Cli::parse();
     if let Some(publish) = cli.publish.as_deref() {
         cli.target = Ingest::parse(publish)?;
+    }
+    if let Some(source) = cli.source.as_deref() {
+        cli.pull = Some(pull::Spec::parse(source)?);
     }
     let carriers = parse_carriers(&cli.carriers)?;
 
@@ -214,18 +240,24 @@ fn main() -> Result<()> {
         None => None,
     };
 
-    let listener = match cli.publish {
-        Some(_) => {
-            let listener = TcpListener::bind(&cli.listen)
-                .with_context(|| format!("binding {}", cli.listen))?;
+    let listener = match (&cli.publish, &cli.pull) {
+        (Some(_), Some(spec)) => {
+            println!("relay pulling from {}", spec.display());
+            println!("  forwarding to {} (key hidden)", cli.target.url());
+            None
+        }
+        (Some(_), None) => {
+            let listener = TcpListener::bind(cli.listen())
+                .with_context(|| format!("binding {}", cli.listen()))?;
             println!(
                 "relay listening on rtmp://{}/{}  (point the encoder here, any stream key)",
-                cli.listen, cli.target.app
+                cli.listen(),
+                cli.target.app
             );
             println!("  forwarding to {} (key hidden)", cli.target.url());
             Some(listener)
         }
-        None => {
+        (None, _) => {
             println!("relay running the OSC lane only: no encoder accepted, nothing published");
             None
         }
@@ -277,6 +309,20 @@ fn main() -> Result<()> {
     let mut dash = Dashboard::default();
     let mut idle = IdleStatus::default();
     let mut next_tick = Instant::now();
+
+    if let Some(spec) = cli.pull.clone() {
+        console::log("");
+        console::event(format!("-- pulling from {}", spec.display()));
+        return session_pull(
+            spec,
+            &cli,
+            &carriers,
+            artnet.as_ref(),
+            &mut osc,
+            key.as_ref(),
+            &mut dash,
+        );
+    }
 
     let Some(listener) = listener else {
         // --osc is required without --publish, and needs --artnet, both
@@ -453,8 +499,9 @@ impl IdleStatus {
     }
 }
 
-/// What a connected publisher's session shows on the panel.
+/// What a session shows on the panel.
 struct SessionView<'a> {
+    /// The publisher's address, or the source's state when pulling.
     peer: &'a str,
     since: Instant,
     publishing: bool,
@@ -548,14 +595,21 @@ impl Dashboard {
         )];
 
         if cli.publish.is_some() {
-            let listen = format!("rtmp://{}/{}", cli.listen, cli.target.app);
-            lines.push(match session {
-                Some(s) => format!(
+            let listen = format!("rtmp://{}/{}", cli.listen(), cli.target.app);
+            lines.push(match (&cli.pull, session) {
+                (Some(spec), Some(s)) => format!(
+                    "source    {}   {} for {}",
+                    spec.display(),
+                    s.peer,
+                    console::clock(s.since.elapsed())
+                ),
+                (Some(spec), None) => format!("source    {}   starting", spec.display()),
+                (None, Some(s)) => format!(
                     "encoder   {listen}   connected from {} for {}",
                     s.peer,
                     console::clock(s.since.elapsed())
                 ),
-                None => format!("encoder   {listen}   waiting for a publisher"),
+                (None, None) => format!("encoder   {listen}   waiting for a publisher"),
             });
             lines.push(format!(
                 "ingest    {}   {}",
@@ -1006,6 +1060,146 @@ fn session_listen(
     }
 
     onward.report(0)
+}
+
+/// A session fed by the RTSP source named in `--source`. It ends when the
+/// source does.
+#[allow(clippy::too_many_arguments)]
+fn session_pull(
+    spec: pull::Spec,
+    cli: &Cli,
+    carriers: &[Carrier],
+    artnet: Option<&artnet::Receiver>,
+    osc: &mut Option<osc::Sender>,
+    key: Option<&creds::StreamKey>,
+    dash: &mut Dashboard,
+) -> Result<()> {
+    let started = Instant::now();
+    let mut source = pull::spawn(spec).context("starting the source thread")?;
+    let mut onward = Onward::new(cli, carriers, artnet, osc, key)?;
+    let mut state = SourceState::Connecting;
+    let mut dts: Option<DtsWindow> = None;
+    let mut rebase = Rebase::default();
+    // The relay writes the onMetaData an encoder would have sent, from what
+    // the source's parameters say.
+    let mut metadata = StreamMetadata::new();
+    metadata.encoder = Some("truss-relay".into());
+
+    loop {
+        let mut idle = true;
+        loop {
+            let event = match source.try_recv() {
+                Ok(event) => event,
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                    bail!("the source thread stopped")
+                }
+            };
+            idle = false;
+            match event {
+                SourceEvent::State(s) => {
+                    console::event(format!("source {}", s.describe()));
+                    state = s;
+                }
+                SourceEvent::Note(note) => console::event(format!("source: {note}")),
+                SourceEvent::Video {
+                    avcc,
+                    width,
+                    height,
+                    fps,
+                } => {
+                    if dts.is_none() {
+                        let depth = pull::timing::reorder_depth(&avcc);
+                        let frame_us = fps
+                            .filter(|f| *f > 0.0)
+                            .map_or(33_333, |f| (1e6 / f) as i64);
+                        console::log(format!(
+                            "source video {width}x{height}, {}",
+                            match depth {
+                                Some(0) => "no reordering".to_string(),
+                                Some(d) => format!("reorders up to {d} frames"),
+                                None => "reorder depth learnt as frames arrive".to_string(),
+                            }
+                        ));
+                        dts = Some(DtsWindow::new(depth.unwrap_or(0), frame_us));
+                    }
+                    metadata.video_width = Some(width);
+                    metadata.video_height = Some(height);
+                    metadata.video_codec_id = Some(7);
+                    metadata.video_frame_rate = fps.map(|f| f as f32);
+                    onward.connect()?;
+                    onward.metadata(&metadata)?;
+                    onward.video(
+                        Bytes::from(truss::flv::avc_sequence_header(&avcc)),
+                        RtmpTimestamp::new(rebase.last(VIDEO)),
+                    )?;
+                }
+                SourceEvent::Audio {
+                    asc,
+                    sample_rate,
+                    channels,
+                } => {
+                    metadata.audio_codec_id = Some(10);
+                    metadata.audio_sample_rate = Some(sample_rate);
+                    metadata.audio_channels = Some(u32::from(channels));
+                    metadata.audio_is_stereo = Some(channels == 2);
+                    onward.connect()?;
+                    onward.metadata(&metadata)?;
+                    onward.audio(
+                        Bytes::from(truss::flv::aac_sequence_header(&asc)),
+                        RtmpTimestamp::new(rebase.last(AUDIO)),
+                    )?;
+                }
+                SourceEvent::VideoFrame { data, pts_us, key } => {
+                    let Some(window) = dts.as_mut() else {
+                        bail!("the source sent video before its parameters");
+                    };
+                    let (decode_us, grew) = window.next(pts_us);
+                    if grew {
+                        console::log(format!(
+                            "source reorders frames: decode delay now {} frames",
+                            window.depth()
+                        ));
+                    }
+                    let held = rebase.held;
+                    let out = rebase.place(VIDEO, decode_us);
+                    if rebase.held > held && rebase.held.is_power_of_two() {
+                        console::event(format!(
+                            "source timestamps went back; {} frames held so far",
+                            rebase.held
+                        ));
+                    }
+                    let cts = i64::from(rebase.ms(pts_us)) - i64::from(out);
+                    let tag = truss::flv::avc_frame(key, cts as i32, &data)?;
+                    onward.video(Bytes::from(tag), RtmpTimestamp::new(out))?;
+                }
+                SourceEvent::AudioFrame { data, pts_us } => {
+                    let out = rebase.place(AUDIO, pts_us);
+                    onward.audio(
+                        Bytes::from(truss::flv::aac_frame(&data)),
+                        RtmpTimestamp::new(out),
+                    )?;
+                }
+                SourceEvent::Lost(why) => {
+                    onward.report(0)?;
+                    bail!("{why}");
+                }
+            }
+        }
+
+        if onward.pass()? {
+            idle = false;
+        }
+        dash.tick(
+            cli,
+            Some(onward.view(state.describe(), started)),
+            artnet,
+            onward.osc.as_ref(),
+        );
+        if idle {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
 }
 
 /// Act on one event from the publisher's RTMP session: accept its requests,

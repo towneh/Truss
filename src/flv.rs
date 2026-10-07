@@ -271,9 +271,95 @@ pub fn nal_length_size(codec: VideoCodec, config: &[u8]) -> Result<usize> {
     Ok(((byte & 0x03) + 1) as usize)
 }
 
+/// FLV's SoundFormat for AAC with the rate, size and channel bits set as the
+/// spec says to for AAC, whatever the stream: decoders read the
+/// AudioSpecificConfig instead.
+const AAC_SOUND_FLAGS: u8 = 0xAF;
+
+/// An H.264 sequence header as a video tag payload, wrapping an
+/// AVCDecoderConfigurationRecord.
+pub fn avc_sequence_header(avcc: &[u8]) -> Vec<u8> {
+    let mut out = vec![0x17, AVC_SEQUENCE_HEADER, 0, 0, 0];
+    out.extend_from_slice(avcc);
+    out
+}
+
+/// One H.264 access unit as a video tag payload. `nals` are length-prefixed
+/// as the stream's sequence header declares, and `cts_ms` is presentation
+/// minus decode time, which the tag carries as a signed 24-bit field.
+pub fn avc_frame(keyframe: bool, cts_ms: i32, nals: &[u8]) -> Result<Vec<u8>> {
+    if !(-0x80_0000..0x80_0000).contains(&cts_ms) {
+        bail!("composition time {cts_ms} ms does not fit the tag's 24-bit field");
+    }
+    let mut out = vec![if keyframe { 0x17 } else { 0x27 }, AVC_NALU];
+    out.extend_from_slice(&cts_ms.to_be_bytes()[1..]);
+    out.extend_from_slice(nals);
+    Ok(out)
+}
+
+/// An AAC sequence header as an audio tag payload, wrapping an
+/// AudioSpecificConfig.
+pub fn aac_sequence_header(asc: &[u8]) -> Vec<u8> {
+    let mut out = vec![AAC_SOUND_FLAGS, 0];
+    out.extend_from_slice(asc);
+    out
+}
+
+/// One raw AAC frame as an audio tag payload.
+pub fn aac_frame(raw: &[u8]) -> Vec<u8> {
+    let mut out = vec![AAC_SOUND_FLAGS, 1];
+    out.extend_from_slice(raw);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn built_video_tags_read_back_as_what_they_were_built_from() {
+        let avcc = [1, 0x42, 0xC0, 0x1F, 0xFF, 0xE1];
+        let header = avc_sequence_header(&avcc);
+        assert_eq!(
+            video(&header),
+            Video::Config {
+                codec: VideoCodec::H264,
+                body: 5
+            }
+        );
+        assert_eq!(&header[5..], &avcc);
+
+        let nals = [0, 0, 0, 2, 0x65, 0xAA];
+        for (key, cts) in [(true, 0), (false, 67), (false, -33)] {
+            let frame = avc_frame(key, cts, &nals).unwrap();
+            assert_eq!(
+                video(&frame),
+                Video::Frame {
+                    codec: VideoCodec::H264,
+                    keyframe: key,
+                    body: 5
+                }
+            );
+            let field = i32::from_be_bytes([0, frame[2], frame[3], frame[4]]);
+            let read = (field << 8) >> 8;
+            assert_eq!(read, cts);
+            assert_eq!(&frame[5..], &nals);
+        }
+    }
+
+    #[test]
+    fn a_composition_time_past_24_bits_is_refused() {
+        assert!(avc_frame(false, 0x7F_FFFF, &[]).is_ok());
+        assert!(avc_frame(false, -0x80_0000, &[]).is_ok());
+        assert!(avc_frame(false, 0x80_0000, &[]).is_err());
+        assert!(avc_frame(false, -0x80_0001, &[]).is_err());
+    }
+
+    #[test]
+    fn audio_tags_carry_aac_and_their_packet_type() {
+        assert_eq!(aac_sequence_header(&[0x11, 0x90]), [0xAF, 0, 0x11, 0x90]);
+        assert_eq!(aac_frame(&[1, 2, 3]), [0xAF, 1, 1, 2, 3]);
+    }
 
     fn build(tags: &[Tag]) -> Vec<u8> {
         let mut header = b"FLV".to_vec();
