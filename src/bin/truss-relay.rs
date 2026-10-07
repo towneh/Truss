@@ -167,15 +167,7 @@ fn main() -> Result<()> {
 
     // Resolved before the listener is bound. A missing key should fail while
     // the operator is still watching, not on the first frame of a show.
-    let key = if cli.passthrough || cli.publish.is_none() {
-        None
-    } else {
-        Some(creds::StreamKey::resolve(
-            cli.stream_key_file.as_deref(),
-            "truss",
-            &cli.target.authority,
-        )?)
-    };
+    let key = stream_key(&cli)?;
 
     // Bound once for the life of the relay rather than per session: a desk
     // keeps sending across an OBS reconnect, and rebinding would drop the
@@ -357,6 +349,20 @@ fn main() -> Result<()> {
         }
         idle = IdleStatus::default();
     }
+}
+
+/// The key to publish with, whenever there is a publish: passthrough leaves
+/// the stream alone but still has to be let in by the ingest.
+fn stream_key(cli: &Cli) -> Result<Option<creds::StreamKey>> {
+    if cli.publish.is_none() {
+        return Ok(None);
+    }
+    creds::StreamKey::resolve(
+        cli.stream_key_file.as_deref(),
+        "truss",
+        &cli.target.authority,
+    )
+    .map(Some)
 }
 
 /// One pass over the Art-Net lane while no publisher is connected: the status
@@ -1700,6 +1706,32 @@ mod tests {
             "ended after {:?}, before the publisher did",
             started.elapsed()
         );
+    }
+
+    #[test]
+    fn passthrough_still_resolves_the_key_it_publishes_with() {
+        let path = std::env::temp_dir().join(format!("truss-relay-key-{}", std::process::id()));
+        std::fs::write(&path, "abc123\n").unwrap();
+        let mut cli = Cli::try_parse_from([
+            "truss-relay",
+            "--publish",
+            "rtmp://127.0.0.1:9/live",
+            "--passthrough",
+            "--stream-key-file",
+            path.to_str().unwrap(),
+        ])
+        .unwrap();
+        cli.target = Ingest::parse(cli.publish.as_deref().unwrap()).unwrap();
+        let key = stream_key(&cli);
+        std::fs::remove_file(&path).unwrap();
+        assert!(key.unwrap().is_some());
+    }
+
+    #[test]
+    fn the_osc_lane_alone_needs_no_key() {
+        let cli =
+            Cli::try_parse_from(["truss-relay", "--artnet", "--osc", "127.0.0.1:12100"]).unwrap();
+        assert!(stream_key(&cli).unwrap().is_none());
     }
 
     fn injector_with_oversize(skipped: u64) -> Injector {
