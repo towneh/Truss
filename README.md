@@ -2,9 +2,9 @@
 
 DMX lighting control carried inside a live video stream, as H.264 or HEVC SEI user data.
 
-Truss takes the Art-Net from a lighting desk and packs it into the video
-as that passes through an RTMP relay. The DMX then travels inside each access
-unit, through the ingest and the CDN to every viewer, locked to the picture.
+Truss takes the Art-Net from a lighting desk and packs it into the video as
+it passes through a relay. The DMX then travels inside each access unit,
+through the ingest and the CDN to every viewer, locked to the picture.
 
 It goes into the SEI, the part of each access unit set aside for extra data,
 which decoders pass over when they draw the frame. The picture reaches viewers
@@ -27,10 +27,8 @@ Truss defines, set out in [docs/format.md](docs/format.md).
 
 ## Will it work on your path
 
-SEI survives a remux and does not survive a transcode. A CDN that repackages
-the stream carries it; one that re-encodes strips it out entirely, and gives no
-warning when it does. The video still plays and the lighting data never
-arrives.
+SEI survives a remux and not a transcode. A CDN that re-encodes strips it out
+with no warning: the video still plays and the lighting data never arrives.
 
 Check your own path before anything else:
 
@@ -88,7 +86,7 @@ nothing about whether the lighting is right.
 
 | Option | Default | Effect |
 | --- | --- | --- |
-| `--carriers` | `sei-unreg,sei-t35` | Carriers to write. The default writes each record twice, once in each SEI type; the relay sends `sei-unreg` only |
+| `--carriers` | `sei-unreg,sei-t35` | Carriers to write. The default writes each record twice, once in each SEI type; the relay's default is `sei-unreg` alone |
 | `--payload-len` | 24 | Payload bytes per record, on top of 32 bytes of record framing |
 | `--every N` | 1 | Write a record on every Nth video frame |
 | `--keyframes-only` | off | Write records on keyframes only |
@@ -120,8 +118,8 @@ seconds is dropped and the slot freed.
 
 When the upload to the ingest falls behind, by about half a second of stream,
 the relay stops reading from the encoder until it catches up. The encoder then
-drops frames or lowers its bitrate, as it would publishing directly, rather
-than the relay queueing more and more behind it.
+drops frames or lowers its bitrate, as it would publishing directly, instead of
+a backlog growing in the relay.
 
 The encoder can send H.264 or HEVC; OBS sends HEVC over Enhanced RTMP from
 version 29.1. Any other codec passes through the relay untouched, with no
@@ -141,8 +139,8 @@ has heard (universe 0 before any), so a desk that searches by universe finds it
 too. A reply names up to four universes from one sub-net and a poll gets eight
 replies at most, so that is 32 when the universes share sub-nets and fewer when
 they are spread out. Until DMX arrives the relay shows which controller found
-the node, which tells a desk that has not been patched apart from one that is
-not there.
+the node, so a desk that has not been patched can be told from one that is not
+there.
 
 `--artnet` on its own listens on every adapter. `--artnet 192.168.1.20` listens
 on that adapter only and tells every desk to use that address; add `:port` when
@@ -164,20 +162,18 @@ event instead.
 
 `truss-dmxmon` shows what a receiver would decode: values rather than counts.
 A stream can deliver every record intact and still carry a snapshot that never
-changes. That is a dead show, and it passes every other test.
+changes, and every other test passes it.
 
 ```sh
 truss-dmxmon rtsp://your-egress/live/stream --universe 0
 ```
 
 `--universe` prints that universe as a grid. `--watch 0.1-16` prints only the
-channels named, and only when they change, which is the quicker way to see
-whether one fixture is moving; slots are numbered from 1, as on a desk. It
-reads the same sources as `truss-detect`. On a live source at a terminal it
-redraws one panel in place, the grid and the watched channels' current values
-included; `--show-logging` gives scrolling lines instead. Over RTSP it sees
-video only when nothing else on this machine is already reading the stream, so
-close other readers first.
+channels named, when they change, which is the quicker way to see whether one
+fixture is moving; slots are numbered from 1, as on a desk. It reads the same
+sources as `truss-detect`. At a terminal it redraws in place; `--show-logging`
+scrolls instead. Over RTSP it sees video only when nothing else on this machine
+is reading the stream, so close other readers first.
 
 ## Pulling from RTSP
 
@@ -221,8 +217,8 @@ truss-dmxmon osc:// --universe 0
 ```
 
 Each record goes out as one OSC message, `/truss/dmx`, with the record as its
-blob argument, carrying the same payload as the stream's. While a publisher is
-connected the lane runs at the video's frame rate; with none it runs at
+blob argument, carrying the same payload as the stream's. While a stream is
+being relayed the lane runs at the video's frame rate; with none it runs at
 `--osc-rate`, 30 a second by default. The lane numbers its own records, so
 loss and order are scored on the lane rather than on the stream.
 
@@ -300,8 +296,9 @@ ExecStart=/usr/local/bin/truss-relay --publish rtmp://ingest.example.net/live \
 ## What arrives
 
 Values are absolute rather than deltas. A late or dropped frame is corrected by
-the next, and a client joining part way through a show is correct within one
-frame.
+the next carrying the same universe, and a client joining part way through a
+show is complete within one frame, or within one rotation when the patch is
+more than a frame carries.
 
 Each block carries its own age. Universes are latched as their packets arrive,
 and DMX at 44 Hz does not divide evenly into a frame grid, so a consumer needs
@@ -317,8 +314,7 @@ H.265 SEI, Art-Net 4, OSC 1.0 and others) are in [docs/format.md](docs/format.md
 
 ## Bitrate cost
 
-The lane shares a bitrate ceiling with the picture, so find out what a given
-patch costs before committing to it.
+The records share the stream's bitrate ceiling with the picture.
 
 A full snapshot is 8 bytes of header plus 522 for each universe: 512 channels
 and a 10-byte block header. At 30 frames per second, with every universe on
@@ -334,9 +330,8 @@ every frame:
 | 20 | 10,448 B | 2,508 kb/s | 40% |
 
 The ceiling in the last column is an example: 6,000 kb/s of video and 320 of
-audio, counted together. With your own ceiling the percentages change; the
-bitrates don't. At twenty universes on every frame the lane takes roughly two
-fifths of the ceiling, and the encoder has to be set for the rest. The relay's default
+audio, counted together. With your own the percentages change and the bitrates
+don't; set the encoder for what is left. The relay's default
 `--artnet-max-payload` of 9,216 bytes fits 17 universes in a frame, and more
 than that on every frame needs it raised.
 
@@ -353,8 +348,8 @@ for it. The cost comes down in two ways:
 - A lower `--artnet-max-payload` caps the bytes in each frame. Universes past
   the cap rotate onto later frames, and each one is refreshed less often.
 
-The relay also measures what actually leaves, averaged over five seconds,
-rather than relying on the arithmetic above. `--warn-kbps` warns when that
+The relay also measures what it publishes, averaged over five seconds, rather
+than relying on the arithmetic above. `--warn-kbps` warns when that
 average goes above a figure, 5,500 kb/s unless set, and `--abort-kbps` drops
 the session rather than let it go above another. Aborting is off unless asked
 for.
@@ -367,7 +362,7 @@ cargo test
 ```
 
 Rust 1.88 or newer. Windows and Linux are both supported, and CI builds and
-tests both. None of the code is platform-specific.
+tests both.
 
 Every parser here reads bytes it did not choose, so there is generative cover
 alongside the unit tests. The properties live in `truss::invariants`, and
@@ -383,17 +378,17 @@ cargo run --example seed-corpus
 cargo +nightly fuzz run ts_feed
 ```
 
-The seed corpus is built with the crate's own encoders, so a run starts inside
-the interesting code rather than working out what a sync byte is. A weekly job
-runs each target and keeps its corpus and any input that crashes it.
+The seed corpus comes from the crate's own encoders, so a run starts from
+valid streams. A weekly job runs each target and keeps its corpus and any input
+that crashes it.
 
 ## Status
 
 Across RTSP, MPEG-TS and RTMP egress on a remuxing CDN: no loss in steady
 state, no corruption, payloads up to 10,448 bytes per frame, a median
 end-to-end latency of around 112 ms, and 47,038 consecutive frames across half
-an hour without a gap. Live desk data has
-run the full path at twenty universes.
+an hour without a gap. Live desk data has run the full path at twenty
+universes.
 
 Discovery has been exercised against SoundSwitch on the relay's own machine,
 which lists the node and delivers both its universes with no address given. The
@@ -413,9 +408,13 @@ loss. With the uplink capped below the stream's bitrate, the relay held the
 encoder back and latency settled at about 3 seconds instead of climbing. Each
 of those is one run of under two minutes on loopback.
 
+Behind the relay, OBS drops frames much as it does publishing directly.
+Sending 4,000 kb/s over a link capped at 3 Mb/s, it dropped 48% of its frames
+through the relay and 59% straight to the link, and every record the relay
+sent arrived. At 2,500 kb/s it dropped none, and the relay never held it back.
+
 Nothing longer than a thirty-minute publish has been measured, nor a real
-degraded uplink, and OBS's own frame dropping behind the relay has not been
-watched yet.
+degraded uplink.
 
 ## Licence
 
