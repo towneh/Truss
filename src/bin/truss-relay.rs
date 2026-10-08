@@ -37,7 +37,7 @@ use truss::creds;
 use truss::inject::{InjectOptions, Injector};
 use truss::osc;
 use truss::payload;
-use truss::pull::timing::{AUDIO, DtsWindow, Rebase, VIDEO};
+use truss::pull::timing::{AUDIO, Timeline, VIDEO};
 use truss::pull::{self, SourceEvent, SourceState};
 use truss::record::{DEFAULT_PAYLOAD_LEN, MAX_PAYLOAD_LEN};
 use truss::recording::Recording;
@@ -1397,9 +1397,9 @@ fn session_pull(
     let mut source = pull::spawn(spec).context("starting the source thread")?;
     let mut onward = Onward::new(cli, carriers, artnet, osc, key)?;
     let mut state = SourceState::Connecting.describe();
-    let mut dts: Option<DtsWindow> = None;
-    let mut rebase = Rebase::default();
+    let mut timeline = Timeline::default();
     let mut records_said = false;
+    let mut dropped: u64 = 0;
     let mut codec = VideoCodec::H264;
     // The relay writes the onMetaData an encoder would have sent, from what
     // the source's parameters say.
@@ -1431,11 +1431,11 @@ fn session_pull(
                     fps,
                 } => {
                     codec = video_codec;
-                    if dts.is_none() {
-                        let depth = pull::timing::reorder_depth(codec, &config);
-                        let frame_us = fps
-                            .filter(|f| *f > 0.0)
-                            .map_or(33_333, |f| (1e6 / f) as i64);
+                    let depth = pull::timing::reorder_depth(codec, &config);
+                    let frame_us = fps
+                        .filter(|f| *f > 0.0)
+                        .map_or(33_333, |f| (1e6 / f) as i64);
+                    if timeline.video_parameters(depth, frame_us) {
                         console::log(format!(
                             "source video {} {width}x{height}, {}",
                             codec.name(),
@@ -1445,7 +1445,6 @@ fn session_pull(
                                 None => "reorder depth learnt as frames arrive".to_string(),
                             }
                         ));
-                        dts = Some(DtsWindow::new(depth.unwrap_or(0), frame_us));
                     }
                     metadata.video_width = Some(width);
                     metadata.video_height = Some(height);
@@ -1459,7 +1458,7 @@ fn session_pull(
                     onward.metadata(&metadata)?;
                     onward.video(
                         Bytes::from(truss::flv::video_sequence_header(codec, &config)),
-                        RtmpTimestamp::new(rebase.last(VIDEO)),
+                        RtmpTimestamp::new(timeline.last(VIDEO)),
                     )?;
                 }
                 SourceEvent::Audio {
@@ -1475,31 +1474,41 @@ fn session_pull(
                     onward.metadata(&metadata)?;
                     onward.audio(
                         Bytes::from(truss::flv::aac_sequence_header(&asc)),
-                        RtmpTimestamp::new(rebase.last(AUDIO)),
+                        RtmpTimestamp::new(timeline.last(AUDIO)),
                     )?;
                 }
                 SourceEvent::VideoFrame { data, pts_us, key } => {
-                    let Some(window) = dts.as_mut() else {
-                        bail!("the source sent video before its parameters");
+                    let held = timeline.held();
+                    // A frame the publish cannot express is dropped, not the
+                    // session: the source's next keyframe repairs the picture.
+                    let tag = match timeline.video_tag(codec, key, pts_us, &data, Instant::now()) {
+                        Ok(tag) => tag,
+                        Err(e) => {
+                            dropped += 1;
+                            if dropped.is_power_of_two() {
+                                console::event(format!(
+                                    "source video frame dropped, {dropped} so far: {e:#}"
+                                ));
+                            }
+                            continue;
+                        }
                     };
-                    let (decode_us, grew) = window.next(pts_us);
-                    if grew {
+                    if let Some(step) = tag.jump {
+                        say_jump("video", step);
+                    }
+                    if tag.grew {
                         console::log(format!(
                             "source reorders frames: decode delay now {} frames",
-                            window.depth()
+                            timeline.depth()
                         ));
                     }
-                    let held = rebase.held;
-                    let out = rebase.place(VIDEO, decode_us);
-                    if rebase.held > held && rebase.held.is_power_of_two() {
+                    if timeline.held() > held && timeline.held().is_power_of_two() {
                         console::event(format!(
                             "source timestamps went back; {} frames held so far",
-                            rebase.held
+                            timeline.held()
                         ));
                     }
-                    let cts = i64::from(rebase.ms(pts_us)) - i64::from(out);
-                    let tag = truss::flv::video_frame(codec, key, cts as i32, &data)?;
-                    onward.video(Bytes::from(tag), RtmpTimestamp::new(out))?;
+                    onward.video(Bytes::from(tag.data), RtmpTimestamp::new(tag.timestamp))?;
                     if !records_said
                         && let Some(note) =
                             onward.injector.as_ref().and_then(|i| records_note(i, cli))
@@ -1509,7 +1518,10 @@ fn session_pull(
                     }
                 }
                 SourceEvent::AudioFrame { data, pts_us } => {
-                    let out = rebase.place(AUDIO, pts_us);
+                    let (out, jump) = timeline.audio(pts_us, Instant::now());
+                    if let Some(step) = jump {
+                        say_jump("audio", step);
+                    }
                     onward.audio(
                         Bytes::from(truss::flv::aac_frame(&data)),
                         RtmpTimestamp::new(out),
@@ -1520,14 +1532,12 @@ fn session_pull(
                     // an ingest commonly refuses a second publish while it
                     // still counts the first, and viewers see a pause.
                     console::event(format!("source lost: {why}"));
-                    dts = None;
-                    rebase.pause(Instant::now());
+                    timeline.lost(Instant::now());
                 }
                 SourceEvent::Down => {
                     console::event("source down: ending the publish until it plays again");
                     onward.disconnect();
-                    dts = None;
-                    rebase = Rebase::default();
+                    timeline = Timeline::default();
                 }
                 SourceEvent::Refused(why) => return Err(SourceRefused(why).into()),
             }
@@ -1546,6 +1556,16 @@ fn session_pull(
             std::thread::sleep(Duration::from_millis(1));
         }
     }
+}
+
+/// A stream's timeline jumped by `step_us` and carries on from where the
+/// publish is.
+fn say_jump(stream: &str, step_us: i64) {
+    console::event(format!(
+        "source {stream} timeline jumped {} by {:.1} s; carrying on from the last timestamp",
+        if step_us < 0 { "back" } else { "forward" },
+        step_us.unsigned_abs() as f64 / 1e6
+    ));
 }
 
 /// Act on one event from the publisher's RTMP session: accept its requests,

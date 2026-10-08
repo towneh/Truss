@@ -52,6 +52,7 @@ fn main() -> std::io::Result<()> {
         &video_tag_seeds(),
         inv::inject_video_tag,
     )?;
+    write(root, "pull_au_to_flv", &pull_seeds(), inv::pull_au_to_flv)?;
 
     Ok(())
 }
@@ -185,6 +186,68 @@ fn video_tag_seeds() -> Vec<Vec<u8>> {
             au(&[&[0x46, 0x01, 0x10], &[0x26, 0x01, 0xAA]]),
         ),
         with(&[0xA3, b'h', b'v', b'c', b'1'], au(&[&[0x02, 0x01, 0xBB]])),
+    ]
+}
+
+/// Pulled streams for `pull_au_to_flv`: H.264 Baseline with no reordering,
+/// and HEVC from libx265 with three B-frames and an open GOP, each with audio,
+/// a loss, a session end and a timeline jump.
+fn pull_seeds() -> Vec<Vec<u8>> {
+    let avcc = [1, 66, 0xC0, 0x1F, 0xFF, 0xE1];
+    let hvcc = truss::invariants::x265_hvcc();
+
+    let frame = |audio: bool, key: bool, delta_us: i64, nals: &[u8]| truss::invariants::PullFrame {
+        audio,
+        key,
+        lost: false,
+        reset: false,
+        delta_us,
+        nals: nals.to_vec(),
+    };
+    let idr = [0, 0, 0, 2, 0x65, 0xAA];
+    let p = [0, 0, 0, 2, 0x41, 0xBB];
+    let aac = [0x21, 0x10, 0x04];
+
+    let mut h264 = vec![frame(false, true, 0, &idr), frame(true, false, 0, &aac)];
+    // On past the session end at h264[100], so the keyframe at 60 opens the
+    // next session and its frames are placed after the gap.
+    for i in 1..90 {
+        h264.push(frame(
+            false,
+            i % 30 == 0,
+            33_300,
+            if i % 30 == 0 { &idr } else { &p },
+        ));
+        h264.push(frame(true, false, 21_300, &aac));
+    }
+    h264[40].lost = true;
+    h264[80].delta_us = -65_000_000;
+    h264[100].reset = true;
+
+    // Decode order for an open GOP with three B-frames: the CRA, its three
+    // leading pictures, then P B B B.
+    let cra = [0, 0, 0, 3, 0x2A, 0x01, 0xAA];
+    let rasl = [0, 0, 0, 3, 0x10, 0x01, 0xBB];
+    let trail = [0, 0, 0, 3, 0x02, 0x01, 0xCC];
+    let mut hevc = Vec::new();
+    for gop in 0..3 {
+        hevc.push(frame(false, true, if gop == 0 { 0 } else { 233_300 }, &cra));
+        for step in [-99_900, 33_300, 33_300] {
+            hevc.push(frame(false, false, step, &rasl));
+        }
+        for _ in 0..3 {
+            for step in [166_500, -99_900, 33_300, 33_300] {
+                hevc.push(frame(false, false, step, &trail));
+            }
+            hevc.push(frame(true, false, 21_300, &aac));
+        }
+    }
+    hevc[20].reset = true;
+
+    vec![
+        truss::invariants::pull_input(false, 0, &avcc, &h264),
+        truss::invariants::pull_input(true, 33, &hvcc, &hevc),
+        truss::invariants::pull_input(true, 0, &[], &hevc[..8]),
     ]
 }
 

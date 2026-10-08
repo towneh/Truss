@@ -419,3 +419,246 @@ fn blocks_from(data: &[u8]) -> Option<Vec<payload::Block>> {
         values: values.to_vec(),
     }])
 }
+
+/// An hvcC from libx265 at 320x180 with three B-frames, so it states a
+/// reorder depth of 2: a configuration record for [`pull_input`].
+pub fn x265_hvcc() -> Vec<u8> {
+    const SPS: &[u8] = &[
+        0x42, 0x01, 0x01, 0x01, 0x60, 0x00, 0x00, 0x03, 0x00, 0x90, 0x00, 0x00, 0x03, 0x00, 0x00,
+        0x03, 0x00, 0x3c, 0xa0, 0x0a, 0x08, 0x0b, 0x9f, 0x79, 0x65, 0x65, 0x92, 0x4c, 0xaf, 0x01,
+        0x68, 0x08, 0x00, 0x00, 0x03, 0x00, 0x08, 0x00, 0x00, 0x03, 0x00, 0xf0, 0x40,
+    ];
+    let mut record = vec![
+        1, 0x01, 0x60, 0, 0, 0, 0x90, 0, 0, 0, 0, 0, 60, 0xF0, 0, 0xFC,
+    ];
+    record.extend_from_slice(&[0xFD, 0xF8, 0xF8, 0, 0, 0x0F, 1, 0xA1, 0, 1]);
+    record.extend_from_slice(&(SPS.len() as u16).to_be_bytes());
+    record.extend_from_slice(SPS);
+    record
+}
+
+/// One frame of [`pull_au_to_flv`]'s input.
+#[derive(Debug, Clone)]
+pub struct PullFrame {
+    /// An audio frame, which the timeline places but the gate and the tag
+    /// builder never see.
+    pub audio: bool,
+    pub key: bool,
+    /// Packets went missing before this frame.
+    pub lost: bool,
+    /// The source's session ended before this frame, and it starts the next.
+    pub reset: bool,
+    /// Presentation time relative to the previous frame's.
+    pub delta_us: i64,
+    pub nals: Vec<u8>,
+}
+
+/// Encode input for [`pull_au_to_flv`]: byte 0 the codec (bit 0, set for
+/// HEVC) and frame interval in ms (the other seven bits, 0 for 33 ms), then
+/// the configuration record behind a length byte, then the frames. Each frame
+/// is a flags byte (key, lost, reset, wide delta, audio), the presentation
+/// time step from the previous frame of its stream (16 bits in 100 µs, or 32
+/// bits in whole ms when wide, saturating at either end) and the NAL units
+/// behind a length byte. Anything past what a frame can hold is cut short.
+pub fn pull_input(hevc: bool, frame_ms: u8, config: &[u8], frames: &[PullFrame]) -> Vec<u8> {
+    let mut out = vec![u8::from(hevc) | frame_ms.min(127) << 1];
+    let config = &config[..config.len().min(255)];
+    out.push(config.len() as u8);
+    out.extend_from_slice(config);
+    for f in frames {
+        let narrow = i16::try_from(f.delta_us / 100)
+            .ok()
+            .filter(|_| f.delta_us % 100 == 0);
+        let flags = u8::from(f.key)
+            | u8::from(f.lost) << 1
+            | u8::from(f.reset) << 2
+            | u8::from(narrow.is_none()) << 3
+            | u8::from(f.audio) << 4;
+        out.push(flags);
+        match narrow {
+            Some(d) => out.extend_from_slice(&d.to_be_bytes()),
+            None => {
+                let ms = (f.delta_us / 1000).clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
+                out.extend_from_slice(&ms.to_be_bytes());
+            }
+        }
+        let nals = &f.nals[..f.nals.len().min(255)];
+        out.push(nals.len() as u8);
+        out.extend_from_slice(nals);
+    }
+    out
+}
+
+/// Run frames from an RTSP source through what the pull and the relay do with
+/// them: the keyframe gate, the [`Timeline`](crate::pull::timing::Timeline)
+/// (decode times, rebase, re-anchoring a stream whose timeline jumps) and the
+/// tag build, then the injector, with the input deciding the codec, the
+/// configuration record, the presentation times, keyframes, losses, session
+/// ends and audio (see [`pull_input`]).
+///
+/// Asserts that what goes out opens on a keyframe; that neither stream's
+/// timestamps ever go back, across jumps and session ends too; that the
+/// composition time is never negative unless the window grew its reorder
+/// depth for that frame or has reached the deepest any codec allows; that
+/// `flv::video` reads back the codec, keyframe flag, composition time and NAL
+/// units the tag was built from; and that the injector keeps any tag it
+/// rewrites reading as the same frame. A tag refused for a composition time
+/// that does not fit is the relay refusing a wild source, and passes.
+pub fn pull_au_to_flv(data: &[u8]) {
+    use crate::pull::timing::{self, AUDIO, Admit, KeyframeGate, MAX_DEPTH, Timeline, VIDEO};
+
+    let Some((&head, rest)) = data.split_first() else {
+        return;
+    };
+    let codec = if head & 1 == 0 {
+        VideoCodec::H264
+    } else {
+        VideoCodec::Hevc
+    };
+    let frame_us = match i64::from(head >> 1) {
+        0 => 33_333,
+        ms => ms * 1000,
+    };
+    let Some((&config_len, rest)) = rest.split_first() else {
+        return;
+    };
+    let Some((config, mut rest)) = rest.split_at_checked(usize::from(config_len)) else {
+        return;
+    };
+    let depth = timing::reorder_depth(codec, config);
+    assert!(depth.is_none_or(|d| d <= 16), "reorder depth {depth:?}");
+
+    let mut inj = Injector::new(&InjectOptions {
+        carriers: vec![Carrier::SeiUnregistered, Carrier::FillerNal],
+        ..Default::default()
+    })
+    .expect("these options are valid")
+    .strip_existing(true);
+    let header = flv::video_sequence_header(codec, config);
+    assert!(
+        matches!(flv::video(&header), Video::Config { codec: c, .. } if c == codec)
+            || config.is_empty(),
+        "a sequence header does not read back"
+    );
+    let described = inj.note_sequence_header(&header).is_ok();
+
+    let mut gate = KeyframeGate::default();
+    let mut timeline = Timeline::default();
+    timeline.video_parameters(depth, frame_us);
+    let mut pts = [0i64; 2];
+    let mut last_timestamp: [Option<u32>; 2] = [None; 2];
+    // Frames arrive a millisecond apart on a clock of the input's own, so the
+    // gaps the timeline measures, and with them every timestamp, are the same
+    // however fast the harness runs.
+    let t0 = Instant::now();
+    let mut arrivals = 0u32;
+
+    loop {
+        let Some((&flags, tail)) = rest.split_first() else {
+            return;
+        };
+        let wide = flags & 8 != 0;
+        let (delta_us, tail) = if wide {
+            let Some((d, tail)) = tail.split_first_chunk::<4>() else {
+                return;
+            };
+            (i64::from(i32::from_be_bytes(*d)) * 1000, tail)
+        } else {
+            let Some((d, tail)) = tail.split_first_chunk::<2>() else {
+                return;
+            };
+            (i64::from(i16::from_be_bytes(*d)) * 100, tail)
+        };
+        let Some((&len, tail)) = tail.split_first() else {
+            return;
+        };
+        let Some((nals, tail)) = tail.split_at_checked(usize::from(len)) else {
+            return;
+        };
+        rest = tail;
+        let (key, lost, reset) = (flags & 1 != 0, flags & 2 != 0, flags & 4 != 0);
+        let stream = if flags & 16 != 0 { AUDIO } else { VIDEO };
+        arrivals += 1;
+        let now = t0 + std::time::Duration::from_millis(u64::from(arrivals));
+        pts[stream] = pts[stream].saturating_add(delta_us);
+        let pts = pts[stream];
+
+        if reset {
+            gate = KeyframeGate::default();
+            timeline.lost(now);
+            timeline.video_parameters(depth, frame_us);
+        }
+        if stream == AUDIO {
+            if !gate.admit_audio(pts) {
+                continue;
+            }
+            let (timestamp, _) = timeline.audio(pts, now);
+            if let Some(last) = last_timestamp[AUDIO] {
+                assert!(
+                    timestamp >= last,
+                    "audio went back from {last} to {timestamp}"
+                );
+            }
+            last_timestamp[AUDIO] = Some(timestamp);
+            continue;
+        }
+        match gate.admit(pts, key, lost) {
+            Admit::Open => {
+                assert!(key, "the video opened on a frame that is not a keyframe");
+                gate.open(pts);
+            }
+            Admit::Pass => {}
+            Admit::Drop | Admit::Lost => continue,
+        }
+
+        let Ok(tag) = timeline.video_tag(codec, key, pts, nals, now) else {
+            continue;
+        };
+        if let Some(last) = last_timestamp[VIDEO] {
+            assert!(
+                tag.timestamp >= last,
+                "video went back from {last} to {}",
+                tag.timestamp
+            );
+        }
+        last_timestamp[VIDEO] = Some(tag.timestamp);
+        assert!(
+            tag.grew || tag.cts_ms >= 0 || timeline.depth() == MAX_DEPTH,
+            "composition time {} ms with the window's depth unchanged at {}",
+            tag.cts_ms,
+            timeline.depth()
+        );
+
+        // A frame with no NAL units reads as nothing in particular, which is
+        // as `flv::video` means it to; retina never hands one over.
+        if nals.is_empty() {
+            assert_eq!(flv::video(&tag.data), Video::Other);
+            continue;
+        }
+        let Video::Frame {
+            codec: read,
+            keyframe,
+            body,
+        } = flv::video(&tag.data)
+        else {
+            panic!("a built tag does not read back as a frame");
+        };
+        assert_eq!(
+            (read, keyframe),
+            (codec, key),
+            "the tag header reads back wrong"
+        );
+        let field = &tag.data[body - 3..body];
+        let cts = i32::from_be_bytes([0, field[0], field[1], field[2]]) << 8 >> 8;
+        assert_eq!(cts, tag.cts_ms, "the composition time reads back wrong");
+        assert_eq!(&tag.data[body..], nals, "the NAL units read back wrong");
+
+        if described && let Ok(Some(out)) = inj.inject_tag(&tag.data, 0) {
+            assert_eq!(
+                flv::video(&out),
+                flv::video(&tag.data),
+                "the injector changed what the tag reads as"
+            );
+        }
+    }
+}

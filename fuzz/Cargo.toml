@@ -103,6 +103,13 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "pull_au_to_flv"
+path = "fuzz_targets/pull_au_to_flv.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]
 
 # The parent crate's patched retina; a [patch] there does not reach this

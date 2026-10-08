@@ -11,10 +11,11 @@ use h264_reader::nal::{Nal, RefNal};
 use retina::codec::h265::nal as hevc_nal;
 
 use crate::codec::VideoCodec;
+use crate::flv;
 
 /// The deepest reorder the window will grow to: the most pictures either
 /// codec's decoded picture buffer can hold.
-const MAX_DEPTH: usize = 16;
+pub const MAX_DEPTH: usize = 16;
 
 /// H.264 Baseline, which has no B-slices and so never reorders.
 const PROFILE_BASELINE: u8 = 66;
@@ -73,7 +74,8 @@ fn hevc_reorder_depth(hvcc: &[u8]) -> Option<usize> {
 /// carries, as ffmpeg derives them. Frames arrive in decode order; once more
 /// than `depth` presentation times are held, each frame's decode time is the
 /// smallest of them. The first `depth` frames come before any can be taken,
-/// and are placed a frame apart ahead of the first.
+/// and are placed a frame apart ahead of the first, or at the earliest
+/// presentation time held when that is sooner.
 ///
 /// Without a depth from the stream it starts at 0 and grows by one whenever
 /// a frame is due to be shown before the last decode time. That frame is
@@ -118,7 +120,12 @@ impl DtsWindow {
         let dts = if self.held.len() > self.depth {
             self.held.pop().map_or(pts, |Reverse(p)| p)
         } else {
-            first - self.depth.saturating_sub(index) as i64 * self.frame_us
+            let spaced = first.saturating_sub(
+                (self.depth.saturating_sub(index) as i64).saturating_mul(self.frame_us),
+            );
+            // Never after a presentation time already held: the frame rate a
+            // source states can be wrong.
+            self.held.peek().map_or(spaced, |Reverse(p)| spaced.min(*p))
         };
         let dts = self.last.map_or(dts, |last| dts.max(last));
         self.last = Some(dts);
@@ -127,6 +134,222 @@ impl DtsWindow {
 
     pub fn depth(&self) -> usize {
         self.depth
+    }
+}
+
+/// Which frames go out: no video before the first keyframe, none after a
+/// loss until the next one, and none of the leading pictures of the keyframe
+/// the video opened or resumed on: frames due to be shown before it, which in
+/// HEVC after a CRA refer to pictures the publish never had, and which a
+/// decoder starting there drops anyway. Audio waits for the video to open.
+#[derive(Debug, Default)]
+pub struct KeyframeGate {
+    opened_at: Option<i64>,
+    awaiting: bool,
+    floor: Option<i64>,
+    audio_started: bool,
+}
+
+/// What [`KeyframeGate::admit`] says to do with a frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Admit {
+    /// The first frame through: describe the video, then call
+    /// [`KeyframeGate::open`] and send it.
+    Open,
+    Pass,
+    Drop,
+    /// Dropped because the source lost video; the gate now waits for a
+    /// keyframe. Returned once per loss, for a note to the operator.
+    Lost,
+}
+
+impl KeyframeGate {
+    /// The verdict on a frame at `pts`. `lost` is whether packets went
+    /// missing before it.
+    pub fn admit(&mut self, pts: i64, key: bool, lost: bool) -> Admit {
+        let opening = self.opened_at.is_none();
+        let mut noted = false;
+        if lost && !key && !opening && !self.awaiting {
+            self.awaiting = true;
+            noted = true;
+        }
+        if (opening || self.awaiting) && !key {
+            return if noted { Admit::Lost } else { Admit::Drop };
+        }
+        // A loss reported on the keyframe itself is a resume too: its leading
+        // pictures refer to what was lost.
+        if opening || self.awaiting || lost {
+            self.floor = Some(pts);
+        } else if let Some(floor) = self.floor {
+            if pts < floor {
+                return Admit::Drop;
+            }
+            // Leading pictures all come before the first trailing one in
+            // decode order, so the floor has done its job. Kept, it would
+            // drop the rest of the session after the source's timeline
+            // jumped back.
+            self.floor = None;
+        }
+        self.awaiting = false;
+        if opening { Admit::Open } else { Admit::Pass }
+    }
+
+    /// The video opened on the keyframe at `pts`.
+    pub fn open(&mut self, pts: i64) {
+        self.opened_at = Some(pts);
+    }
+
+    /// Whether an audio frame at `pts` goes out: none until the video has
+    /// opened, and none due before the keyframe it opened on until the first
+    /// that is not. From there audio follows its own timeline.
+    pub fn admit_audio(&mut self, pts: i64) -> bool {
+        match self.opened_at {
+            None => false,
+            Some(_) if self.audio_started => true,
+            Some(opened) => {
+                self.audio_started = pts >= opened;
+                self.audio_started
+            }
+        }
+    }
+}
+
+/// One video frame as the publish carries it.
+#[derive(Debug)]
+pub struct VideoTag {
+    /// The tag's timestamp: the frame's decode time, rebased.
+    pub timestamp: u32,
+    /// Presentation minus decode time.
+    pub cts_ms: i32,
+    /// The tag body.
+    pub data: Vec<u8>,
+    /// Whether the window grew its reorder depth for this frame.
+    pub grew: bool,
+    /// How far the video's timeline jumped before this frame, in µs, when
+    /// it did and the frame was re-anchored.
+    pub jump: Option<i64>,
+}
+
+/// A backward step in a stream's presentation times past this is a jump, not
+/// reordering. Longer for video when the deepest reorder at its frame rate is.
+const JUMP_BACK_US: i64 = 1_000_000;
+/// A forward step this much longer than the wall-clock time since the
+/// stream's previous frame is a jump.
+const JUMP_AHEAD_US: i64 = 5_000_000;
+
+/// The pull's timestamps for both streams: decode times for video from a
+/// [`DtsWindow`], both streams placed on the publish's timeline by a
+/// [`Rebase`], and a stream whose timeline jumps re-anchored to carry on from
+/// where the publish is, rather than held there or sent on with it.
+#[derive(Debug, Default)]
+pub struct Timeline {
+    window: Option<DtsWindow>,
+    depth: usize,
+    frame_us: i64,
+    rebase: Rebase,
+    /// Each stream's previous presentation time, and when it arrived.
+    seen: [Option<(i64, Instant)>; 2],
+}
+
+impl Timeline {
+    /// The video's parameters. The first set of a session starts the decode
+    /// time window, at the reorder depth the stream states or else at 0 to
+    /// learn it; returns whether it did.
+    pub fn video_parameters(&mut self, depth: Option<usize>, frame_us: i64) -> bool {
+        if self.window.is_some() {
+            return false;
+        }
+        self.depth = depth.unwrap_or(0).min(MAX_DEPTH);
+        self.frame_us = frame_us.max(1);
+        self.window = Some(DtsWindow::new(self.depth, self.frame_us));
+        true
+    }
+
+    /// The tag for a video frame at `pts_us`, arriving at `now`: its decode
+    /// time from the window, placed on the publish's timeline, with the
+    /// composition time the presentation time leaves. Fails before the
+    /// video's parameters, and when the composition time does not fit the
+    /// tag, which only a source sending wild timestamps produces.
+    pub fn video_tag(
+        &mut self,
+        codec: VideoCodec,
+        key: bool,
+        pts_us: i64,
+        nals: &[u8],
+        now: Instant,
+    ) -> anyhow::Result<VideoTag> {
+        let jump = self.jumped(VIDEO, pts_us, now);
+        let Some(window) = self.window.as_mut() else {
+            anyhow::bail!("the source sent video before its parameters");
+        };
+        if jump.is_some() {
+            // At the depth learnt so far, which is still the stream's.
+            *window = DtsWindow::new(window.depth(), self.frame_us);
+        }
+        let (decode_us, grew) = window.next(pts_us);
+        if jump.is_some() {
+            self.rebase.jump(VIDEO, decode_us, now);
+        }
+        let timestamp = self.rebase.place_at(VIDEO, decode_us, now);
+        let cts = i64::from(self.rebase.ms(VIDEO, pts_us)) - i64::from(timestamp);
+        let cts_ms = i32::try_from(cts)
+            .map_err(|_| anyhow::anyhow!("composition time {cts} ms does not fit the tag"))?;
+        let data = flv::video_frame(codec, key, cts_ms, nals)?;
+        Ok(VideoTag {
+            timestamp,
+            cts_ms,
+            data,
+            grew,
+            jump,
+        })
+    }
+
+    /// The timestamp for an audio frame at `pts_us`, arriving at `now`, and
+    /// how far its timeline jumped first, in µs, when it did.
+    pub fn audio(&mut self, pts_us: i64, now: Instant) -> (u32, Option<i64>) {
+        let jump = self.jumped(AUDIO, pts_us, now);
+        if jump.is_some() {
+            self.rebase.jump(AUDIO, pts_us, now);
+        }
+        (self.rebase.place_at(AUDIO, pts_us, now), jump)
+    }
+
+    /// The source's session ended at `at`. The next brings a timeline of its
+    /// own, and fresh parameters before its first frame.
+    pub fn lost(&mut self, at: Instant) {
+        self.window = None;
+        self.seen = [None; 2];
+        self.rebase.pause(at);
+    }
+
+    /// The last timestamp placed on `stream`, or 0 before any.
+    pub fn last(&self, stream: usize) -> u32 {
+        self.rebase.last(stream)
+    }
+
+    /// Frames held at their stream's last timestamp so far.
+    pub fn held(&self) -> u64 {
+        self.rebase.held
+    }
+
+    /// The window's reorder depth.
+    pub fn depth(&self) -> usize {
+        self.window.as_ref().map_or(self.depth, DtsWindow::depth)
+    }
+
+    /// The step from the stream's previous frame, when it is too large to be
+    /// anything but a jump in the source's timeline.
+    fn jumped(&mut self, stream: usize, pts_us: i64, now: Instant) -> Option<i64> {
+        let (previous, at) = self.seen[stream].replace((pts_us, now))?;
+        let wall = i64::try_from(now.saturating_duration_since(at).as_micros()).unwrap_or(i64::MAX);
+        let step = pts_us.saturating_sub(previous);
+        // Only video reorders, so only video gets the allowance for it.
+        let back = if stream == VIDEO {
+            JUMP_BACK_US.max((MAX_DEPTH as i64 + 1).saturating_mul(self.frame_us))
+        } else {
+            JUMP_BACK_US
+        };
+        (step < -back || step > wall.saturating_add(JUMP_AHEAD_US)).then_some(step)
     }
 }
 
@@ -143,7 +366,12 @@ pub const AUDIO: usize = 1;
 #[derive(Debug, Default)]
 pub struct Rebase {
     origin: Option<i64>,
+    /// Added to a stream's times once its timeline has jumped, so it carries
+    /// on from where the publish is.
+    shift: [i64; 2],
     last: [Option<u32>; 2],
+    /// When a frame was last placed.
+    placed_at: Option<Instant>,
     pub held: u64,
     /// When the source's session ended, if a new one is yet to place a frame.
     paused: Option<Instant>,
@@ -164,9 +392,11 @@ impl Rebase {
                 .unwrap_or(u32::MAX)
                 .max(1);
             let resume = self.last(0).max(self.last(1)).saturating_add(gap);
-            self.origin = Some(us - i64::from(resume) * 1000);
+            self.origin = Some(us.saturating_sub(i64::from(resume) * 1000));
+            self.shift = [0; 2];
         }
-        let ms = self.ms(us);
+        self.placed_at = Some(now);
+        let ms = self.ms(stream, us);
         let ms = match self.last[stream] {
             Some(last) if ms < last => {
                 self.held += 1;
@@ -178,11 +408,33 @@ impl Rebase {
         ms
     }
 
-    /// `us` in output milliseconds, without placing a frame. Times before
-    /// the origin read as 0.
-    pub fn ms(&mut self, us: i64) -> u32 {
+    /// `us` on `stream` in output milliseconds, without placing a frame.
+    /// Times before the origin read as 0.
+    pub fn ms(&mut self, stream: usize, us: i64) -> u32 {
+        let us = us.saturating_add(self.shift[stream]);
         let origin = *self.origin.get_or_insert(us);
         u32::try_from(us.saturating_sub(origin).max(0) / 1000).unwrap_or(u32::MAX)
+    }
+
+    /// `stream`'s timeline jumped, and `us` is its first time on the new one.
+    /// Re-anchor the stream so that time lands after the newest timestamp on
+    /// either stream by the wall-clock time since it was placed, at least
+    /// 1 ms. The other stream keeps its anchor until its own timeline jumps.
+    pub fn jump(&mut self, stream: usize, us: i64, now: Instant) {
+        let Some(origin) = self.origin else {
+            return;
+        };
+        let gap = self
+            .placed_at
+            .map_or(0, |t| now.saturating_duration_since(t).as_millis())
+            .max(1);
+        let target = self
+            .last(0)
+            .max(self.last(1))
+            .saturating_add(u32::try_from(gap).unwrap_or(u32::MAX));
+        self.shift[stream] = origin
+            .saturating_add(i64::from(target) * 1000)
+            .saturating_sub(us);
     }
 
     /// The last timestamp placed on `stream`, or 0 before any.
@@ -203,6 +455,7 @@ impl Rebase {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     const FRAME: i64 = 33_333;
 
@@ -337,5 +590,163 @@ mod tests {
         assert_eq!(r.held, 1);
         // Each stream keeps its own floor.
         assert_eq!(r.place(AUDIO, 1_000_000), 1_000);
+    }
+
+    #[test]
+    fn the_window_never_decodes_after_a_frame_it_has_seen() {
+        // Stated at 50 fps, sent at 30: the opening placement would put the
+        // B-frame's decode time after its presentation time.
+        let mut w = DtsWindow::new(2, 20_000);
+        let (first, _) = w.next(100_000);
+        let (second, grew) = w.next(66_667);
+        assert!(!grew);
+        assert!(first <= second && second <= 66_667, "{first} {second}");
+    }
+
+    fn tags(t: &mut Timeline, ptss: &[i64], at: Instant) -> Vec<VideoTag> {
+        ptss.iter()
+            .map(|&p| {
+                t.video_tag(VideoCodec::H264, false, p, &[0, 0, 0, 1, 0x41], at)
+                    .unwrap()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_video_timeline_that_jumps_back_carries_on_from_the_last_timestamp() {
+        let t0 = Instant::now();
+        let mut t = Timeline::default();
+        t.video_parameters(Some(0), FRAME);
+        let before = tags(&mut t, &[100_000_000, 100_033_333, 100_066_667], t0);
+        assert_eq!(before.last().unwrap().timestamp, 66);
+        // 65 s back, 40 ms of wall clock later.
+        let after = tags(
+            &mut t,
+            &[35_000_000, 35_033_333],
+            t0 + Duration::from_millis(40),
+        );
+        assert_eq!(after[0].jump, Some(35_000_000 - 100_066_667));
+        assert_eq!(after[0].timestamp, 66 + 40);
+        assert_eq!(after[1].timestamp, 66 + 40 + 33);
+        assert!(after.iter().all(|f| !f.grew && f.cts_ms == 0));
+        assert_eq!((t.depth(), t.held()), (0, 0));
+    }
+
+    #[test]
+    fn each_stream_re_anchors_when_its_own_timeline_jumps() {
+        let t0 = Instant::now();
+        let mut t = Timeline::default();
+        t.video_parameters(Some(0), FRAME);
+        tags(&mut t, &[0], t0);
+        assert_eq!(t.audio(0, t0), (0, None));
+        assert_eq!(t.audio(21_333, t0).0, 21);
+        // Video jumps first; audio carries on in its old timeline.
+        let jumped = tags(&mut t, &[-60_000_000], t0 + Duration::from_millis(30));
+        assert_eq!(jumped[0].timestamp, 21 + 30);
+        assert_eq!(t.audio(42_667, t0 + Duration::from_millis(31)), (42, None));
+        // Then audio jumps, and lands after the newest timestamp.
+        let (ms, jump) = t.audio(-59_990_000, t0 + Duration::from_millis(50));
+        assert!(jump.is_some());
+        assert_eq!(ms, 51 + 19);
+    }
+
+    #[test]
+    fn a_jump_keeps_the_reorder_depth_the_window_learnt() {
+        let t0 = Instant::now();
+        let mut t = Timeline::default();
+        t.video_parameters(None, FRAME);
+        let ptss = two_b_frames();
+        tags(&mut t, &ptss, t0);
+        let learnt = t.depth();
+        assert!(learnt > 0);
+        let after: Vec<i64> = ptss.iter().map(|p| p - 60_000_000).collect();
+        let tags = tags(&mut t, &after, t0 + Duration::from_millis(40));
+        assert!(tags[0].jump.is_some());
+        assert!(tags.iter().all(|f| !f.grew && f.cts_ms >= 0));
+        assert_eq!(t.depth(), learnt);
+    }
+
+    #[test]
+    fn the_gate_drops_leading_pictures_and_nothing_after_a_jump() {
+        let mut g = KeyframeGate::default();
+        assert_eq!(g.admit(1_000_000, false, false), Admit::Drop);
+        assert!(!g.admit_audio(1_000_000));
+        assert_eq!(g.admit(1_100_000, true, false), Admit::Open);
+        g.open(1_100_000);
+        // A leading picture, then the first trailing one.
+        assert_eq!(g.admit(1_000_000, false, false), Admit::Drop);
+        assert_eq!(g.admit(1_200_000, false, false), Admit::Pass);
+        assert!(!g.admit_audio(1_050_000));
+        assert!(g.admit_audio(1_110_000));
+        // The source's timeline jumps back, with no loss: everything passes.
+        assert_eq!(g.admit(5_000, false, false), Admit::Pass);
+        assert!(g.admit_audio(4_000));
+        // A loss waits for a keyframe, and that keyframe's leading pictures
+        // are dropped in turn.
+        assert_eq!(g.admit(40_000, false, true), Admit::Lost);
+        assert_eq!(g.admit(50_000, true, false), Admit::Pass);
+        assert_eq!(g.admit(45_000, false, false), Admit::Drop);
+        assert_eq!(g.admit(60_000, false, false), Admit::Pass);
+        // A loss reported on the keyframe itself: its leading pictures go too.
+        assert_eq!(g.admit(70_000, true, true), Admit::Pass);
+        assert_eq!(g.admit(65_000, false, false), Admit::Drop);
+        assert_eq!(g.admit(80_000, false, false), Admit::Pass);
+    }
+
+    #[test]
+    fn a_composition_time_the_tag_cannot_carry_is_refused() {
+        // An hour between frames, arriving an hour apart, so no step is a
+        // jump; three frames of reordering then put presentation three hours
+        // after decode, past the tag's 24-bit field of milliseconds.
+        let t0 = Instant::now();
+        let hour = Duration::from_secs(3600);
+        let mut t = Timeline::default();
+        t.video_parameters(Some(3), FRAME);
+        let refused = (0..8u32).find_map(|i| {
+            t.video_tag(
+                VideoCodec::H264,
+                i == 0,
+                i64::from(i) * 3_600_000_000,
+                &[0, 0, 0, 1, 0x41],
+                t0 + hour * i,
+            )
+            .err()
+        });
+        let e = refused.expect("every frame was accepted").to_string();
+        assert!(e.contains("24-bit"), "{e}");
+    }
+
+    #[test]
+    fn audio_jumps_back_past_a_second_whatever_the_video_frame_rate() {
+        // At 1 fps the video's reorder allowance is 17 s; audio's stays 1 s.
+        let t0 = Instant::now();
+        let mut t = Timeline::default();
+        t.video_parameters(Some(0), 1_000_000);
+        tags(&mut t, &[10_000_000], t0);
+        t.audio(10_000_000, t0);
+        let (ms, jump) = t.audio(8_000_000, t0 + Duration::from_millis(21));
+        assert_eq!(jump, Some(-2_000_000));
+        assert_eq!(ms, 21);
+    }
+
+    #[test]
+    fn steps_that_reordering_or_the_wall_clock_explain_are_not_jumps() {
+        let t0 = Instant::now();
+        let mut t = Timeline::default();
+        t.video_parameters(Some(2), FRAME);
+        let ptss = two_b_frames();
+        let tags = tags(&mut t, &ptss, t0);
+        assert!(tags.iter().all(|f| f.jump.is_none()));
+        // A 4 s step after 4 s of silence is the source pausing, not a jump.
+        let later = t
+            .video_tag(
+                VideoCodec::H264,
+                true,
+                ptss.iter().max().unwrap() + 4_000_000,
+                &[0, 0, 0, 1, 0x65],
+                t0 + Duration::from_secs(4),
+            )
+            .unwrap();
+        assert!(later.jump.is_none());
     }
 }

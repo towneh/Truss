@@ -40,6 +40,7 @@ jobs:
           - osc_message
           - h264_nals
           - inject_video_tag
+          - pull_au_to_flv
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly

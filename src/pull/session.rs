@@ -16,6 +16,7 @@ use retina::codec::{CodecItem, FrameFormat, ParametersRef};
 use tokio::sync::mpsc;
 use tokio::time::{Instant, timeout};
 
+use super::timing::{Admit, KeyframeGate};
 use super::{SourceEvent, SourceState, Spec};
 use crate::codec::VideoCodec;
 
@@ -104,15 +105,8 @@ pub(super) async fn run(spec: &Spec, tx: &Tx, relayed: &mut bool) -> Result<(), 
     let mut demuxed = session
         .demuxed()
         .map_err(|e| format!("starting the demuxer: {e}"))?;
-    // Presentation time of the keyframe the publish starts on.
-    let mut gate: Option<i64> = None;
+    let mut gate = KeyframeGate::default();
     let mut audio_described = false;
-    let mut awaiting_key = false;
-    // Presentation time of the keyframe the video last started or resumed
-    // on. A frame due to be shown before it is a leading picture of that
-    // keyframe: in HEVC after a CRA, one that refers to pictures the publish
-    // never had, and a decoder starting there drops it anyway.
-    let mut floor: Option<i64> = None;
 
     loop {
         let item = match timeout(FEED_STALL, demuxed.next()).await {
@@ -219,28 +213,23 @@ pub(super) async fn run(spec: &Spec, tx: &Tx, relayed: &mut bool) -> Result<(), 
                     continue;
                 };
                 let key = frame.is_random_access_point();
-                let opening = gate.is_none();
-                if frame.loss() > 0 && !key && !opening && !awaiting_key {
-                    awaiting_key = true;
-                    send(
-                        tx,
-                        SourceEvent::Note(
-                            "the source skipped video; holding the picture until the next \
-                             keyframe"
-                                .into(),
-                        ),
-                    )
-                    .await?;
-                }
-                if (opening || awaiting_key) && !key {
-                    continue;
-                }
-                if opening || awaiting_key {
-                    floor = Some(pts);
-                } else if floor.is_some_and(|f| pts < f) {
-                    continue;
-                }
-                awaiting_key = false;
+                let opening = match gate.admit(pts, key, frame.loss() > 0) {
+                    Admit::Open => true,
+                    Admit::Pass => false,
+                    Admit::Drop => continue,
+                    Admit::Lost => {
+                        send(
+                            tx,
+                            SourceEvent::Note(
+                                "the source skipped video; holding the picture until the \
+                                 next keyframe"
+                                    .into(),
+                            ),
+                        )
+                        .await?;
+                        continue;
+                    }
+                };
                 if opening || frame.has_new_parameters() {
                     let Some(event) = video_parameters(&demuxed, tracks[VIDEO].index) else {
                         continue;
@@ -248,7 +237,7 @@ pub(super) async fn run(spec: &Spec, tx: &Tx, relayed: &mut bool) -> Result<(), 
                     send(tx, event).await?;
                 }
                 if opening {
-                    gate = Some(pts);
+                    gate.open(pts);
                     if let Some(event) = audio_parameters(&demuxed, tracks[AUDIO].index) {
                         send(tx, event).await?;
                         audio_described = true;
@@ -272,7 +261,7 @@ pub(super) async fn run(spec: &Spec, tx: &Tx, relayed: &mut bool) -> Result<(), 
                 let Some(pts) = place(&align, &mut tracks[AUDIO], elapsed, now_us) else {
                     continue;
                 };
-                if gate.is_none_or(|g| pts < g) {
+                if !gate.admit_audio(pts) {
                     continue;
                 }
                 if !audio_described {

@@ -393,3 +393,122 @@ fn the_injector_keeps_any_video_tag_it_rewrites_intact() {
         invariants::inject_video_tag,
     );
 }
+
+/// GOPs in decode order with up to three B-frames between references, open
+/// GOP leading pictures after some keyframes, losses, session ends and the
+/// odd wild jump, as an RTSP source can send them.
+fn pull_frames(rng: &mut Rng) -> Vec<invariants::PullFrame> {
+    let frame = 33_333i64;
+    let b = rng.below(4) as i64;
+    let mut frames = Vec::new();
+    let mut last_pts = 0i64;
+    let mut base = 0i64;
+    for _ in 0..1 + rng.below(6) {
+        // Display order within the GOP: the keyframe at `b` when it has
+        // leading pictures before it, else at 0.
+        let leading = rng.below(3) == 0;
+        let key_at = if leading { b } else { 0 };
+        let mut order = vec![(key_at, true)];
+        let mut next_ref = key_at + b + 1;
+        for _ in 0..2 + rng.below(4) {
+            order.push((next_ref, false));
+            for k in 1..=b {
+                order.push((next_ref - b - 1 + k, false));
+            }
+            next_ref += b + 1;
+        }
+        if leading {
+            for k in 0..b {
+                order.insert(1, (k, false));
+            }
+        }
+        for (display, key) in order {
+            let pts = base + display * frame;
+            let mut delta = pts - last_pts;
+            if rng.below(40) == 0 {
+                delta += (rng.next() as i64 >> 20) * 1000;
+            }
+            last_pts += delta;
+            frames.push(invariants::PullFrame {
+                audio: false,
+                key,
+                lost: rng.below(25) == 0,
+                reset: rng.below(60) == 0,
+                delta_us: delta,
+                nals: rng.some_bytes(24),
+            });
+        }
+        base = last_pts + frame * (b + 2);
+    }
+    // Audio interleaved in time, 21.3 ms a frame, jumping where the video
+    // did now and then, as a source restarting upstream makes both do.
+    let mut out = Vec::new();
+    let (mut video_pts, mut audio_pts, mut audio_last) = (0i64, 0i64, 0i64);
+    for f in frames {
+        video_pts += f.delta_us;
+        while audio_pts < video_pts && rng.below(3) != 0 {
+            let mut delta = audio_pts - audio_last;
+            if delta.abs() > 5_000_000 && rng.below(2) == 0 {
+                delta = 21_333;
+            }
+            audio_last += delta;
+            out.push(invariants::PullFrame {
+                audio: true,
+                key: false,
+                lost: false,
+                reset: false,
+                delta_us: delta,
+                nals: vec![0x21, 0x10],
+            });
+            audio_pts = audio_last + 21_333;
+        }
+        if (video_pts - audio_pts).abs() > 5_000_000 {
+            audio_pts = video_pts;
+        }
+        out.push(f);
+    }
+    out
+}
+
+#[test]
+fn the_pull_publishes_monotonic_tags_that_read_back() {
+    each_case(
+        "pull_au_to_flv",
+        400,
+        |rng| {
+            let hevc = rng.below(2) == 0;
+            let config = match (hevc, rng.below(3)) {
+                (true, 0) => rng.some_bytes(64),
+                (true, _) => invariants::x265_hvcc(),
+                (false, 0) => rng.some_bytes(64),
+                (false, _) => vec![1, 66, 0xC0, 0x1F, 0xFF, 0xE1],
+            };
+            let frames = pull_frames(rng);
+            let input = invariants::pull_input(hevc, rng.below(3) as u8 * 20, &config, &frames);
+            if rng.below(5) == 0 {
+                mutate(rng, &input)
+            } else {
+                input
+            }
+        },
+        invariants::pull_au_to_flv,
+    );
+}
+
+#[test]
+fn a_wide_step_saturates_at_its_own_end() {
+    for (delta_us, ms) in [(i64::MIN / 2, i32::MIN), (i64::MAX / 2, i32::MAX)] {
+        let frame = invariants::PullFrame {
+            audio: false,
+            key: true,
+            lost: false,
+            reset: false,
+            delta_us,
+            nals: Vec::new(),
+        };
+        // The codec byte, an empty configuration record, then the frame.
+        let input = invariants::pull_input(false, 0, &[], &[frame]);
+        assert_eq!(input[2] & 8, 8, "not encoded wide");
+        assert_eq!(i32::from_be_bytes(input[3..7].try_into().unwrap()), ms);
+    }
+}
