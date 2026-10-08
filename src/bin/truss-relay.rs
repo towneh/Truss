@@ -77,6 +77,11 @@ struct Cli {
     /// this relay's own, to measure a hop.
     #[arg(long, value_enum, default_value_t = SourceRecords::Strip, requires = "source", conflicts_with = "passthrough")]
     source_records: SourceRecords,
+    /// What to do with the source's AAC audio: relay it, or drop it for a
+    /// publish of the picture alone. Other audio is always left out, since
+    /// an RTMP ingest wants AAC and the relay does not transcode.
+    #[arg(long, value_enum, default_value_t = SourceAudio::Keep, requires = "source")]
+    source_audio: SourceAudio,
     /// Where to publish the stream: rtmp://host/app, with the port after the
     /// host when it is not 1935, and "live" when no application is given.
     /// The stream key is never part of this: see --stream-key-file.
@@ -161,6 +166,12 @@ enum SourceRecords {
     Keep,
 }
 
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+enum SourceAudio {
+    Keep,
+    Drop,
+}
+
 impl Cli {
     fn listen(&self) -> &str {
         self.listen.as_deref().unwrap_or(DEFAULT_LISTEN)
@@ -195,7 +206,11 @@ fn main() -> Result<()> {
         cli.target = Ingest::parse(publish)?;
     }
     if let Some(source) = cli.source.as_deref() {
-        cli.pull = Some(pull::Spec::parse(source)?);
+        let spec = pull::Spec::parse(source)?;
+        cli.pull = Some(match cli.source_audio {
+            SourceAudio::Keep => spec,
+            SourceAudio::Drop => spec.without_audio(),
+        });
     }
     let carriers = parse_carriers(&cli.carriers)?;
 
@@ -269,6 +284,9 @@ fn main() -> Result<()> {
             match cli.source_user.as_deref() {
                 Some(user) => println!("relay pulling from {} as {user}", spec.display()),
                 None => println!("relay pulling from {}", spec.display()),
+            }
+            if cli.source_audio == SourceAudio::Drop {
+                println!("  audio left out, as --source-audio drop asks");
             }
             println!("  forwarding to {} (key hidden)", cli.target.url());
             None

@@ -299,16 +299,14 @@ async fn open(spec: &Spec, tx: &Tx) -> Result<(Session<retina::client::Playing>,
         .map_err(|e| failed(spec, "DESCRIBE", &e))?;
 
     let mut tracks: [Track; 2] = Default::default();
-    let mut others = Vec::new();
-    for (index, stream) in session.streams().iter().enumerate() {
-        match (stream.media(), stream.encoding_name()) {
-            ("video", "h264") if tracks[VIDEO].index.is_none() => tracks[VIDEO].index = Some(index),
-            ("audio", "mpeg4-generic") if tracks[AUDIO].index.is_none() => {
-                tracks[AUDIO].index = Some(index);
-            }
-            (media, encoding) => others.push(format!("{media} {encoding}")),
-        }
-    }
+    let streams: Vec<(&str, &str)> = session
+        .streams()
+        .iter()
+        .map(|s| (s.media(), s.encoding_name()))
+        .collect();
+    let (chosen, others) = choose_streams(&streams, spec.audio);
+    tracks[VIDEO].index = chosen[VIDEO];
+    tracks[AUDIO].index = chosen[AUDIO];
     if tracks[VIDEO].index.is_none() {
         return Err(End::Lost(if others.is_empty() {
             "the source has no streams".into()
@@ -383,6 +381,23 @@ fn failed(spec: &Spec, request: &str, e: &retina::Error) -> End {
     })
 }
 
+/// The first H.264 video and, when `audio`, the first AAC audio, by index,
+/// and the streams that will not be relayed. Audio left out by choice is not
+/// listed with them.
+fn choose_streams(streams: &[(&str, &str)], audio: bool) -> ([Option<usize>; 2], Vec<String>) {
+    let mut chosen = [None; 2];
+    let mut others = Vec::new();
+    for (index, &(media, encoding)) in streams.iter().enumerate() {
+        match (media, encoding) {
+            ("video", "h264") if chosen[VIDEO].is_none() => chosen[VIDEO] = Some(index),
+            ("audio", _) if !audio => {}
+            ("audio", "mpeg4-generic") if chosen[AUDIO].is_none() => chosen[AUDIO] = Some(index),
+            _ => others.push(format!("{media} {encoding}")),
+        }
+    }
+    (chosen, others)
+}
+
 /// Shift the anchors so the earliest sits at 0, keeping numbers small.
 fn rebase_anchors(tracks: &mut [Track; 2]) {
     let Some(base) = tracks.iter().filter_map(|t| t.anchor).min() else {
@@ -442,6 +457,35 @@ fn audio_parameters(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_first_h264_and_aac_are_chosen_and_the_rest_named() {
+        let streams = [
+            ("audio", "pcmu"),
+            ("video", "h264"),
+            ("audio", "mpeg4-generic"),
+            ("video", "h264"),
+            ("application", "onvif.metadata"),
+        ];
+        let (chosen, others) = choose_streams(&streams, true);
+        assert_eq!(chosen, [Some(1), Some(2)]);
+        assert_eq!(
+            others,
+            ["audio pcmu", "video h264", "application onvif.metadata"]
+        );
+    }
+
+    #[test]
+    fn dropped_audio_is_neither_chosen_nor_reported() {
+        let streams = [
+            ("video", "h264"),
+            ("audio", "mpeg4-generic"),
+            ("audio", "pcmu"),
+        ];
+        let (chosen, others) = choose_streams(&streams, false);
+        assert_eq!(chosen, [Some(0), None]);
+        assert!(others.is_empty(), "{others:?}");
+    }
 
     #[test]
     fn an_ntp_timestamp_reads_as_microseconds() {

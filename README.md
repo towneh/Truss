@@ -193,7 +193,8 @@ connection, so no UDP ports are needed; `rtspt://` is accepted and means the
 same.
 
 The source needs H.264 video. AAC audio is carried, and any other audio is left
-out with a warning.
+out with a warning. `--source-audio drop` leaves AAC out as well, for a publish
+of the picture alone; the relay then does not ask the source for audio at all.
 
 A source that asks for a login, as a camera usually does, takes the user with
 `--source-user` and the password the way the relay takes the stream key (see

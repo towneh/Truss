@@ -25,6 +25,7 @@ use crate::creds;
 pub struct Spec {
     url: url::Url,
     login: Option<Login>,
+    audio: bool,
 }
 
 /// A user and password for a source that asks for them. Retina answers
@@ -66,7 +67,20 @@ impl Spec {
         if url.host_str().is_none_or(str::is_empty) {
             bail!("--source names no host");
         }
-        Ok(Self { url, login: None })
+        Ok(Self {
+            url,
+            login: None,
+            audio: true,
+        })
+    }
+
+    /// Leave the source's audio out, AAC included, for a publish of the
+    /// picture alone. Audio is not set up, so it costs nothing to receive.
+    pub fn without_audio(self) -> Self {
+        Self {
+            audio: false,
+            ..self
+        }
     }
 
     /// Log in to the source with `login` when it asks.
