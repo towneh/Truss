@@ -16,6 +16,7 @@
 
 use std::io::{ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
+use std::path::Path;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -39,17 +40,19 @@ use truss::payload;
 use truss::pull::timing::{AUDIO, DtsWindow, Rebase, VIDEO};
 use truss::pull::{self, SourceEvent, SourceState};
 use truss::record::{DEFAULT_PAYLOAD_LEN, MAX_PAYLOAD_LEN};
+use truss::recording::Recording;
 use truss::relay::{Backpressure, Ingest, OutBuf, RateMeter};
 
 #[derive(Parser, Clone)]
 #[command(
     name = "truss-relay",
-    about = "Relay RTMP, planting DMX in the video on the way through"
+    about = "Relay RTMP, planting DMX in the video on the way through",
+    group(clap::ArgGroup::new("output").args(["publish", "record"]).multiple(true))
 )]
 struct Cli {
     /// Address to accept the encoder on, 127.0.0.1:1935 unless given. Point
     /// the encoder at rtmp://<this>/live with any key.
-    #[arg(long, requires = "publish", value_name = "ADDRESS")]
+    #[arg(long, requires = "output", value_name = "ADDRESS")]
     listen: Option<String>,
     /// Pull the video from this RTSP source instead of accepting an encoder:
     /// rtsp://host/path, with the port after the host when it is not 554.
@@ -57,7 +60,7 @@ struct Cli {
     /// a keyframe arrives, 5 to 10 seconds in.
     #[arg(
         long,
-        requires = "publish",
+        requires = "output",
         conflicts_with = "listen",
         value_name = "URL"
     )]
@@ -87,11 +90,16 @@ struct Cli {
     /// host when it is not 1935, and "live" when no application is given.
     /// The stream key is never part of this: see --stream-key-file.
     ///
-    /// Leave it out to run the OSC lane alone, for testing against a desk
-    /// with no encoder or ingest: then --artnet and --osc are needed, and
-    /// nothing listens for an encoder.
-    #[arg(long, required_unless_present = "osc")]
+    /// Leave it out to record without publishing (--record), or to run the
+    /// OSC lane alone, for testing against a desk with no encoder or ingest:
+    /// then --artnet and --osc are needed, and nothing listens for an encoder.
+    #[arg(long, required_unless_present_any = ["osc", "record"])]
     publish: Option<String>,
+    /// Also write the stream, records and all, to an FLV file in this
+    /// directory: one file per session, named for the local time it started.
+    /// Without --publish the relay records and publishes nothing.
+    #[arg(long, value_name = "DIR")]
+    record: Option<std::path::PathBuf>,
     #[arg(skip)]
     target: Ingest,
     /// File holding the stream key, or `-` to read it from stdin. Suits
@@ -104,14 +112,14 @@ struct Cli {
     #[arg(long, requires = "publish")]
     stream_key_file: Option<String>,
     /// Comma-separated carrier slugs.
-    #[arg(long, default_value = DEFAULT_CARRIERS, requires = "publish")]
+    #[arg(long, default_value = DEFAULT_CARRIERS, requires = "output")]
     carriers: String,
     /// Inject on every Nth video frame.
-    #[arg(long, default_value_t = 1, requires = "publish")]
+    #[arg(long, default_value_t = 1, requires = "output")]
     every: u32,
     /// Payload bytes per record. Ignored with --artnet, which sizes each
     /// payload from the universes the desk is sending.
-    #[arg(long, default_value_t = DEFAULT_PAYLOAD_LEN, requires = "publish")]
+    #[arg(long, default_value_t = DEFAULT_PAYLOAD_LEN, requires = "output")]
     payload_len: usize,
     /// Carry live Art-Net DMX. On its own this listens on every adapter, port
     /// 6454, and hears a desk on this machine as well as one on the network.
@@ -139,7 +147,7 @@ struct Cli {
     #[arg(long, requires = "publish")]
     abort_kbps: Option<f64>,
     /// Relay without injecting, to measure what the relay itself costs.
-    #[arg(long, requires = "publish")]
+    #[arg(long, requires = "output")]
     passthrough: bool,
     /// Also send every record to this OSC listener, as /truss/dmx with the
     /// record as a blob, so a tool on this network can watch the desk without
@@ -176,6 +184,15 @@ enum SourceAudio {
 impl Cli {
     fn listen(&self) -> &str {
         self.listen.as_deref().unwrap_or(DEFAULT_LISTEN)
+    }
+
+    /// The application to point the encoder at: the ingest's, so the two
+    /// URLs read alike, or "live" when recording without one.
+    fn listen_app(&self) -> &str {
+        match self.publish {
+            Some(_) => &self.target.app,
+            None => "live",
+        }
     }
 }
 
@@ -214,6 +231,11 @@ fn main() -> Result<()> {
         });
     }
     let carriers = parse_carriers(&cli.carriers)?;
+    if let Some(dir) = cli.record.as_deref()
+        && !dir.is_dir()
+    {
+        bail!("--record {}: no such directory", dir.display());
+    }
 
     // Art-Net is unauthenticated by protocol design, so how many universes turn
     // up is not ours to decide. The budget is, and holding it under the record's
@@ -280,8 +302,13 @@ fn main() -> Result<()> {
         None => None,
     };
 
-    let listener = match (&cli.publish, &cli.pull) {
-        (Some(_), Some(spec)) => {
+    let output = cli.publish.is_some() || cli.record.is_some();
+    let forwarding = || match cli.publish.as_ref() {
+        Some(_) => println!("  forwarding to {} (key hidden)", cli.target.url()),
+        None => println!("  not publishing: recording only"),
+    };
+    let listener = match (output, &cli.pull) {
+        (true, Some(spec)) => {
             match cli.source_user.as_deref() {
                 Some(user) => println!("relay pulling from {} as {user}", spec.display()),
                 None => println!("relay pulling from {}", spec.display()),
@@ -289,25 +316,28 @@ fn main() -> Result<()> {
             if cli.source_audio == SourceAudio::Drop {
                 println!("  audio left out, as --source-audio drop asks");
             }
-            println!("  forwarding to {} (key hidden)", cli.target.url());
+            forwarding();
             None
         }
-        (Some(_), None) => {
+        (true, None) => {
             let listener =
                 bind_listener(cli.listen()).with_context(|| format!("binding {}", cli.listen()))?;
             println!(
                 "relay listening on rtmp://{}/{}  (point the encoder here, any stream key)",
                 cli.listen(),
-                cli.target.app
+                cli.listen_app()
             );
-            println!("  forwarding to {} (key hidden)", cli.target.url());
+            forwarding();
             Some(listener)
         }
-        (None, _) => {
+        (false, _) => {
             println!("relay running the OSC lane only: no encoder accepted, nothing published");
             None
         }
     };
+    if let Some(dir) = cli.record.as_deref() {
+        println!("  recording to {}, one FLV file per session", dir.display());
+    }
     if cli.passthrough {
         println!("  passthrough: nothing injected");
     } else if cli.carriers.trim() != DEFAULT_CARRIERS {
@@ -592,6 +622,8 @@ struct SessionView<'a> {
     queued: usize,
     /// Whether the relay is holding the encoder back for the ingest to catch up.
     holding: bool,
+    recording: Option<&'a Recording>,
+    record_failed: Option<&'a str>,
 }
 
 #[derive(Default, Clone, Copy)]
@@ -670,16 +702,16 @@ impl Dashboard {
 
         let mut lines = vec![format!(
             "truss-relay{}   up {}",
-            if cli.publish.is_none() {
-                "  (OSC lane only)"
-            } else {
-                ""
+            match (&cli.publish, &cli.record) {
+                (None, None) => "  (OSC lane only)",
+                (None, Some(_)) => "  (recording only)",
+                _ => "",
             },
             console::clock(console::uptime())
         )];
 
-        if cli.publish.is_some() {
-            let listen = format!("rtmp://{}/{}", cli.listen(), cli.target.app);
+        if cli.publish.is_some() || cli.record.is_some() {
+            let listen = format!("rtmp://{}/{}", cli.listen(), cli.listen_app());
             lines.push(match (&cli.pull, session) {
                 (Some(spec), Some(s)) => format!(
                     "source    {}   {} for {}",
@@ -695,15 +727,24 @@ impl Dashboard {
                 ),
                 (None, None) => format!("encoder   {listen}   waiting for a publisher"),
             });
-            lines.push(format!(
-                "ingest    {}   {}",
-                cli.target.url(),
-                match session {
-                    None => "not connected",
-                    Some(s) if s.publishing => "publishing",
-                    Some(_) => "connecting",
+            if cli.publish.is_some() {
+                lines.push(format!(
+                    "ingest    {}   {}",
+                    cli.target.url(),
+                    match session {
+                        None => "not connected",
+                        Some(s) if s.publishing => "publishing",
+                        Some(_) => "connecting",
+                    }
+                ));
+            }
+            if let Some(dir) = cli.record.as_deref() {
+                let (line, failed) = record_status(dir, session);
+                lines.push(line);
+                if let Some(why) = failed {
+                    warnings.push(why);
                 }
-            ));
+            }
             if let Some(s) = session {
                 let kbps = s.meter.kbps();
                 let mut line = format!("stream    {kbps:.0} kb/s out");
@@ -735,7 +776,7 @@ impl Dashboard {
                 if let Some(note) = s.injector.and_then(|i| records_note(i, cli)) {
                     warnings.push(note);
                 }
-                if kbps > cli.warn_kbps {
+                if cli.publish.is_some() && kbps > cli.warn_kbps {
                     warnings.push(format!(
                         "{kbps:.0} kb/s is above {:.0}: lower the encoder bitrate or raise --every",
                         cli.warn_kbps
@@ -800,6 +841,41 @@ impl Dashboard {
             lines.extend(warnings.into_iter().map(|w| format!("! {w}")));
         }
         lines
+    }
+}
+
+/// The panel's recording line, and a warning when the recording has stopped.
+fn record_status(dir: &Path, session: Option<&SessionView>) -> (String, Option<String>) {
+    let failed = |why: &str| Some(format!("recording stopped: {why}"));
+    match (
+        session.and_then(|s| s.recording),
+        session.and_then(|s| s.record_failed),
+    ) {
+        (_, Some(why)) => (
+            format!("record    {}   stopped", dir.display()),
+            failed(why),
+        ),
+        (Some(r), None) => {
+            let mut line = format!(
+                "record    {}   {:.1} MB",
+                r.path().display(),
+                r.bytes() as f64 / 1e6
+            );
+            if let Some(codec) = r.codec() {
+                line.push_str(&format!("   {}", codec.name()));
+            }
+            match r.stopped() {
+                Some(why) => {
+                    line.push_str("   stopped");
+                    (line, failed(why))
+                }
+                None => (line, None),
+            }
+        }
+        (None, None) => (
+            format!("record    {}   waiting for the stream", dir.display()),
+            None,
+        ),
     }
 }
 
@@ -896,6 +972,10 @@ struct Onward<'a> {
     buf: Vec<u8>,
     /// Times the encoder was held back since the last report.
     held_back: u32,
+    /// This session's file, from its first tag.
+    recording: Option<Recording>,
+    /// Why the file could not be created, when it could not.
+    record_failed: Option<String>,
 }
 
 impl<'a> Onward<'a> {
@@ -929,27 +1009,81 @@ impl<'a> Onward<'a> {
             last_note: None,
             buf: vec![0u8; 32 * 1024],
             held_back: 0,
+            recording: None,
+            record_failed: None,
         })
     }
 
-    /// Dial the ingest server, once per session.
+    /// Dial the ingest server, once per session, when there is one.
     fn connect(&mut self) -> Result<()> {
-        if self.upstream.is_none() {
+        if self.cli.publish.is_some() && self.upstream.is_none() {
             self.upstream = Some(connect_upstream(self.cli)?);
         }
         Ok(())
     }
 
     /// End the publish, so the ingest shows the stream as ended rather than
-    /// holding it open with nothing in it. The next [`Onward::connect`]
-    /// publishes afresh.
+    /// holding it open with nothing in it, and the recording with it: the
+    /// next [`Onward::connect`] publishes afresh, from a new timeline, and the
+    /// next tag starts a new file.
     fn disconnect(&mut self) {
         self.upstream = None;
+        self.close_recording();
+    }
+
+    fn close_recording(&mut self) {
+        if let Some(r) = self.recording.take() {
+            console::event(format!(
+                "recorded {:.1} MB to {}",
+                r.bytes() as f64 / 1e6,
+                r.path().display()
+            ));
+        }
     }
 
     fn metadata(&mut self, metadata: &StreamMetadata) -> Result<()> {
+        self.record(|r| r.metadata(metadata))?;
         if let Some(up) = self.upstream.as_mut() {
             forward_metadata(up, metadata)?;
+        }
+        Ok(())
+    }
+
+    /// Hand one write to this session's recording, opening the file on the
+    /// first. A failed write stops the recording and the publish carries on;
+    /// with nothing published it ends the session.
+    fn record(&mut self, write: impl FnOnce(&mut Recording) -> Result<()>) -> Result<()> {
+        let Some(dir) = self.cli.record.as_deref() else {
+            return Ok(());
+        };
+        if self.record_failed.is_some() {
+            return Ok(());
+        }
+        if self.recording.is_none() {
+            match Recording::create(dir) {
+                Ok(r) => {
+                    console::event(format!("recording to {}", r.path().display()));
+                    self.recording = Some(r);
+                }
+                Err(e) => return self.record_stopped(format!("{e:#}")),
+            }
+        }
+        let Some(recording) = self.recording.as_mut() else {
+            return Ok(());
+        };
+        match write(recording) {
+            Ok(()) => Ok(()),
+            Err(e) => self.record_stopped(format!("{e:#}")),
+        }
+    }
+
+    fn record_stopped(&mut self, why: String) -> Result<()> {
+        if self.cli.publish.is_none() {
+            bail!("recording stopped: {why}");
+        }
+        console::event(format!("recording stopped: {why}; the publish carries on"));
+        if self.recording.is_none() {
+            self.record_failed = Some(why);
         }
         Ok(())
     }
@@ -1004,6 +1138,8 @@ impl<'a> Onward<'a> {
             }
             None => data,
         };
+        self.record(|r| r.video(timestamp.value, &payload))?;
+        self.recorded_only(payload.len());
         forward_av(
             &mut self.upstream,
             &mut self.meter,
@@ -1014,7 +1150,17 @@ impl<'a> Onward<'a> {
     }
 
     fn audio(&mut self, data: Bytes, timestamp: RtmpTimestamp) -> Result<()> {
+        self.record(|r| r.audio(timestamp.value, &data))?;
+        self.recorded_only(data.len());
         forward_av(&mut self.upstream, &mut self.meter, false, data, timestamp)
+    }
+
+    /// With nothing published, the rate on the panel and in the report is
+    /// what goes to the file.
+    fn recorded_only(&mut self, len: usize) {
+        if self.cli.publish.is_none() && self.recording.is_some() {
+            self.meter.add(len);
+        }
     }
 
     /// One pass over the ingest connection, then the report when it is due.
@@ -1069,7 +1215,15 @@ impl<'a> Onward<'a> {
             injector: self.injector.as_ref(),
             queued: self.queued(),
             holding: false,
+            recording: self.recording.as_ref(),
+            record_failed: self.record_failed.as_deref(),
         }
+    }
+}
+
+impl Drop for Onward<'_> {
+    fn drop(&mut self) {
+        self.close_recording();
     }
 }
 
@@ -1967,7 +2121,7 @@ fn report(
     if let Some(note) = injector.and_then(|i| oversize_note(i, cli)) {
         console::log(format!("  WARNING: {note}"));
     }
-    if kbps > cli.warn_kbps {
+    if cli.publish.is_some() && kbps > cli.warn_kbps {
         console::log(format!(
             "  WARNING: {kbps:.0} kb/s is above {:.0}. many ingests count video and audio \
              together against 6000 + 320 kb/s and warns for five minutes before \
@@ -2275,6 +2429,27 @@ mod tests {
         .unwrap();
         let e = source_login(&cli).unwrap_err().to_string();
         assert!(e.contains("both read stdin"), "{e}");
+    }
+
+    #[test]
+    fn recording_alone_needs_no_publish_and_no_key() {
+        for input in [
+            &["--listen", "127.0.0.1:1935"][..],
+            &["--source", "rtsp://h/p"],
+        ] {
+            let mut args = vec!["truss-relay", "--record", "."];
+            args.extend_from_slice(input);
+            args.extend_from_slice(&["--carriers", "sei-t35", "--passthrough"]);
+            let cli = Cli::try_parse_from(&args).unwrap();
+            assert!(stream_key(&cli).unwrap().is_none());
+        }
+        // The key belongs to a publish, so it is refused without one.
+        assert!(
+            Cli::try_parse_from(["truss-relay", "--record", ".", "--stream-key-file", "k"])
+                .is_err()
+        );
+        // Neither an output nor the OSC lane: nothing to do.
+        assert!(Cli::try_parse_from(["truss-relay", "--listen", "127.0.0.1:1935"]).is_err());
     }
 
     #[test]

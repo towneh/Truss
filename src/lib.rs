@@ -31,5 +31,6 @@ pub mod osc;
 pub mod payload;
 pub mod pull;
 pub mod record;
+pub mod recording;
 pub mod relay;
 pub mod source;

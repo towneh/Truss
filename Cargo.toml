@@ -53,6 +53,9 @@ tokio = { version = "1.53.1", features = ["rt", "time", "sync", "net", "macros"]
 futures = "0.3.34"
 url = "2.5.8"
 h264-reader = "0.8"
+# --record: local-time file names, and onMetaData written as an FLV script tag.
+jiff = "0.2.38"
+rml_amf0 = "0.3"
 
 [dev-dependencies]
 rosc = "0.11"

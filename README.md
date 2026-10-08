@@ -227,6 +227,44 @@ gap. An ingest that closes a silent publish sooner ends the session there, as
 MediaMTX does after 10 seconds, and the relay starts again when the source is
 back.
 
+## Recording the stream
+
+```sh
+truss-relay \
+  --listen 127.0.0.1:1935 \
+  --publish rtmp://ingest.example.net/live \
+  --stream-key-file /run/credentials/truss/key \
+  --artnet \
+  --record /var/lib/truss
+```
+
+`--record <dir>` writes the stream to an FLV file in that directory as it goes
+out, records included: the same tags the ingest receives. Each session gets a
+file of its own, named for the local time it started
+(`truss-20261008-201500.flv`), so an encoder reconnecting never overwrites one.
+With `--source`, a new file starts when a source that was declared down plays
+again. The directory has to exist when the relay starts.
+
+Leave out `--publish` to record without publishing, and no stream key is asked
+for. That tests a desk and an encoder together with no ingest at all.
+
+FLV has no index or trailer, so a recording cut short by a crash, a kill or a
+full disk still plays up to its last frame. If a write fails, the recording
+stops and the file is cut back to its last whole tag, the panel says why, and
+the publish carries on. With nothing published the session ends instead.
+
+To edit or share a recording, or to play an HEVC one in VLC 3, which cannot
+read HEVC from FLV, remux it to MP4 with ffmpeg. The records survive the
+remux.
+
+```sh
+ffmpeg -i truss-20261008-201500.flv -c copy show.mp4              # H.264
+ffmpeg -i truss-20261008-201500.flv -c copy -tag:v hvc1 show.mp4  # HEVC
+```
+
+`truss-detect` reads MPEG-TS, so check a recording through a remux to TS, as in
+[A dry run](#a-dry-run).
+
 ## Watching the desk with nothing else running
 
 The relay can send every record it builds to an OSC listener as well as into
@@ -284,6 +322,9 @@ machine.
 `--passthrough` relays without injecting anything. Set against a publish
 straight to the ingest it shows what the relay itself costs, and against a
 normal run what the records do.
+
+With no ingest in the picture at all, `--record` in place of `--publish` skips
+the stand-in: the relay writes what it would have published to a file.
 
 ## The stream key
 
@@ -422,6 +463,11 @@ with one, with no gaps on loopback, into the VRSL-URP source and into
 every one of 8,825 frames, no gaps and no decode errors, and through MediaMTX a
 source with B-frames, one with no audio, and one behind a login with Basic and
 with Digest.
+
+`--record` has written H.264 from an encoder and HEVC from a pulled source
+while publishing, and recorded alone with no publish; every file carried every
+record its ingest received and decoded clean, including one cut short by
+killing the relay.
 
 On an emulated slow or lossy uplink, with 100 to 300 ms of round trip and 0.05%
 to 0.5% packet loss between the relay and the ingest, no record was lost: every

@@ -257,6 +257,70 @@ pub fn serialise(flv: &Flv) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+/// Writes an FLV a tag at a time, for a file that grows while a stream runs.
+///
+/// FLV has no index or trailer, so a file cut anywhere plays up to its last
+/// whole tag. Each tag goes to `out` in one `write_all`, so after an error
+/// [`Writer::complete`] is where the last whole tag ends, and cutting the file
+/// back to it leaves nothing for a reader to trip on.
+pub struct Writer<W: std::io::Write> {
+    out: W,
+    complete: u64,
+    buf: Vec<u8>,
+}
+
+impl<W: std::io::Write> Writer<W> {
+    /// Start a file: the header, flagged as holding audio and video, then
+    /// PreviousTagSize0.
+    pub fn new(mut out: W) -> std::io::Result<Self> {
+        let mut head = b"FLV\x01\x05".to_vec();
+        head.extend_from_slice(&(FLV_HEADER_LEN as u32).to_be_bytes());
+        head.extend_from_slice(&0u32.to_be_bytes());
+        out.write_all(&head)?;
+        Ok(Self {
+            out,
+            complete: head.len() as u64,
+            buf: Vec::new(),
+        })
+    }
+
+    /// One tag: `kind` is [`TAG_AUDIO`], [`TAG_VIDEO`] or [`TAG_SCRIPT`],
+    /// `data` its body exactly as an RTMP message carries it.
+    pub fn tag(&mut self, kind: u8, timestamp: u32, data: &[u8]) -> std::io::Result<()> {
+        if data.len() > MAX_TAG_SIZE {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "a {} byte tag exceeds FLV's {MAX_TAG_SIZE} byte DataSize field",
+                    data.len()
+                ),
+            ));
+        }
+        self.buf.clear();
+        self.buf.push(kind);
+        self.buf
+            .extend_from_slice(&(data.len() as u32).to_be_bytes()[1..]);
+        self.buf.extend_from_slice(&timestamp.to_be_bytes()[1..]);
+        self.buf.push((timestamp >> 24) as u8);
+        self.buf.extend_from_slice(&[0, 0, 0]); // StreamID
+        self.buf.extend_from_slice(data);
+        self.buf
+            .extend_from_slice(&((data.len() + 11) as u32).to_be_bytes());
+        self.out.write_all(&self.buf)?;
+        self.complete += self.buf.len() as u64;
+        Ok(())
+    }
+
+    /// Bytes up to the end of the last tag written whole.
+    pub fn complete(&self) -> u64 {
+        self.complete
+    }
+
+    pub fn get_mut(&mut self) -> &mut W {
+        &mut self.out
+    }
+}
+
 /// NAL length size from the decoder configuration record in the sequence
 /// header: byte 4 of an avcC, byte 21 of an hvcC. Every access unit is framed
 /// with it, so guessing 4 and being wrong would corrupt all of them.
@@ -396,6 +460,80 @@ mod tests {
     fn audio_tags_carry_aac_and_their_packet_type() {
         assert_eq!(aac_sequence_header(&[0x11, 0x90]), [0xAF, 0, 0x11, 0x90]);
         assert_eq!(aac_frame(&[1, 2, 3]), [0xAF, 1, 1, 2, 3]);
+    }
+
+    #[test]
+    fn written_tags_read_back_unchanged() {
+        let big = vec![0x5A; MAX_TAG_SIZE];
+        // A legacy CodecID 12 HEVC frame, which no encoder to hand sends.
+        let codec_12 = [0x1C, 1, 0, 0, 0, 0, 0, 0, 3, 0x26, 0x01, 0xAA];
+        let tags = [
+            (TAG_SCRIPT, 0, &b"\x02\x00\x0aonMetaData"[..]),
+            (TAG_VIDEO, 0, &[0x17, 0, 0, 0, 0, 1, 0x42][..]),
+            (TAG_AUDIO, 21, &[0xAF, 1, 0x21][..]),
+            (TAG_VIDEO, 0x0100_0000 + 33, &codec_12[..]),
+            (TAG_VIDEO, u32::MAX, &big[..]),
+        ];
+        let mut w = Writer::new(Vec::new()).unwrap();
+        for (kind, ts, data) in tags {
+            w.tag(kind, ts, data).unwrap();
+        }
+        let bytes = std::mem::take(w.get_mut());
+        assert_eq!(w.complete(), bytes.len() as u64);
+        let flv = parse(&bytes).unwrap();
+        assert_eq!(flv.tags.len(), tags.len());
+        for (tag, (kind, ts, data)) in flv.tags.iter().zip(tags) {
+            assert_eq!((tag.kind, tag.timestamp, &tag.data[..]), (kind, ts, data));
+        }
+        assert!(matches!(
+            video(&flv.tags[3].data),
+            Video::Frame {
+                codec: VideoCodec::Hevc,
+                keyframe: true,
+                ..
+            }
+        ));
+        assert!(w.tag(TAG_VIDEO, 0, &vec![0; MAX_TAG_SIZE + 1]).is_err());
+    }
+
+    /// Takes `room` bytes, then refuses everything, as a full disk does,
+    /// keeping what it took.
+    struct FillsUp {
+        room: usize,
+        kept: Vec<u8>,
+    }
+
+    impl std::io::Write for FillsUp {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let n = buf.len().min(self.room - self.kept.len());
+            if n == 0 {
+                return Err(std::io::Error::other("no space left on device"));
+            }
+            self.kept.extend_from_slice(&buf[..n]);
+            Ok(n)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn after_a_failed_write_complete_marks_the_last_whole_tag() {
+        let mut w = Writer::new(FillsUp {
+            room: 13 + 2 * 20 + 7,
+            kept: Vec::new(),
+        })
+        .unwrap();
+        w.tag(TAG_AUDIO, 0, &[0xAF, 1, 1, 2, 3]).unwrap();
+        w.tag(TAG_AUDIO, 23, &[0xAF, 1, 4, 5, 6]).unwrap();
+        assert!(w.tag(TAG_AUDIO, 46, &[0xAF, 1, 7, 8, 9]).is_err());
+        let complete = w.complete() as usize;
+        assert_eq!(complete, 13 + 2 * 20);
+        let kept = &w.get_mut().kept;
+        assert_eq!(kept.len(), 13 + 2 * 20 + 7);
+        let flv = parse(&kept[..complete]).unwrap();
+        assert_eq!(flv.tags.len(), 2);
     }
 
     fn build(tags: &[Tag]) -> Vec<u8> {
