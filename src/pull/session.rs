@@ -62,6 +62,8 @@ struct Track {
     /// Server NTP time, in µs, at this stream's elapsed zero, by its latest
     /// sender report.
     last_report: Option<i64>,
+    /// Sender reports seen for this stream.
+    reports: u32,
     /// Where this stream's elapsed zero sits on the aligned timeline, once
     /// aligned.
     anchor: Option<i64>,
@@ -156,6 +158,7 @@ pub(super) async fn run(spec: &Spec, tx: &Tx, relayed: &mut bool) -> Result<(), 
                 }
             }
             tracks[which].last_report = Some(at_zero);
+            tracks[which].reports += 1;
             if matches!(align, Align::Waiting)
                 && tracks
                     .iter()
@@ -169,11 +172,7 @@ pub(super) async fn run(spec: &Spec, tx: &Tx, relayed: &mut bool) -> Result<(), 
         }
 
         if matches!(align, Align::Waiting) && Instant::now() >= align_by {
-            let risk = if tracks[AUDIO].index.is_some() {
-                ", so audio and video may be out of step"
-            } else {
-                ""
-            };
+            let note = fallback_note(&tracks);
             if tracks
                 .iter()
                 .all(|t| t.index.is_none() || t.last_report.is_some())
@@ -183,25 +182,10 @@ pub(super) async fn run(spec: &Spec, tx: &Tx, relayed: &mut bool) -> Result<(), 
                 }
                 rebase_anchors(&mut tracks);
                 align = Align::Reports;
-                send(
-                    tx,
-                    SourceEvent::Note(format!(
-                        "the source's sender reports did not agree within {ALIGN_LIMIT:?}; \
-                         aligned on the latest{risk}"
-                    )),
-                )
-                .await?;
             } else {
                 align = Align::Arrival;
-                send(
-                    tx,
-                    SourceEvent::Note(format!(
-                        "no sender reports from the source within {ALIGN_LIMIT:?}; aligned \
-                         on arrival{risk}"
-                    )),
-                )
-                .await?;
             }
+            send(tx, SourceEvent::Note(note)).await?;
             send(tx, SourceEvent::State(SourceState::WaitingForKeyframe)).await?;
         }
 
@@ -398,6 +382,54 @@ fn choose_streams(streams: &[(&str, &str)], audio: bool) -> ([Option<usize>; 2],
     (chosen, others)
 }
 
+/// What to tell the operator when [`ALIGN_LIMIT`] passes before every
+/// stream's sender reports agree. The streams are then aligned on their latest
+/// reports, or on arrival when one has none.
+///
+/// A stream's first report is the one a server gets wrong: seconds out on a
+/// resumed VRCDN session, a few hundred ms from a publisher behind MediaMTX
+/// that has only just started. Once each stream has a later one, aligning on
+/// it is sound and only the confirming report is missing, which a server
+/// reporting every 10 s cannot send in time.
+fn fallback_note(tracks: &[Track; 2]) -> String {
+    let risk = if tracks[AUDIO].index.is_some() {
+        ", so audio and video may be out of step"
+    } else {
+        ""
+    };
+    // The streams the source has, by name, that meet `short`.
+    let named = |short: fn(&Track) -> bool| -> Vec<&str> {
+        ["video", "audio"]
+            .into_iter()
+            .zip(tracks)
+            .filter(|(_, t)| t.index.is_some() && short(t))
+            .map(|(name, _)| name)
+            .collect()
+    };
+    let silent = named(|t| t.last_report.is_none());
+    let once = named(|t| t.reports == 1);
+    let present = tracks.iter().filter(|t| t.index.is_some()).count();
+    match (silent.as_slice(), once.as_slice()) {
+        ([], []) => format!(
+            "aligned on the latest sender reports after {ALIGN_LIMIT:?}, with none later in \
+             time to confirm them"
+        ),
+        ([], first) => format!(
+            "only one sender report for the {} within {ALIGN_LIMIT:?}; aligned on it{risk}",
+            first.join(" and the ")
+        ),
+        (none, _) if none.len() == present => {
+            format!(
+                "no sender reports from the source within {ALIGN_LIMIT:?}; aligned on arrival{risk}"
+            )
+        }
+        (none, _) => format!(
+            "no sender reports for the {} within {ALIGN_LIMIT:?}; aligned on arrival{risk}",
+            none.join(" and the ")
+        ),
+    }
+}
+
 /// Shift the anchors so the earliest sits at 0, keeping numbers small.
 fn rebase_anchors(tracks: &mut [Track; 2]) {
     let Some(base) = tracks.iter().filter_map(|t| t.anchor).min() else {
@@ -509,6 +541,46 @@ mod tests {
         rebase_anchors(&mut tracks);
         assert_eq!(tracks[VIDEO].anchor, Some(15_000));
         assert_eq!(tracks[AUDIO].anchor, Some(0));
+    }
+
+    fn track(reports: u32) -> Track {
+        Track {
+            index: Some(0),
+            last_report: (reports > 0).then_some(1_000),
+            reports,
+            anchor: None,
+        }
+    }
+
+    #[test]
+    fn the_fallback_warns_only_when_a_first_report_is_all_there_is() {
+        let calm = fallback_note(&[track(2), track(3)]);
+        assert!(!calm.contains("out of step"), "{calm}");
+        let first_only = fallback_note(&[track(2), track(1)]);
+        assert!(first_only.starts_with("only one sender report for the audio"));
+        assert!(first_only.contains("out of step"), "{first_only}");
+        // Video only: no audio to fall out of step with.
+        let video = fallback_note(&[track(1), Track::default()]);
+        assert!(!video.contains("out of step"), "{video}");
+    }
+
+    #[test]
+    fn the_fallback_names_the_stream_that_sent_no_reports() {
+        let audio = fallback_note(&[track(2), track(0)]);
+        assert!(
+            audio.starts_with("no sender reports for the audio"),
+            "{audio}"
+        );
+        let both = fallback_note(&[track(0), track(0)]);
+        assert!(
+            both.starts_with("no sender reports from the source"),
+            "{both}"
+        );
+        let video_only = fallback_note(&[track(0), Track::default()]);
+        assert!(
+            video_only.starts_with("no sender reports from the source"),
+            "{video_only}"
+        );
     }
 
     #[test]
