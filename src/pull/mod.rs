@@ -110,9 +110,11 @@ pub enum SourceEvent {
     /// Something the operator should know, logged once.
     Note(String),
     /// The video's parameters: before the first frame and whenever they
-    /// change. `avcc` is the AVCDecoderConfigurationRecord.
+    /// change. `config` is the decoder configuration record: an avcC for
+    /// H.264, an hvcC for HEVC.
     Video {
-        avcc: Vec<u8>,
+        codec: crate::codec::VideoCodec,
+        config: Vec<u8>,
         width: u32,
         height: u32,
         fps: Option<f64>,
@@ -124,7 +126,7 @@ pub enum SourceEvent {
         sample_rate: u32,
         channels: u16,
     },
-    /// One H.264 access unit, NAL units with 4-byte lengths, at its
+    /// One access unit, NAL units with 4-byte lengths, at its
     /// presentation time on the aligned timeline.
     VideoFrame {
         data: Vec<u8>,

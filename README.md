@@ -192,9 +192,10 @@ streams you run or have permission to carry. RTP runs over the RTSP
 connection, so no UDP ports are needed; `rtspt://` is accepted and means the
 same.
 
-The source needs H.264 video. AAC audio is carried, and any other audio is left
-out with a warning. `--source-audio drop` leaves AAC out as well, for a publish
-of the picture alone; the relay then does not ask the source for audio at all.
+The source needs H.264 or HEVC video; HEVC is published over Enhanced RTMP, as
+OBS sends it. AAC audio is carried, and any other audio is left out with a
+warning. `--source-audio drop` leaves AAC out as well, for a publish of the
+picture alone; the relay then does not ask the source for audio at all.
 
 A source that asks for a login, as a camera usually does, takes the user with
 `--source-user` and the password the way the relay takes the stream key (see

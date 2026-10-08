@@ -30,6 +30,7 @@ use rml_rtmp::sessions::{
 use rml_rtmp::time::RtmpTimestamp;
 use truss::artnet;
 use truss::carrier::{self, Carrier};
+use truss::codec::VideoCodec;
 use truss::console;
 use truss::creds;
 use truss::inject::{InjectOptions, Injector};
@@ -1245,6 +1246,7 @@ fn session_pull(
     let mut dts: Option<DtsWindow> = None;
     let mut rebase = Rebase::default();
     let mut records_said = false;
+    let mut codec = VideoCodec::H264;
     // The relay writes the onMetaData an encoder would have sent, from what
     // the source's parameters say.
     let mut metadata = StreamMetadata::new();
@@ -1268,18 +1270,21 @@ fn session_pull(
                 }
                 SourceEvent::Note(note) => console::event(format!("source: {note}")),
                 SourceEvent::Video {
-                    avcc,
+                    codec: video_codec,
+                    config,
                     width,
                     height,
                     fps,
                 } => {
+                    codec = video_codec;
                     if dts.is_none() {
-                        let depth = pull::timing::reorder_depth(&avcc);
+                        let depth = pull::timing::reorder_depth(codec, &config);
                         let frame_us = fps
                             .filter(|f| *f > 0.0)
                             .map_or(33_333, |f| (1e6 / f) as i64);
                         console::log(format!(
-                            "source video {width}x{height}, {}",
+                            "source video {} {width}x{height}, {}",
+                            codec.name(),
                             match depth {
                                 Some(0) => "no reordering".to_string(),
                                 Some(d) => format!("reorders up to {d} frames"),
@@ -1290,12 +1295,16 @@ fn session_pull(
                     }
                     metadata.video_width = Some(width);
                     metadata.video_height = Some(height);
-                    metadata.video_codec_id = Some(7);
+                    metadata.video_codec_id = Some(match codec {
+                        VideoCodec::H264 => 7,
+                        // Enhanced RTMP gives the FourCC as a number.
+                        VideoCodec::Hevc => u32::from_be_bytes(*b"hvc1"),
+                    });
                     metadata.video_frame_rate = fps.map(|f| f as f32);
                     onward.connect()?;
                     onward.metadata(&metadata)?;
                     onward.video(
-                        Bytes::from(truss::flv::avc_sequence_header(&avcc)),
+                        Bytes::from(truss::flv::video_sequence_header(codec, &config)),
                         RtmpTimestamp::new(rebase.last(VIDEO)),
                     )?;
                 }
@@ -1335,7 +1344,7 @@ fn session_pull(
                         ));
                     }
                     let cts = i64::from(rebase.ms(pts_us)) - i64::from(out);
-                    let tag = truss::flv::avc_frame(key, cts as i32, &data)?;
+                    let tag = truss::flv::video_frame(codec, key, cts as i32, &data)?;
                     onward.video(Bytes::from(tag), RtmpTimestamp::new(out))?;
                     if !records_said
                         && let Some(note) =

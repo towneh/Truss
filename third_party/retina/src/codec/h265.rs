@@ -87,7 +87,24 @@ struct AccessUnit {
     loss: u16,
 
     same_ts_as_prev: bool,
+
+    /// RTP payload bytes taken in for this access unit so far.
+    payload_bytes: usize,
 }
+
+/// Ceiling on the RTP payload one access unit may gather. Nothing else
+/// bounds it: a sender that holds the timestamp and never sets the marker
+/// grows the access unit for as long as it keeps sending. Far above any
+/// real frame.
+const MAX_AU_PAYLOAD_BYTES: usize = 16 << 20;
+
+/// Ceilings on the NAL units and payload pieces one access unit may hold. The
+/// payload ceiling alone lets a sender of tiny NAL units or fragments build
+/// millions of entries. A picture at level 6.2 has at most 600 slice segments,
+/// beside at most 16 VPS, 16 SPS and 64 PPS; a 16 MiB access unit in
+/// fragments of 256 bytes or more reaches the payload ceiling first.
+const MAX_AU_NALS: usize = 1 << 16;
+const MAX_AU_PIECES: usize = 1 << 16;
 
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
@@ -307,6 +324,12 @@ impl Depacketizer {
         let loss = pkt.loss();
         let timestamp = pkt.timestamp();
         let mut data = pkt.into_payload_bytes();
+        access_unit.payload_bytes += data.len();
+        if access_unit.payload_bytes > MAX_AU_PAYLOAD_BYTES {
+            return Err(format!(
+                "access unit exceeds {MAX_AU_PAYLOAD_BYTES} bytes of RTP payload"
+            ));
+        }
 
         let hdr = take_hdr(&mut data)?;
 
@@ -439,6 +462,11 @@ impl Depacketizer {
                 }
             }
             _ => return Err(format!("unexpected/bad nal header {hdr:?}")),
+        }
+        if self.nals.len() > MAX_AU_NALS || self.pieces.len() > MAX_AU_PIECES {
+            return Err(format!(
+                "access unit exceeds {MAX_AU_NALS} NAL units or {MAX_AU_PIECES} pieces"
+            ));
         }
 
         self.input_state = if mark {
@@ -727,6 +755,7 @@ impl AccessUnit {
             // TODO: overflow?
             loss: pkt.loss() + additional_loss,
             same_ts_as_prev,
+            payload_bytes: 0,
         }
     }
 }
@@ -1470,5 +1499,145 @@ mod tests {
         )
         .unwrap();
         assert_eq!(p.generic_parameters.pixel_dimensions(), (2304, 1296));
+    }
+
+    fn depacketizer() -> super::Depacketizer {
+        let mut d = super::Depacketizer::new(90_000, Some("profile-id=1;sprop-sps=QgEBAWAAAAMAsAAAAwAAAwBaoAWCAeFja5JFL83BQYFBAAADAAEAAAMADKE=;sprop-pps=RAHA8saNA7NA;sprop-vps=QAEMAf//AWAAAAMAsAAAAwAAAwBarAwAAAMABAAAAwAyqA==")).unwrap();
+        d.set_frame_format(crate::codec::FrameFormat {
+            parameter_set_insertion: crate::codec::ParameterSetInsertion::Never,
+            ..Default::default()
+        });
+        d
+    }
+
+    fn packet(
+        timestamp: i64,
+        sequence_number: u16,
+        mark: bool,
+        payload: Vec<u8>,
+    ) -> crate::rtp::ReceivedPacket {
+        ReceivedPacketBuilder {
+            ctx: PacketContext::dummy(),
+            stream_id: 0,
+            timestamp: crate::Timestamp {
+                timestamp,
+                clock_rate: NonZeroU32::new(90_000).unwrap(),
+                start: 0,
+            },
+            ssrc: 0,
+            sequence_number,
+            loss: 0,
+            mark,
+            payload_type: 0,
+        }
+        .build(payload)
+        .unwrap()
+    }
+
+    /// Every IRAP picture is a random access point, CRA and BLA as well as
+    /// IDR; other pictures are not.
+    #[test]
+    fn irap_pictures_are_random_access_points() {
+        init_logging();
+        let mut d = depacketizer();
+        // NAL types: IDR_N_LP 20, CRA_NUT 21, BLA_W_LP 16, TRAIL_R 1.
+        for (i, (unit_type, rap)) in [(20u8, true), (21, true), (16, true), (1, false)]
+            .into_iter()
+            .enumerate()
+        {
+            let i = u16::try_from(i).unwrap();
+            let nal = vec![unit_type << 1, 0x01, 0xAA, 0xBB];
+            d.push(packet(i64::from(i) * 3000, i, true, nal)).unwrap();
+            let Some(Ok(CodecItem::VideoFrame(frame))) = d.pull() else {
+                panic!("no frame for NAL type {unit_type}");
+            };
+            assert_eq!(frame.is_random_access_point(), rap, "NAL type {unit_type}");
+        }
+    }
+
+    /// An access unit that never ends is refused once its payload passes the
+    /// ceiling, and the depacketizer takes the next one afresh.
+    #[test]
+    fn an_access_unit_past_the_payload_ceiling_is_refused() {
+        init_logging();
+        let mut d = depacketizer();
+        let mut sei = vec![0x4e, 0x01];
+        sei.resize(60_000, 0x55);
+        let mut refused = None;
+        for seq in 0..=u16::try_from(super::MAX_AU_PAYLOAD_BYTES / 60_000).unwrap() {
+            if let Err(e) = d.push(packet(0, seq, false, sei.clone())) {
+                refused = Some((seq, e));
+                break;
+            }
+            assert_eq!(d.pull(), None);
+        }
+        let (seq, e) = refused.expect("never refused");
+        assert_eq!(usize::from(seq), super::MAX_AU_PAYLOAD_BYTES / 60_000);
+        assert!(e.contains("bytes of RTP payload"), "{e}");
+        assert!(d.nals.is_empty() && d.pieces.is_empty());
+
+        d.push(packet(3000, seq + 1, true, vec![0x28, 0x01, 0xAA]))
+            .unwrap();
+        assert!(matches!(d.pull(), Some(Ok(CodecItem::VideoFrame(_)))));
+    }
+
+    /// Aggregation packets of tiny NAL units are refused once the access
+    /// unit holds more NAL units than the ceiling, well under the payload one.
+    #[test]
+    fn an_access_unit_past_the_nal_ceiling_is_refused() {
+        init_logging();
+        let mut d = depacketizer();
+        const PER_PACKET: usize = 16_000;
+        let mut ap = vec![0x60, 0x01];
+        for _ in 0..PER_PACKET {
+            ap.extend_from_slice(&[0x00, 0x02, 0x4e, 0x01]);
+        }
+        let mut refused = None;
+        for seq in 0..=u16::try_from(super::MAX_AU_NALS / PER_PACKET).unwrap() {
+            if let Err(e) = d.push(packet(0, seq, false, ap.clone())) {
+                refused = Some((seq, e));
+                break;
+            }
+        }
+        let (seq, e) = refused.expect("never refused");
+        assert_eq!(usize::from(seq), super::MAX_AU_NALS / PER_PACKET);
+        assert!(e.contains("NAL units"), "{e}");
+        assert!(d.nals.is_empty() && d.pieces.is_empty());
+    }
+
+    /// Push packets built by `build(i)` into one access unit until one is
+    /// refused, and return its index and the error.
+    fn refused_at(build: impl Fn(usize) -> Vec<u8>) -> (usize, String) {
+        let mut d = depacketizer();
+        for i in 0..=super::MAX_AU_NALS + 1 {
+            let seq = u16::try_from(i % 65_536).unwrap();
+            if let Err(e) = d.push(packet(0, seq, false, build(i))) {
+                assert!(d.nals.is_empty() && d.pieces.is_empty());
+                return (i, e);
+            }
+        }
+        panic!("never refused");
+    }
+
+    /// One NAL unit per packet: refused at the 65,537th.
+    #[test]
+    fn single_nal_packets_past_the_nal_ceiling_are_refused() {
+        init_logging();
+        let (i, e) = refused_at(|_| vec![0x4e, 0x01]);
+        assert_eq!(i, super::MAX_AU_NALS);
+        assert!(e.contains("NAL units"), "{e}");
+    }
+
+    /// One NAL unit in fragments: refused at the 65,537th piece, empty
+    /// fragments included.
+    #[test]
+    fn fragments_past_the_piece_ceiling_are_refused() {
+        init_logging();
+        let (i, e) = refused_at(|i| {
+            let start = if i == 0 { 0x80 } else { 0 };
+            vec![0x62, 0x01, start | 1]
+        });
+        assert_eq!(i, super::MAX_AU_PIECES);
+        assert!(e.contains("pieces"), "{e}");
     }
 }

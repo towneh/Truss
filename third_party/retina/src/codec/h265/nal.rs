@@ -122,12 +122,6 @@ impl UnitType {
             | UnitType::RsvVclR13
             | UnitType::RsvVclN14
             | UnitType::RsvVclR15
-            | UnitType::BlaWLp
-            | UnitType::BlaWRadl
-            | UnitType::BlaNLp
-            | UnitType::CraNut
-            | UnitType::RsvIrapVcl22
-            | UnitType::RsvIrapVcl23
             | UnitType::RsvVcl24
             | UnitType::RsvVcl25
             | UnitType::RsvVcl26
@@ -136,7 +130,18 @@ impl UnitType {
             | UnitType::RsvVcl29
             | UnitType::RsvVcl30
             | UnitType::RsvVcl31 => UnitTypeClass::Vcl { intra_coded: false },
-            UnitType::IdrWRadl | UnitType::IdrNLp => UnitTypeClass::Vcl { intra_coded: true },
+            // Every IRAP picture, `BLA_W_LP` to `RSV_IRAP_VCL23`, as the
+            // depacketiser's random access check expects: a CRA starts
+            // decoding as well as an IDR does, and open-GOP encoders send
+            // nothing else.
+            UnitType::BlaWLp
+            | UnitType::BlaWRadl
+            | UnitType::BlaNLp
+            | UnitType::IdrWRadl
+            | UnitType::IdrNLp
+            | UnitType::CraNut
+            | UnitType::RsvIrapVcl22
+            | UnitType::RsvIrapVcl23 => UnitTypeClass::Vcl { intra_coded: true },
             _ => UnitTypeClass::NonVcl,
         }
     }
@@ -345,6 +350,7 @@ pub struct Sps {
     bit_depth_chroma_minus8: u8,
     short_term_pic_ref_sets: Vec<ShortTermRefPicSet>,
     vui: Option<VuiParameters>,
+    sps_max_num_reorder_pics: u32,
 }
 
 impl Sps {
@@ -389,6 +395,8 @@ impl Sps {
         let log2_max_pic_order_cnt_lsb_minus4 = r.read_ue("log2_max_pic_order_cnt_lsb_minus4")?;
         let sps_sub_layer_ordering_info_present_flag =
             r.read_bool("sps_sub_layer_ordering_info_present_flag")?;
+        // The value for the highest sub-layer, which is the last one read.
+        let mut sps_max_num_reorder_pics = 0;
         {
             let start = if sps_sub_layer_ordering_info_present_flag {
                 0
@@ -408,7 +416,7 @@ impl Sps {
                         "sps_max_dec_pic_buffering_minus1 must be in [0, 15]".to_owned(),
                     ));
                 }
-                let _sps_max_num_reorder_pics = r.read_ue("sps_max_num_reorder_pics")?;
+                sps_max_num_reorder_pics = r.read_ue("sps_max_num_reorder_pics")?;
                 let _sps_max_latency_increase_plus1 =
                     r.read_ue("sps_max_latency_increase_plus1")?;
             }
@@ -530,6 +538,7 @@ impl Sps {
             bit_depth_chroma_minus8,
             short_term_pic_ref_sets,
             vui,
+            sps_max_num_reorder_pics,
         })
     }
 
@@ -542,6 +551,13 @@ impl Sps {
 
     pub(crate) fn general_level_idc(&self) -> u8 {
         self.profile_tier_level.general_level_idc
+    }
+
+    /// `sps_max_num_reorder_pics` for the highest sub-layer: how many
+    /// pictures may precede any picture in decode order and follow it in
+    /// output order.
+    pub fn max_num_reorder_pics(&self) -> u32 {
+        self.sps_max_num_reorder_pics
     }
 
     /// The maximum sub layers, in the range [1, 7].
@@ -1539,6 +1555,21 @@ mod tests {
         let timing = vui.timing_info().unwrap();
         assert_eq!(timing.num_units_in_tick(), 1);
         assert_eq!(timing.time_scale(), 12);
+    }
+
+    /// SPSs from libx265 at 320x180 with `bframes=0` and `bframes=3` (B-pyramid,
+    /// its default): no reordering, then two pictures of it.
+    #[test]
+    fn parse_sps_max_num_reorder_pics() {
+        init_logging();
+        let no_b = &b"\x42\x01\x01\x01\x60\x00\x00\x03\x00\x90\x00\x00\x03\x00\x00\x03\x00\x3c\xa0\x0a\x08\x0b\x9f\x79\x64\xa9\x24\xca\xf0\x16\x80\x80\x00\x00\x03\x00\x80\x00\x00\x0f\x04"[..];
+        let three_b = &b"\x42\x01\x01\x01\x60\x00\x00\x03\x00\x90\x00\x00\x03\x00\x00\x03\x00\x3c\xa0\x0a\x08\x0b\x9f\x79\x65\x65\x92\x4c\xaf\x01\x68\x08\x00\x00\x03\x00\x08\x00\x00\x03\x00\xf0\x40"[..];
+        for (data, reorder) in [(no_b, 0), (three_b, 2)] {
+            let (h, bits) = split(data).unwrap();
+            assert_eq!(h.unit_type(), UnitType::SpsNut);
+            let sps = Sps::from_bits(LoggingBitReader(bits)).unwrap();
+            assert_eq!(sps.max_num_reorder_pics(), reorder);
+        }
     }
 
     #[test]

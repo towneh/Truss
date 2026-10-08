@@ -8,16 +8,31 @@ use std::time::Instant;
 use h264_reader::avcc::AvcDecoderConfigurationRecord;
 use h264_reader::nal::sps::SeqParameterSet;
 use h264_reader::nal::{Nal, RefNal};
+use retina::codec::h265::nal as hevc_nal;
 
-/// The deepest reorder the window will grow to: H.264's own limit.
+use crate::codec::VideoCodec;
+
+/// The deepest reorder the window will grow to: the most pictures either
+/// codec's decoded picture buffer can hold.
 const MAX_DEPTH: usize = 16;
 
 /// H.264 Baseline, which has no B-slices and so never reorders.
 const PROFILE_BASELINE: u8 = 66;
 
-/// How many frames the stream reorders by, from its configuration record:
-/// none for Baseline, else what the SPS states, when it states it.
-pub fn reorder_depth(avcc: &[u8]) -> Option<usize> {
+/// HEVC's SPS NAL unit type, as an hvcC array names it.
+const HEVC_SPS: u8 = 33;
+
+/// How many frames the stream reorders by, from its decoder configuration
+/// record (avcC or hvcC), when the SPS in it says.
+pub fn reorder_depth(codec: VideoCodec, config: &[u8]) -> Option<usize> {
+    match codec {
+        VideoCodec::H264 => avc_reorder_depth(config),
+        VideoCodec::Hevc => hevc_reorder_depth(config),
+    }
+}
+
+/// None for Baseline, else what the SPS's optional VUI states.
+fn avc_reorder_depth(avcc: &[u8]) -> Option<usize> {
     if avcc.get(1) == Some(&PROFILE_BASELINE) {
         return Some(0);
     }
@@ -29,6 +44,29 @@ pub fn reorder_depth(avcc: &[u8]) -> Option<usize> {
         .bitstream_restrictions?
         .max_num_reorder_frames;
     Some((frames as usize).min(MAX_DEPTH))
+}
+
+/// `sps_max_num_reorder_pics`, which every HEVC SPS states, from the first
+/// SPS in an hvcC: 22 bytes of fixed fields, then arrays of NAL units, each
+/// a type byte and a count, the units each behind a 16-bit length.
+fn hevc_reorder_depth(hvcc: &[u8]) -> Option<usize> {
+    let mut at = 23;
+    for _ in 0..*hvcc.get(22)? {
+        let ty = hvcc.get(at)? & 0x3F;
+        let count = u16::from_be_bytes(hvcc.get(at + 1..at + 3)?.try_into().ok()?);
+        at += 3;
+        for _ in 0..count {
+            let len = usize::from(u16::from_be_bytes(hvcc.get(at..at + 2)?.try_into().ok()?));
+            let nal = hvcc.get(at + 2..at + 2 + len)?;
+            if ty == HEVC_SPS {
+                let (_, bits) = hevc_nal::split(nal).ok()?;
+                let sps = hevc_nal::Sps::from_bits(bits).ok()?;
+                return Some((sps.max_num_reorder_pics() as usize).min(MAX_DEPTH));
+            }
+            at += 2 + len;
+        }
+    }
+    None
 }
 
 /// Decode times for video from presentation times alone, which is all RTP
@@ -228,8 +266,41 @@ mod tests {
 
     #[test]
     fn baseline_never_reorders() {
-        assert_eq!(reorder_depth(&[1, 66, 0xC0, 0x1F, 0xFF, 0xE1]), Some(0));
-        assert_eq!(reorder_depth(&[]), None);
+        assert_eq!(
+            reorder_depth(VideoCodec::H264, &[1, 66, 0xC0, 0x1F, 0xFF, 0xE1]),
+            Some(0)
+        );
+        assert_eq!(reorder_depth(VideoCodec::H264, &[]), None);
+    }
+
+    /// An hvcC holding `sps` as its only parameter set, after a VPS array
+    /// with nothing in it.
+    fn hvcc(sps: &[u8]) -> Vec<u8> {
+        let mut record = vec![
+            1, 0x01, 0x60, 0, 0, 0, 0x90, 0, 0, 0, 0, 0, 60, 0xF0, 0, 0xFC,
+        ];
+        record.extend_from_slice(&[0xFD, 0xF8, 0xF8, 0, 0, 0x0F]);
+        record.push(2);
+        record.extend_from_slice(&[0xA0, 0, 0]);
+        record.extend_from_slice(&[0xA1, 0, 1]);
+        record.extend_from_slice(&u16::try_from(sps.len()).unwrap().to_be_bytes());
+        record.extend_from_slice(sps);
+        record
+    }
+
+    #[test]
+    fn hevc_reorder_depth_is_read_from_the_sps() {
+        // libx265 at 320x180, bframes=0 and bframes=3 (B-pyramid).
+        let no_b = b"\x42\x01\x01\x01\x60\x00\x00\x03\x00\x90\x00\x00\x03\x00\x00\x03\x00\x3c\xa0\x0a\x08\x0b\x9f\x79\x64\xa9\x24\xca\xf0\x16\x80\x80\x00\x00\x03\x00\x80\x00\x00\x0f\x04";
+        let three_b = b"\x42\x01\x01\x01\x60\x00\x00\x03\x00\x90\x00\x00\x03\x00\x00\x03\x00\x3c\xa0\x0a\x08\x0b\x9f\x79\x65\x65\x92\x4c\xaf\x01\x68\x08\x00\x00\x03\x00\x08\x00\x00\x03\x00\xf0\x40";
+        assert_eq!(reorder_depth(VideoCodec::Hevc, &hvcc(no_b)), Some(0));
+        assert_eq!(reorder_depth(VideoCodec::Hevc, &hvcc(three_b)), Some(2));
+        let truncated = hvcc(three_b);
+        assert_eq!(
+            reorder_depth(VideoCodec::Hevc, &truncated[..truncated.len() - 10]),
+            None
+        );
+        assert_eq!(reorder_depth(VideoCodec::Hevc, &[1, 2, 3]), None);
     }
 
     #[test]

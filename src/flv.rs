@@ -276,22 +276,39 @@ pub fn nal_length_size(codec: VideoCodec, config: &[u8]) -> Result<usize> {
 /// AudioSpecificConfig instead.
 const AAC_SOUND_FLAGS: u8 = 0xAF;
 
-/// An H.264 sequence header as a video tag payload, wrapping an
-/// AVCDecoderConfigurationRecord.
-pub fn avc_sequence_header(avcc: &[u8]) -> Vec<u8> {
-    let mut out = vec![0x17, AVC_SEQUENCE_HEADER, 0, 0, 0];
-    out.extend_from_slice(avcc);
+/// A video sequence header as a tag payload, wrapping the decoder
+/// configuration record: an avcC for H.264, in the legacy layout, or an hvcC
+/// for HEVC, as an Enhanced RTMP SequenceStart.
+pub fn video_sequence_header(codec: VideoCodec, config: &[u8]) -> Vec<u8> {
+    let mut out = match codec {
+        VideoCodec::H264 => vec![0x17, AVC_SEQUENCE_HEADER, 0, 0, 0],
+        VideoCodec::Hevc => {
+            let mut out = vec![EX_HEADER | 1 << 4 | EX_SEQUENCE_START];
+            out.extend_from_slice(b"hvc1");
+            out
+        }
+    };
+    out.extend_from_slice(config);
     out
 }
 
-/// One H.264 access unit as a video tag payload. `nals` are length-prefixed
-/// as the stream's sequence header declares, and `cts_ms` is presentation
-/// minus decode time, which the tag carries as a signed 24-bit field.
-pub fn avc_frame(keyframe: bool, cts_ms: i32, nals: &[u8]) -> Result<Vec<u8>> {
+/// One access unit as a video tag payload, laid out as
+/// [`video_sequence_header`] lays out its codec. `nals` are length-prefixed
+/// as the sequence header declares, and `cts_ms` is presentation minus
+/// decode time, which the tag carries as a signed 24-bit field.
+pub fn video_frame(codec: VideoCodec, keyframe: bool, cts_ms: i32, nals: &[u8]) -> Result<Vec<u8>> {
     if !(-0x80_0000..0x80_0000).contains(&cts_ms) {
         bail!("composition time {cts_ms} ms does not fit the tag's 24-bit field");
     }
-    let mut out = vec![if keyframe { 0x17 } else { 0x27 }, AVC_NALU];
+    let frame_type: u8 = if keyframe { 1 } else { 2 };
+    let mut out = match codec {
+        VideoCodec::H264 => vec![frame_type << 4 | 7, AVC_NALU],
+        VideoCodec::Hevc => {
+            let mut out = vec![EX_HEADER | frame_type << 4 | EX_CODED_FRAMES];
+            out.extend_from_slice(b"hvc1");
+            out
+        }
+    };
     out.extend_from_slice(&cts_ms.to_be_bytes()[1..]);
     out.extend_from_slice(nals);
     Ok(out)
@@ -318,41 +335,61 @@ mod tests {
 
     #[test]
     fn built_video_tags_read_back_as_what_they_were_built_from() {
-        let avcc = [1, 0x42, 0xC0, 0x1F, 0xFF, 0xE1];
-        let header = avc_sequence_header(&avcc);
-        assert_eq!(
-            video(&header),
-            Video::Config {
-                codec: VideoCodec::H264,
-                body: 5
-            }
-        );
-        assert_eq!(&header[5..], &avcc);
-
-        let nals = [0, 0, 0, 2, 0x65, 0xAA];
-        for (key, cts) in [(true, 0), (false, 67), (false, -33)] {
-            let frame = avc_frame(key, cts, &nals).unwrap();
+        // The body starts after the 5-byte legacy header, or after the
+        // Enhanced RTMP byte, the FourCC and, on a frame, the composition time.
+        for (codec, config, nals, config_body, frame_body) in [
+            (
+                VideoCodec::H264,
+                &[1, 0x42, 0xC0, 0x1F, 0xFF, 0xE1][..],
+                &[0, 0, 0, 2, 0x65, 0xAA][..],
+                5,
+                5,
+            ),
+            (
+                VideoCodec::Hevc,
+                &[1, 0x01, 0x60, 0, 0, 0][..],
+                &[0, 0, 0, 3, 0x26, 0x01, 0xAA][..],
+                5,
+                8,
+            ),
+        ] {
+            let header = video_sequence_header(codec, config);
             assert_eq!(
-                video(&frame),
-                Video::Frame {
-                    codec: VideoCodec::H264,
-                    keyframe: key,
-                    body: 5
+                video(&header),
+                Video::Config {
+                    codec,
+                    body: config_body
                 }
             );
-            let field = i32::from_be_bytes([0, frame[2], frame[3], frame[4]]);
-            let read = (field << 8) >> 8;
-            assert_eq!(read, cts);
-            assert_eq!(&frame[5..], &nals);
+            assert_eq!(&header[config_body..], config);
+
+            for (key, cts) in [(true, 0), (false, 67), (false, -33)] {
+                let frame = video_frame(codec, key, cts, nals).unwrap();
+                assert_eq!(
+                    video(&frame),
+                    Video::Frame {
+                        codec,
+                        keyframe: key,
+                        body: frame_body
+                    }
+                );
+                let at = frame_body - 3;
+                let field = i32::from_be_bytes([0, frame[at], frame[at + 1], frame[at + 2]]);
+                let read = (field << 8) >> 8;
+                assert_eq!(read, cts, "{}", codec.name());
+                assert_eq!(&frame[frame_body..], nals);
+            }
         }
     }
 
     #[test]
     fn a_composition_time_past_24_bits_is_refused() {
-        assert!(avc_frame(false, 0x7F_FFFF, &[]).is_ok());
-        assert!(avc_frame(false, -0x80_0000, &[]).is_ok());
-        assert!(avc_frame(false, 0x80_0000, &[]).is_err());
-        assert!(avc_frame(false, -0x80_0001, &[]).is_err());
+        for codec in [VideoCodec::H264, VideoCodec::Hevc] {
+            assert!(video_frame(codec, false, 0x7F_FFFF, &[]).is_ok());
+            assert!(video_frame(codec, false, -0x80_0000, &[]).is_ok());
+            assert!(video_frame(codec, false, 0x80_0000, &[]).is_err());
+            assert!(video_frame(codec, false, -0x80_0001, &[]).is_err());
+        }
     }
 
     #[test]

@@ -17,6 +17,7 @@ use tokio::sync::mpsc;
 use tokio::time::{Instant, timeout};
 
 use super::{SourceEvent, SourceState, Spec};
+use crate::codec::VideoCodec;
 
 /// DESCRIBE, SETUP and PLAY together.
 const OPEN_DEADLINE: Duration = Duration::from_secs(15);
@@ -107,6 +108,11 @@ pub(super) async fn run(spec: &Spec, tx: &Tx, relayed: &mut bool) -> Result<(), 
     let mut gate: Option<i64> = None;
     let mut audio_described = false;
     let mut awaiting_key = false;
+    // Presentation time of the keyframe the video last started or resumed
+    // on. A frame due to be shown before it is a leading picture of that
+    // keyframe: in HEVC after a CRA, one that refers to pictures the publish
+    // never had, and a decoder starting there drops it anyway.
+    let mut floor: Option<i64> = None;
 
     loop {
         let item = match timeout(FEED_STALL, demuxed.next()).await {
@@ -229,6 +235,11 @@ pub(super) async fn run(spec: &Spec, tx: &Tx, relayed: &mut bool) -> Result<(), 
                 if (opening || awaiting_key) && !key {
                     continue;
                 }
+                if opening || awaiting_key {
+                    floor = Some(pts);
+                } else if floor.is_some_and(|f| pts < f) {
+                    continue;
+                }
                 awaiting_key = false;
                 if opening || frame.has_new_parameters() {
                     let Some(event) = video_parameters(&demuxed, tracks[VIDEO].index) else {
@@ -285,7 +296,7 @@ pub(super) async fn run(spec: &Spec, tx: &Tx, relayed: &mut bool) -> Result<(), 
     }
 }
 
-/// DESCRIBE, then SETUP of the H.264 video and any AAC audio over the RTSP
+/// DESCRIBE, then SETUP of the H.264 or HEVC video and any AAC audio over the RTSP
 /// connection, then PLAY.
 async fn open(spec: &Spec, tx: &Tx) -> Result<(Session<retina::client::Playing>, [Track; 2]), End> {
     let options = SessionOptions::default()
@@ -312,7 +323,7 @@ async fn open(spec: &Spec, tx: &Tx) -> Result<(Session<retina::client::Playing>,
             "the source has no streams".into()
         } else {
             format!(
-                "the source has no H.264 video, which records ride in. It has: {}",
+                "the source has no H.264 or HEVC video, which records ride in. It has: {}",
                 others.join(", ")
             )
         }));
@@ -381,7 +392,7 @@ fn failed(spec: &Spec, request: &str, e: &retina::Error) -> End {
     })
 }
 
-/// The first H.264 video and, when `audio`, the first AAC audio, by index,
+/// The first H.264 or HEVC video and, when `audio`, the first AAC audio, by index,
 /// and the streams that will not be relayed. Audio left out by choice is not
 /// listed with them.
 fn choose_streams(streams: &[(&str, &str)], audio: bool) -> ([Option<usize>; 2], Vec<String>) {
@@ -389,7 +400,7 @@ fn choose_streams(streams: &[(&str, &str)], audio: bool) -> ([Option<usize>; 2],
     let mut others = Vec::new();
     for (index, &(media, encoding)) in streams.iter().enumerate() {
         match (media, encoding) {
-            ("video", "h264") if chosen[VIDEO].is_none() => chosen[VIDEO] = Some(index),
+            ("video", "h264" | "h265") if chosen[VIDEO].is_none() => chosen[VIDEO] = Some(index),
             ("audio", _) if !audio => {}
             ("audio", "mpeg4-generic") if chosen[AUDIO].is_none() => chosen[AUDIO] = Some(index),
             _ => others.push(format!("{media} {encoding}")),
@@ -424,8 +435,13 @@ fn video_parameters(
     demuxed: &retina::client::Demuxed,
     index: Option<usize>,
 ) -> Option<SourceEvent> {
-    let ParametersRef::Video(v) = demuxed.streams()[index?].parameters()? else {
+    let stream = &demuxed.streams()[index?];
+    let ParametersRef::Video(v) = stream.parameters()? else {
         return None;
+    };
+    let codec = match stream.encoding_name() {
+        "h265" => VideoCodec::Hevc,
+        _ => VideoCodec::H264,
     };
     let (width, height) = v.pixel_dimensions();
     let fps = v
@@ -433,7 +449,8 @@ fn video_parameters(
         .filter(|&(num, den)| num > 0 && den > 0)
         .map(|(num, den)| f64::from(den) / f64::from(num));
     Some(SourceEvent::Video {
-        avcc: v.extra_data().to_vec(),
+        codec,
+        config: v.extra_data().to_vec(),
         width,
         height,
         fps,
@@ -459,20 +476,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_first_h264_and_aac_are_chosen_and_the_rest_named() {
+    fn the_first_video_and_aac_are_chosen_and_the_rest_named() {
         let streams = [
             ("audio", "pcmu"),
             ("video", "h264"),
             ("audio", "mpeg4-generic"),
-            ("video", "h264"),
+            ("video", "h265"),
             ("application", "onvif.metadata"),
         ];
         let (chosen, others) = choose_streams(&streams, true);
         assert_eq!(chosen, [Some(1), Some(2)]);
         assert_eq!(
             others,
-            ["audio pcmu", "video h264", "application onvif.metadata"]
+            ["audio pcmu", "video h265", "application onvif.metadata"]
         );
+        let (chosen, _) = choose_streams(&[("video", "h265"), ("video", "h264")], true);
+        assert_eq!(chosen, [Some(0), None]);
     }
 
     #[test]

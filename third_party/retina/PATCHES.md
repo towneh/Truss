@@ -61,9 +61,28 @@ dropped. The source matches the crates.io release apart from these changes:
   sent neither grew it without limit, and one-byte NAL units or fragments
   built millions of entries inside the payload ceiling. The counts clear
   one slice per macroblock at level 5.2 (36,864) with every SPS and PPS
-  beside them. The H.265 depacketizer has the same shape and is left
-  alone: the engine sets up no H.265 stream. Covered by
-  `media-rtsp/tests/h264_access_unit_bound.rs`.
+  beside them. Covered by `media-rtsp/tests/h264_access_unit_bound.rs`.
+- `src/codec/h265.rs`, `push_inner`: the same three ceilings on an H.265
+  access unit, at the same points, for the same reason. The counts clear
+  the 600 slice segments a picture may have at level 6.2 with every VPS,
+  SPS and PPS beside them. Covered in that file: the payload ceiling
+  (`an_access_unit_past_the_payload_ceiling_is_refused`), the NAL ceiling
+  in single-NAL and aggregation packets
+  (`single_nal_packets_past_the_nal_ceiling_are_refused`,
+  `an_access_unit_past_the_nal_ceiling_is_refused`) and the piece ceiling
+  in fragments (`fragments_past_the_piece_ceiling_are_refused`). Added in
+  Truss, which sets up H.265 streams; the Basis media player does not.
+- `src/codec/h265/nal.rs`, `UnitType::unit_type_class`: every IRAP type
+  (`BLA_W_LP` to `RSV_IRAP_VCL23`) is `intra_coded`, not IDR alone. The
+  depacketizer's random access check treats any IRAP as one, as its comment
+  says, but read this flag, so a CRA or BLA picture was never a random
+  access point. Open-GOP encoders, x265 by default, send CRA keyframes and
+  no IDR after the first. Covered by `irap_pictures_are_random_access_points`
+  in `src/codec/h265.rs`. Added in Truss.
+- `src/codec/h265/nal.rs`, `Sps`: `sps_max_num_reorder_pics` for the
+  highest sub-layer is kept and read through `max_num_reorder_pics()`, where
+  upstream parsed it and dropped it. Covered by
+  `parse_sps_max_num_reorder_pics`. Added in Truss.
 - `src/codec/h265/nal.rs`, `Sps::from_bits` and `ScalingListData::from_bits`:
   the reads of `palette_max_size` and `scaling_list_delta_coef` propagate
   their errors. Upstream dropped them, so an SPS with an unreadable code in
@@ -102,7 +121,7 @@ scottlamb/retina. The copy can go once a release carries them.
 cargo test --manifest-path third_party/retina/Cargo.toml --lib
 ```
 
-All 124 pass with the patches applied. `Cargo.toml` names the `mylog`
+All 130 pass with the patches applied. `Cargo.toml` names the `mylog`
 dev-dependency that crates.io's copy leaves out (it is a git dependency, which
 a published manifest cannot carry), pinned to the commit these results came
 from; `src/testutil.rs` needs it. It is resolved only when retina's tests are
