@@ -63,6 +63,15 @@ struct Cli {
     source: Option<String>,
     #[arg(skip)]
     pull: Option<pull::Spec>,
+    /// User to log in to the source as, when it asks for one, as a camera
+    /// usually does. The password is never a flag: see --source-password-file.
+    #[arg(long, requires = "source", value_name = "NAME")]
+    source_user: Option<String>,
+    /// File holding the source's password, or `-` to read it from stdin.
+    /// Without it the password is looked for in TRUSS_SOURCE_PASSWORD, then
+    /// asked for if this is a terminal.
+    #[arg(long, requires = "source_user", value_name = "PATH")]
+    source_password_file: Option<String>,
     /// What to do with Truss records the source already carries, as a stream
     /// that has been through a relay does: strip them, or keep them beside
     /// this relay's own, to measure a hop.
@@ -202,8 +211,12 @@ fn main() -> Result<()> {
         );
     }
 
-    // Resolved before the listener is bound. A missing key should fail while
-    // the operator is still watching, not on the first frame of a show.
+    // Resolved before the listener is bound. A missing key or password should
+    // fail while the operator is still watching, not on the first frame of a
+    // show.
+    if let Some(login) = source_login(&cli)? {
+        cli.pull = cli.pull.take().map(|spec| spec.with_login(login));
+    }
     let key = stream_key(&cli)?;
 
     // Bound once for the life of the relay rather than per session: a desk
@@ -253,7 +266,10 @@ fn main() -> Result<()> {
 
     let listener = match (&cli.publish, &cli.pull) {
         (Some(_), Some(spec)) => {
-            println!("relay pulling from {}", spec.display());
+            match cli.source_user.as_deref() {
+                Some(user) => println!("relay pulling from {} as {user}", spec.display()),
+                None => println!("relay pulling from {}", spec.display()),
+            }
             println!("  forwarding to {} (key hidden)", cli.target.url());
             None
         }
@@ -337,6 +353,7 @@ fn main() -> Result<()> {
                 &mut dash,
             ) {
                 Ok(()) => console::event("-- session ended cleanly"),
+                Err(e) if e.is::<SourceRefused>() => return Err(e),
                 Err(e) => console::event(format!("-- session ended: {e:#}")),
             }
             std::thread::sleep(pull::RECONNECT_CAP);
@@ -418,16 +435,43 @@ fn main() -> Result<()> {
 
 /// The key to publish with, whenever there is a publish: passthrough leaves
 /// the stream alone but still has to be let in by the ingest.
-fn stream_key(cli: &Cli) -> Result<Option<creds::StreamKey>> {
+fn stream_key(cli: &Cli) -> Result<Option<creds::Secret>> {
     if cli.publish.is_none() {
         return Ok(None);
     }
-    creds::StreamKey::resolve(
+    creds::Secret::resolve(
+        &creds::STREAM_KEY,
         cli.stream_key_file.as_deref(),
         "truss",
         &cli.target.authority,
     )
     .map(Some)
+}
+
+/// The login for the source, when --source-user names one. Resolved like the
+/// stream key, with its own file flag and variable.
+fn source_login(cli: &Cli) -> Result<Option<pull::Login>> {
+    let (Some(user), Some(spec)) = (cli.source_user.as_deref(), cli.pull.as_ref()) else {
+        return Ok(None);
+    };
+    if user.is_empty() {
+        bail!("--source-user is empty");
+    }
+    if cli.source_password_file.as_deref() == Some("-")
+        && cli.stream_key_file.as_deref() == Some("-")
+    {
+        bail!("--stream-key-file and --source-password-file cannot both read stdin");
+    }
+    let password = creds::Secret::resolve(
+        &creds::SOURCE_PASSWORD,
+        cli.source_password_file.as_deref(),
+        "truss",
+        &spec.display(),
+    )?;
+    Ok(Some(pull::Login {
+        user: user.to_owned(),
+        password,
+    }))
 }
 
 /// One pass over the Art-Net lane while no publisher is connected: the status
@@ -822,7 +866,7 @@ struct Onward<'a> {
     cli: &'a Cli,
     artnet: Option<&'a artnet::Receiver>,
     osc: &'a mut Option<osc::Sender>,
-    key: Option<&'a creds::StreamKey>,
+    key: Option<&'a creds::Secret>,
     injector: Option<Injector>,
     upstream: Option<Upstream>,
     meter: RateMeter,
@@ -841,7 +885,7 @@ impl<'a> Onward<'a> {
         carriers: &[Carrier],
         artnet: Option<&'a artnet::Receiver>,
         osc: &'a mut Option<osc::Sender>,
-        key: Option<&'a creds::StreamKey>,
+        key: Option<&'a creds::Secret>,
     ) -> Result<Self> {
         let injector = (!cli.passthrough)
             .then(|| {
@@ -1018,7 +1062,7 @@ fn session_listen(
     carriers: &[Carrier],
     artnet: Option<&artnet::Receiver>,
     osc: &mut Option<osc::Sender>,
-    key: Option<&creds::StreamKey>,
+    key: Option<&creds::Secret>,
     peer: &str,
     dash: &mut Dashboard,
     idle_timeout: Duration,
@@ -1152,6 +1196,18 @@ fn session_listen(
     onward.report(0)
 }
 
+/// The source refused the login. The relay stops rather than start again.
+#[derive(Debug)]
+struct SourceRefused(String);
+
+impl std::fmt::Display for SourceRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for SourceRefused {}
+
 /// A session fed by the RTSP source named in `--source`. It ends when the
 /// source does.
 #[allow(clippy::too_many_arguments)]
@@ -1161,7 +1217,7 @@ fn session_pull(
     carriers: &[Carrier],
     artnet: Option<&artnet::Receiver>,
     osc: &mut Option<osc::Sender>,
-    key: Option<&creds::StreamKey>,
+    key: Option<&creds::Secret>,
     dash: &mut Dashboard,
 ) -> Result<()> {
     let started = Instant::now();
@@ -1292,6 +1348,7 @@ fn session_pull(
                     dts = None;
                     rebase = Rebase::default();
                 }
+                SourceEvent::Refused(why) => return Err(SourceRefused(why).into()),
             }
         }
 
@@ -1372,7 +1429,7 @@ fn publisher_event(
 /// anything arrived.
 fn service_upstream(
     up: &mut Upstream,
-    key: Option<&creds::StreamKey>,
+    key: Option<&creds::Secret>,
     meter: &mut RateMeter,
     buf: &mut [u8],
 ) -> Result<bool> {
@@ -2129,6 +2186,70 @@ mod tests {
         assert!(key.unwrap().is_some());
     }
 
+    fn pull_cli(extra: &[&str]) -> Result<Cli> {
+        let mut args = vec![
+            "truss-relay",
+            "--source",
+            "rtsp://127.0.0.1:9/cam",
+            "--publish",
+            "rtmp://127.0.0.1:9/live",
+        ];
+        args.extend_from_slice(extra);
+        let mut cli = Cli::try_parse_from(args)?;
+        cli.pull = Some(pull::Spec::parse(cli.source.as_deref().unwrap())?);
+        Ok(cli)
+    }
+
+    #[test]
+    fn a_source_password_is_read_from_its_file_for_the_named_user() {
+        let path =
+            std::env::temp_dir().join(format!("truss-relay-source-pw-{}", std::process::id()));
+        std::fs::write(&path, "pass word\n").unwrap();
+        let cli = pull_cli(&[
+            "--source-user",
+            "admin",
+            "--source-password-file",
+            path.to_str().unwrap(),
+        ])
+        .unwrap();
+        let login = source_login(&cli);
+        std::fs::remove_file(&path).unwrap();
+        let login = login.unwrap().unwrap();
+        assert_eq!(login.user, "admin");
+        assert_eq!(login.password.expose(), "pass word");
+    }
+
+    #[test]
+    fn a_source_login_needs_a_source_and_a_user() {
+        assert!(pull_cli(&[]).is_ok_and(|cli| source_login(&cli).unwrap().is_none()));
+        assert!(pull_cli(&["--source-password-file", "pw"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "truss-relay",
+                "--publish",
+                "rtmp://127.0.0.1:9/live",
+                "--source-user",
+                "admin",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn the_key_and_the_source_password_cannot_both_come_from_stdin() {
+        let cli = pull_cli(&[
+            "--stream-key-file",
+            "-",
+            "--source-user",
+            "admin",
+            "--source-password-file",
+            "-",
+        ])
+        .unwrap();
+        let e = source_login(&cli).unwrap_err().to_string();
+        assert!(e.contains("both read stdin"), "{e}");
+    }
+
     #[test]
     fn the_osc_lane_alone_needs_no_key() {
         let cli =
@@ -2244,7 +2365,7 @@ mod tests {
         let mut cli =
             Cli::try_parse_from(["truss-relay", "--publish", &url, "--passthrough"]).unwrap();
         cli.target = Ingest::parse(&url).unwrap();
-        let key = creds::StreamKey::new("k").unwrap();
+        let key = creds::Secret::new(&creds::STREAM_KEY, "k").unwrap();
         let (publisher, relay) = connected();
         let encoder = flooding_publisher(publisher);
         let started = Instant::now();

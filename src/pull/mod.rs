@@ -18,10 +18,21 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{Result, bail};
 use tokio::sync::mpsc;
 
+use crate::creds;
+
 /// An RTSP source to pull from.
 #[derive(Clone, Debug)]
 pub struct Spec {
     url: url::Url,
+    login: Option<Login>,
+}
+
+/// A user and password for a source that asks for them. Retina answers
+/// Basic and Digest challenges with it; it never goes in the URL.
+#[derive(Clone, Debug)]
+pub struct Login {
+    pub user: String,
+    pub password: creds::Secret,
 }
 
 impl Spec {
@@ -48,13 +59,22 @@ impl Spec {
         if !url.username().is_empty() || url.password().is_some() {
             bail!(
                 "--source carries a user and password, which the relay will not print or \
-                 pass in a URL. Sources that need them are not supported yet"
+                 pass in a URL. Give the user with --source-user and the password with \
+                 --source-password-file or TRUSS_SOURCE_PASSWORD"
             );
         }
         if url.host_str().is_none_or(str::is_empty) {
             bail!("--source names no host");
         }
-        Ok(Self { url })
+        Ok(Self { url, login: None })
+    }
+
+    /// Log in to the source with `login` when it asks.
+    pub fn with_login(self, login: Login) -> Self {
+        Self {
+            login: Some(login),
+            ..self
+        }
     }
 
     /// The URL to show: scheme, host, port and path, nothing after them.
@@ -105,6 +125,10 @@ pub enum SourceEvent {
     /// The quick reconnects have all failed. Attempts carry on every
     /// [`RECONNECT_CAP`] or so; the relay closes its publish until one plays.
     Down,
+    /// The source refused the login, or asked for one the relay was not
+    /// given. Nothing more is tried: the same password cannot succeed, and a
+    /// camera that counts failed logins would lock the account.
+    Refused(String),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -171,7 +195,8 @@ const CHANNEL_DEPTH: usize = 512;
 
 /// Start pulling `spec` on its own thread. When a session ends the thread
 /// sends [`SourceEvent::Lost`] and reconnects, quickly at first and then
-/// every [`RECONNECT_CAP`], until the receiver is dropped.
+/// every [`RECONNECT_CAP`], until the receiver is dropped or the source
+/// refuses the login ([`SourceEvent::Refused`]).
 pub fn spawn(spec: Spec) -> Result<mpsc::Receiver<SourceEvent>> {
     let (tx, rx) = mpsc::channel(CHANNEL_DEPTH);
     std::thread::Builder::new()
@@ -197,7 +222,13 @@ pub fn spawn(spec: Spec) -> Result<mpsc::Receiver<SourceEvent>> {
                     Ok(()) => "the source ended the session".to_string(),
                     // Retina follows its message with the connection and
                     // message ids on lines of their own.
-                    Err(e) => e.lines().next().unwrap_or_default().trim_end().to_string(),
+                    Err(session::End::Lost(e)) => {
+                        e.lines().next().unwrap_or_default().trim_end().to_string()
+                    }
+                    Err(session::End::Refused(why)) => {
+                        let _ = tx.blocking_send(SourceEvent::Refused(why));
+                        return;
+                    }
                 };
                 failures = if relayed { 1 } else { failures + 1 };
                 let attempt = failures;
@@ -263,5 +294,108 @@ mod tests {
             let e = Spec::parse(url).unwrap_err().to_string();
             assert!(!e.contains("sk_secret"), "{url}: {e}");
         }
+    }
+
+    /// A server that answers every request with 401, asking for Basic auth,
+    /// and passes on each request's head.
+    fn refusing_server() -> (u16, std::sync::mpsc::Receiver<String>) {
+        use std::io::{BufRead, BufReader, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (seen, requests) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                let Ok(mut conn) = conn else { return };
+                let seen = seen.clone();
+                std::thread::spawn(move || {
+                    let mut reader = BufReader::new(conn.try_clone().unwrap());
+                    loop {
+                        let mut head = String::new();
+                        loop {
+                            let mut line = String::new();
+                            if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                                return;
+                            }
+                            if line == "\r\n" {
+                                break;
+                            }
+                            head.push_str(&line);
+                        }
+                        let cseq = head
+                            .lines()
+                            .find_map(|l| {
+                                l.split_once(':')
+                                    .filter(|(k, _)| k.eq_ignore_ascii_case("cseq"))
+                            })
+                            .map_or("0", |(_, v)| v.trim())
+                            .to_owned();
+                        let _ = seen.send(head);
+                        let _ = write!(
+                            conn,
+                            "RTSP/1.0 401 Unauthorized\r\nCSeq: {cseq}\r\n\
+                             WWW-Authenticate: Basic realm=\"truss\"\r\nContent-Length: 0\r\n\r\n"
+                        );
+                    }
+                });
+            }
+        });
+        (port, requests)
+    }
+
+    /// Everything the source thread sends, until it stops.
+    fn events_until_stopped(spec: Spec) -> Vec<SourceEvent> {
+        let mut rx = spawn(spec).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut events = Vec::new();
+        loop {
+            match rx.try_recv() {
+                Ok(event) => events.push(event),
+                Err(mpsc::error::TryRecvError::Disconnected) => return events,
+                Err(mpsc::error::TryRecvError::Empty) => {
+                    assert!(Instant::now() < deadline, "still running: {events:?}");
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_refused_login_is_sent_once_and_not_tried_again() {
+        let (port, requests) = refusing_server();
+        let spec = Spec::parse(&format!("rtsp://127.0.0.1:{port}/cam"))
+            .unwrap()
+            .with_login(Login {
+                user: "user".into(),
+                password: creds::Secret::new(&creds::SOURCE_PASSWORD, "sk_secret_pw").unwrap(),
+            });
+        let events = events_until_stopped(spec);
+        let Some(SourceEvent::Refused(why)) = events.last() else {
+            panic!("did not end on a refusal: {events:?}");
+        };
+        assert!(why.contains("refused the login"), "{why}");
+        assert!(!why.contains("sk_secret"), "{why}");
+        assert!(
+            !events.iter().any(|e| matches!(e, SourceEvent::Lost(_))),
+            "{events:?}"
+        );
+
+        let heads: Vec<String> = requests.try_iter().collect();
+        let authorised: Vec<&String> = heads
+            .iter()
+            .filter(|h| h.contains("Authorization: Basic dXNlcjpza19zZWNyZXRfcHc="))
+            .collect();
+        assert_eq!(authorised.len(), 1, "{heads:?}");
+    }
+
+    #[test]
+    fn a_source_that_wants_a_login_says_how_to_give_one() {
+        let (port, _requests) = refusing_server();
+        let spec = Spec::parse(&format!("rtsp://127.0.0.1:{port}/cam")).unwrap();
+        let events = events_until_stopped(spec);
+        let Some(SourceEvent::Refused(why)) = events.last() else {
+            panic!("did not end on a refusal: {events:?}");
+        };
+        assert!(why.contains("--source-user"), "{why}");
     }
 }

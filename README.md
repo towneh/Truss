@@ -193,8 +193,16 @@ connection, so no UDP ports are needed; `rtspt://` is accepted and means the
 same.
 
 The source needs H.264 video. AAC audio is carried, and any other audio is left
-out with a warning. A source that asks for a user and password is not supported
-yet.
+out with a warning.
+
+A source that asks for a login, as a camera usually does, takes the user with
+`--source-user` and the password the way the relay takes the stream key (see
+[The stream key](#the-stream-key)): `--source-password-file <path>` or `-`,
+then `TRUSS_SOURCE_PASSWORD`, then a prompt. The two cannot both be read from
+stdin. Basic and Digest are both answered. A user and password in the URL
+itself are refused. If the source turns the login down, the relay stops rather
+than trying again every few seconds, since many cameras lock an account after a
+handful of failed logins.
 
 A source that has been through a relay already carries records. The relay
 strips them before adding its own, so the stream carries one set, and warns
@@ -410,7 +418,8 @@ with one, with no gaps on loopback, into the VRSL-URP source and into
 
 `--source` has pulled VRCDN's RTSP egress for five minutes with a record on
 every one of 8,825 frames, no gaps and no decode errors, and through MediaMTX a
-source with B-frames and one with no audio.
+source with B-frames, one with no audio, and one behind a login with Basic and
+with Digest.
 
 On an emulated slow or lossy uplink, with 100 to 300 ms of round trip and 0.05%
 to 0.5% packet loss between the relay and the ingest, no record was lost: every

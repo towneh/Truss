@@ -9,7 +9,8 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use retina::client::{
-    InitialTimestampPolicy, PlayOptions, Session, SessionOptions, SetupOptions, Transport,
+    Credentials, InitialTimestampPolicy, PlayOptions, Session, SessionOptions, SetupOptions,
+    Transport,
 };
 use retina::codec::{CodecItem, FrameFormat, ParametersRef};
 use tokio::sync::mpsc;
@@ -73,9 +74,23 @@ enum Align {
     Arrival,
 }
 
+/// Why a session ended.
+pub(super) enum End {
+    /// Worth connecting again.
+    Lost(String),
+    /// The source wants a login it was not given, or refused the one it was.
+    Refused(String),
+}
+
+impl From<String> for End {
+    fn from(why: String) -> Self {
+        Self::Lost(why)
+    }
+}
+
 /// One session, from DESCRIBE until it ends. `relayed` is set once frames
 /// have gone to the relay.
-pub(super) async fn run(spec: &Spec, tx: &Tx, relayed: &mut bool) -> Result<(), String> {
+pub(super) async fn run(spec: &Spec, tx: &Tx, relayed: &mut bool) -> Result<(), End> {
     send(tx, SourceEvent::State(SourceState::Connecting)).await?;
     let (session, mut tracks) = timeout(OPEN_DEADLINE, open(spec, tx)).await.map_err(|_| {
         format!("the source did not answer DESCRIBE, SETUP and PLAY within {OPEN_DEADLINE:?}")
@@ -95,9 +110,9 @@ pub(super) async fn run(spec: &Spec, tx: &Tx, relayed: &mut bool) -> Result<(), 
 
     loop {
         let item = match timeout(FEED_STALL, demuxed.next()).await {
-            Err(_) => return Err(format!("nothing from the source for {FEED_STALL:?}")),
+            Err(_) => return Err(format!("nothing from the source for {FEED_STALL:?}").into()),
             Ok(None) => return Ok(()),
-            Ok(Some(Err(e))) => return Err(format!("the source: {e}")),
+            Ok(Some(Err(e))) => return Err(format!("the source: {e}").into()),
             Ok(Some(Ok(item))) => item,
         };
         let now_us = started.elapsed().as_micros() as i64;
@@ -272,15 +287,16 @@ pub(super) async fn run(spec: &Spec, tx: &Tx, relayed: &mut bool) -> Result<(), 
 
 /// DESCRIBE, then SETUP of the H.264 video and any AAC audio over the RTSP
 /// connection, then PLAY.
-async fn open(
-    spec: &Spec,
-    tx: &Tx,
-) -> Result<(Session<retina::client::Playing>, [Track; 2]), String> {
-    let options =
-        SessionOptions::default().user_agent(format!("truss-relay/{}", env!("CARGO_PKG_VERSION")));
+async fn open(spec: &Spec, tx: &Tx) -> Result<(Session<retina::client::Playing>, [Track; 2]), End> {
+    let options = SessionOptions::default()
+        .user_agent(format!("truss-relay/{}", env!("CARGO_PKG_VERSION")))
+        .creds(spec.login.as_ref().map(|login| Credentials {
+            username: login.user.clone(),
+            password: login.password.expose().to_owned(),
+        }));
     let mut session = Session::describe(spec.url.clone(), options)
         .await
-        .map_err(|e| format!("DESCRIBE: {e}"))?;
+        .map_err(|e| failed(spec, "DESCRIBE", &e))?;
 
     let mut tracks: [Track; 2] = Default::default();
     let mut others = Vec::new();
@@ -294,14 +310,14 @@ async fn open(
         }
     }
     if tracks[VIDEO].index.is_none() {
-        return Err(if others.is_empty() {
+        return Err(End::Lost(if others.is_empty() {
             "the source has no streams".into()
         } else {
             format!(
                 "the source has no H.264 video, which records ride in. It has: {}",
                 others.join(", ")
             )
-        });
+        }));
     }
     if !others.is_empty() {
         send(
@@ -329,13 +345,14 @@ async fn open(
             )
             .await
             .map_err(|e| {
-                let e = e.to_string();
-                if e.contains("461") {
-                    "the source refuses RTP over the RTSP connection (461 Unsupported \
-                     Transport), and that is the only transport the relay speaks"
-                        .to_string()
+                if e.status_code() == Some(461) {
+                    End::Lost(
+                        "the source refuses RTP over the RTSP connection (461 Unsupported \
+                         Transport), and that is the only transport the relay speaks"
+                            .into(),
+                    )
                 } else {
-                    format!("SETUP: {e}")
+                    failed(spec, "SETUP", &e)
                 }
             })?;
     }
@@ -344,8 +361,26 @@ async fn open(
     let session = session
         .play(PlayOptions::default().initial_timestamp(InitialTimestampPolicy::Permissive))
         .await
-        .map_err(|e| format!("PLAY: {e}"))?;
+        .map_err(|e| failed(spec, "PLAY", &e))?;
     Ok((session, tracks))
+}
+
+/// A request that failed. 401 is told apart from the rest: the next attempt
+/// would send the same login, and could only fail the same way.
+fn failed(spec: &Spec, request: &str, e: &retina::Error) -> End {
+    if e.status_code() != Some(401) {
+        return End::Lost(format!("{request}: {e}"));
+    }
+    End::Refused(match &spec.login {
+        None => "the source asks for a login. Give the user with --source-user and the \
+                 password with --source-password-file or TRUSS_SOURCE_PASSWORD"
+            .into(),
+        Some(login) => format!(
+            "the source refused the login for user {:?} at {request}. Not trying again, so \
+             a camera that counts failed logins does not lock the account",
+            login.user
+        ),
+    })
 }
 
 /// Shift the anchors so the earliest sits at 0, keeping numbers small.
