@@ -3,12 +3,12 @@
 DMX lighting control carried inside a live video stream, as H.264 or HEVC SEI user data.
 
 Truss takes the Art-Net from a lighting desk and packs it into the video as
-it passes through a relay. The DMX then travels inside each access unit,
+it passes through a relay. The DMX then travels inside each video frame,
 through the ingest and the CDN to every viewer, locked to the picture.
 
-It goes into the SEI, the part of each access unit set aside for extra data,
-which decoders pass over when they draw the frame. The picture reaches viewers
-exactly as the encoder made it.
+It goes into the SEI, the part of each coded frame (its access unit) set aside
+for extra data, which decoders pass over when they draw the frame. The picture
+reaches viewers exactly as the encoder made it.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/how-truss-works-dark.svg">
@@ -24,6 +24,27 @@ Truss defines, set out in [docs/format.md](docs/format.md).
   <source media="(prefers-color-scheme: dark)" srcset="docs/reading-truss-records-dark.svg">
   <img alt="The Basis Media Player finds Truss records in the SEI as it demuxes the stream and raises OnUserDataReceived as playback reaches each record. VRSL decodes the record, checks its CRC and writes the universes into the DMX buffer on the GPU, which the DMX Realtime Light fixtures read. Records sent over OSC enter VRSL directly and take the same path from there." src="docs/reading-truss-records-light.svg">
 </picture>
+
+## The tools
+
+| Tool | What it does |
+| --- | --- |
+| `truss-relay` | Sits between the encoder and the ingest, or pulls an RTSP source, packs the desk's Art-Net into the video and publishes it on. It can also record what it sends |
+| `truss-detect` | Reads a stream or a file and reports whether records arrived intact, damaged or not at all |
+| `truss-inject` | Writes test records into an FLV file, to check a path before a desk is involved |
+| `truss-dmxmon` | Shows the DMX values a receiver would decode from a stream |
+
+They build with Rust 1.88 or newer, on Windows or Linux, into
+`target/release`:
+
+```sh
+cargo build --release
+```
+
+`truss-detect` and `truss-dmxmon` read `rtsp://` and `rtmp://` sources through
+ffmpeg, which then has to be on your PATH (6.1 or later for HEVC over RTMP).
+The remux commands further down use it too. `--help` on any of the tools lists
+every flag with its default.
 
 ## Will it work on your path
 
@@ -92,6 +113,34 @@ nothing about whether the lighting is right.
 | `--keyframes-only` | off | Write records on keyframes only |
 | `--max-added-kbps` | 250 | Refuse to write the file at all if the records would add more than this |
 
+## With no ingest to point at
+
+ffmpeg will accept a publish on a port, which is enough to stand in for an
+ingest and put the whole path on one machine. Three terminals, started in this
+order, since each waits for the one before it:
+
+```sh
+ffmpeg -listen 1 -f flv -i rtmp://127.0.0.1:1936/live -c copy -f mpegts egress.ts
+truss-relay --listen 127.0.0.1:1935 --publish rtmp://127.0.0.1:1936/live
+ffmpeg -re -i source.mp4 -c:v libx264 -f flv rtmp://127.0.0.1:1935/live/anykey
+```
+
+The relay asks for a stream key when it starts. Type anything: the stand-in
+accepts whatever it is given. OBS can take the place of the third terminal,
+pointed at the same URL.
+
+`truss-detect egress.ts` then scores what left the far end, and adding
+`--artnet` to the relay puts a desk in the same loop. None of it leaves the
+machine.
+
+`--passthrough` relays without injecting anything. Set against a publish
+straight to the ingest it shows what the relay itself costs, and against a
+normal run what the records do.
+
+With no ingest in the picture at all, `--record` in place of `--publish` skips
+the stand-in: the relay writes what it would have published to a file (see
+[Recording the stream](#recording-the-stream)).
+
 ## Running a show
 
 ```sh
@@ -101,8 +150,6 @@ truss-relay \
   --stream-key-file /run/credentials/truss/key \
   --artnet
 ```
-
-`--help` on any of the tools lists every flag with its default.
 
 `--listen` is where the encoder sends and `--publish` is where the relay sends
 on. `--publish` goes up to the application and no further: the host, the port
@@ -116,14 +163,19 @@ that can reach `--listen` can take that slot. Keep it on loopback, or behind a
 firewall when it has to listen wider. An encoder that sends nothing for 15
 seconds is dropped and the slot freed.
 
+An ingest can refuse a publish straight after a run, while it still counts the
+previous one as connected. The relay says so: wait for the stream to drop, or
+end it from the ingest's control panel.
+
 When the upload to the ingest falls behind, by about half a second of stream,
 the relay stops reading from the encoder until it catches up. The encoder then
 drops frames or lowers its bitrate, as it would publishing directly, instead of
 a backlog growing in the relay.
 
-The encoder can send H.264 or HEVC; OBS sends HEVC over Enhanced RTMP from
-version 29.1. Any other codec passes through the relay untouched, with no
-records in it, and the relay warns that it is doing so.
+The encoder can send H.264 or HEVC; OBS sends HEVC over Enhanced RTMP, the
+extension of RTMP that carries it, from version 29.1. Any other codec passes
+through the relay untouched, with no records in it, and the relay warns that it
+is doing so.
 
 Point the lighting desk at this machine's Art-Net port, 6454 by default. The
 relay keeps the newest value for each universe and packs as many universes into
@@ -132,15 +184,22 @@ which is 17 full universes. When they do not all fit it rotates through them on
 the frames that follow, and a universe at the far end of the patch cannot
 starve.
 
+At a terminal the relay shows a panel redrawn in place, covering the encoder,
+the ingest, the stream, any recording and both lanes, with anything wrong right
+now listed beneath. `--show-logging`, or output that is not a terminal, gets a
+line per event instead.
+
+## Desks and discovery
+
 A desk that lists nodes rather than broadcasting will find one named Truss;
 pick it and assign it the universes to carry. The relay answers `ArtPoll` with
 an address on the desk's own subnet, and advertises the lowest universes it
-has heard (universe 0 before any), so a desk that searches by universe finds it
-too. A reply names up to four universes from one sub-net and a poll gets eight
-replies at most, so that is 32 when the universes share sub-nets and fewer when
+has heard (universe 0 before any), which lets a desk that searches by universe
+find it too. A reply names up to four universes from one sub-net and a poll
+gets eight replies at most: 32 universes when they share sub-nets, fewer when
 they are spread out. Until DMX arrives the relay shows which controller found
-the node, so a desk that has not been patched can be told from one that is not
-there.
+the node. A desk that has not been patched can then be told from one that is
+not there.
 
 `--artnet` on its own listens on every adapter. `--artnet 192.168.1.20` listens
 on that adapter only and tells every desk to use that address; add `:port` when
@@ -155,10 +214,7 @@ and tells a desk on this machine to send there. A desk set to send to localhost
 needs no discovery. Send to this node or to localhost, not both, or every
 universe arrives twice and shows as a steady share of late packets.
 
-At a terminal the relay shows a panel redrawn in place, covering the encoder,
-the ingest, the stream and both lanes, with anything wrong right now listed
-beneath. `--show-logging`, or output that is not a terminal, gets a line per
-event instead.
+## Reading the values back
 
 `truss-dmxmon` shows what a receiver would decode: values rather than counts.
 A stream can deliver every record intact and still carry a snapshot that never
@@ -200,32 +256,34 @@ picture alone; the relay then does not ask the source for audio at all.
 A source that asks for a login, as a camera usually does, takes the user with
 `--source-user` and the password the way the relay takes the stream key (see
 [The stream key](#the-stream-key)): `--source-password-file <path>` or `-`,
-then `TRUSS_SOURCE_PASSWORD`, then a prompt. The two cannot both be read from
-stdin. Basic and Digest are both answered. A user and password in the URL
+then `TRUSS_SOURCE_PASSWORD`, then a prompt. Basic and Digest are both
+answered. A user and password in the URL
 itself are refused. If the source turns the login down, the relay stops rather
 than trying again every few seconds, since many cameras lock an account after a
 handful of failed logins.
 
 A source that has been through a relay already carries records. The relay
-strips them before adding its own, so the stream carries one set, and warns
+strips them before adding its own, leaving one set in the stream, and warns
 with how fresh they are: fresh ones usually mean the source is this channel's
 own egress, and the relay is feeding itself. `--source-records keep` leaves
 them in beside the relay's own, to measure a hop.
 
-The publish starts 5 to 10 seconds after the relay connects. It waits for two
-of the source's sender reports in a row to agree, so the audio and video it
-publishes are in step, and then for a keyframe. A server can begin a session
-with a report that is seconds out, as VRCDN does when a pull starts soon after
-the last one ended, and waiting for the next one costs another 5 seconds. The
-panel says which wait it is in.
+The publish starts 5 to 10 seconds after the relay connects. The source's RTCP
+sender reports tie its audio and video timestamps to one clock, and the relay
+waits until two in a row agree on each stream before publishing them in step,
+then for a keyframe. A server can begin a session with a report that is
+seconds out, as VRCDN does when a pull starts soon after the last one ended,
+and waiting for the next one costs another 5 seconds. The panel says which
+wait it is in.
 
 When the source drops, the relay reconnects: six times, waiting about 24
 seconds in all between attempts (longer if a server is slow to answer), with
-the publish held open, so viewers see a pause, then every 8 seconds with the
-publish ended until the source plays again. Timestamps carry on across the
-gap. An ingest that closes a silent publish sooner ends the session there, as
-MediaMTX does after 10 seconds, and the relay starts again when the source is
-back.
+the publish held open, which viewers see as a pause, then every 8 seconds with
+the publish ended until the source plays again. Timestamps carry on across the
+gap. A jump in the source's own timestamps within a session is treated the
+same way: the stream carries on from the last timestamp sent, and the relay
+logs the jump. An ingest that closes a silent publish sooner ends the session
+there, and the relay starts again when the source is back.
 
 ## Recording the stream
 
@@ -241,14 +299,14 @@ truss-relay \
 `--record <dir>` writes the stream to an FLV file in that directory as it goes
 out, records included: the same tags the ingest receives. Each session gets a
 file of its own, named for the local time it started
-(`truss-20261008-201500.flv`), so an encoder reconnecting never overwrites one.
+(`truss-20261008-201500.flv`), and an encoder reconnecting starts a new one.
 With `--source`, a new file starts when a source that was declared down plays
-again. The directory has to exist when the relay starts.
+again.
 
 Leave out `--publish` to record without publishing, and no stream key is asked
 for. That tests a desk and an encoder together with no ingest at all.
 
-FLV has no index or trailer, so a recording cut short by a crash, a kill or a
+FLV has no index or trailer. A recording cut short by a crash, a kill or a
 full disk still plays up to its last frame. If a write fails, the recording
 stops and the file is cut back to its last whole tag, the panel says why, and
 the publish carries on. With nothing published the session ends instead.
@@ -262,7 +320,7 @@ ffmpeg -i truss-20261008-201500.flv -c copy show.mp4              # H.264
 ffmpeg -i truss-20261008-201500.flv -c copy -tag:v hvc1 show.mp4  # HEVC
 ```
 
-`truss-detect` reads MPEG-TS, so check a recording through a remux to TS, as in
+`truss-detect` reads MPEG-TS: check a recording through a remux to TS, as in
 [A dry run](#a-dry-run).
 
 ## Watching the desk with nothing else running
@@ -287,9 +345,9 @@ loss and order are scored on the lane rather than on the stream.
 VRSL Grid Node and QLC+; `osc://:12200` or `osc://192.168.1.20:12200` listens
 elsewhere.
 
-Leave out `--publish` to run the lane alone, for testing against a desk with
-no encoder or ingest. Nothing listens for an encoder and no stream key is
-needed, and the stream-only flags (`--listen`, `--stream-key-file`,
+Leave out `--publish` and `--record` to run the lane alone, for testing against
+a desk with no encoder or ingest. Nothing listens for an encoder and no stream
+key is needed, and the stream-only flags (`--listen`, `--stream-key-file`,
 `--carriers` and the rest) are refused:
 
 ```sh
@@ -299,32 +357,6 @@ truss-relay --artnet --osc 127.0.0.1:12100
 `truss-detect osc:// --max-seconds 10` scores the lane the way it scores a
 stream. Nothing on this path crosses a CDN. A gap on the lane points at the
 relay; a gap in the stream that the lane doesn't show points at the CDN path.
-
-## With no ingest to point at
-
-ffmpeg will accept a publish on a port, which is enough to stand in for an
-ingest and put the whole path on one machine. Three terminals, started in this
-order, since each waits for the one before it:
-
-```sh
-ffmpeg -listen 1 -f flv -i rtmp://127.0.0.1:1936/live -c copy -f mpegts egress.ts
-truss-relay --listen 127.0.0.1:1935 --publish rtmp://127.0.0.1:1936/live --stream-key-file key.txt
-ffmpeg -re -i source.mp4 -c:v libx264 -f flv rtmp://127.0.0.1:1935/live/anykey
-```
-
-OBS can take the place of the third terminal, pointed at the same URL. The key
-in `key.txt` can be anything; the stand-in accepts whatever it is given.
-
-`truss-detect egress.ts` then scores what left the far end, and adding
-`--artnet` to the relay puts a desk in the same loop. None of it leaves the
-machine.
-
-`--passthrough` relays without injecting anything. Set against a publish
-straight to the ingest it shows what the relay itself costs, and against a
-normal run what the records do.
-
-With no ingest in the picture at all, `--record` in place of `--publish` skips
-the stand-in: the relay writes what it would have published to a file.
 
 ## The stream key
 
@@ -417,20 +449,15 @@ average goes above a figure, 5,500 kb/s unless set, and `--abort-kbps` drops
 the session rather than let it go above another. Aborting is off unless asked
 for.
 
-## Building
+## Testing
 
-```sh
-cargo build --release
-cargo test
-```
+`cargo test` runs the unit tests and the generative cover, and CI runs it on
+Windows and Linux.
 
-Rust 1.88 or newer. Windows and Linux are both supported, and CI builds and
-tests both.
-
-Every parser here reads bytes it did not choose, so there is generative cover
+Every parser here reads bytes it did not choose, and generative cover runs
 alongside the unit tests. The properties live in `truss::invariants`, and
 `tests/properties.rs` drives them with mutated input as part of `cargo test`,
-on stable and with no extra toolchain. The run is deterministic, so a failure
+on stable and with no extra toolchain. The run is deterministic, and a failure
 names the case that caused it.
 
 libFuzzer drives the same properties for a deeper search. It's happiest on
@@ -444,6 +471,22 @@ cargo +nightly fuzz run ts_feed
 The seed corpus comes from the crate's own encoders, so a run starts from
 valid streams. A weekly job runs each target and keeps its corpus and any input
 that crashes it.
+
+## When something's wrong
+
+The relay's panel names most problems as they happen. These are the ones it
+cannot see, or that need a change elsewhere.
+
+| Symptom | Likely cause | See |
+| --- | --- | --- |
+| The egress plays, but `truss-detect` finds no records | The CDN transcodes | [Will it work on your path](#will-it-work-on-your-path) |
+| The desk does not list Truss, or DMX stops once `--artnet` is given an address | A socket bound to one address misses the desk's broadcasts | [Desks and discovery](#desks-and-discovery) |
+| A steady share of packets arrive late | The desk sends to this node and to localhost | [Desks and discovery](#desks-and-discovery) |
+| The ingest refuses the publish straight after a run | It still counts the previous session | [Running a show](#running-a-show) |
+| `truss-dmxmon` shows no video over RTSP | Another reader on this machine has the stream | [Reading the values back](#reading-the-values-back) |
+| An HEVC recording plays sound only in VLC | VLC 3 cannot read HEVC from FLV | [Recording the stream](#recording-the-stream) |
+| The relay stops, saying a camera refused the login | The user or password is wrong; it does not retry | [Pulling from RTSP](#pulling-from-rtsp) |
+| A pull takes several seconds to start publishing | It waits for the sender reports, then a keyframe | [Pulling from RTSP](#pulling-from-rtsp) |
 
 ## Status
 
@@ -460,9 +503,10 @@ with one, with no gaps on loopback, into the VRSL-URP source and into
 `truss-detect`.
 
 `--source` has pulled VRCDN's RTSP egress for five minutes with a record on
-every one of 8,825 frames, no gaps and no decode errors, and through MediaMTX a
-source with B-frames, one with no audio, and one behind a login with Basic and
-with Digest.
+every one of 8,825 frames, no gaps and no decode errors. Through MediaMTX it
+has pulled a source with B-frames, one with no audio, one behind a login with
+Basic and with Digest, and HEVC from x265 with three B-frames in open and
+closed GOPs.
 
 `--record` has written H.264 from an encoder and HEVC from a pulled source
 while publishing, and recorded alone with no publish; every file carried every
