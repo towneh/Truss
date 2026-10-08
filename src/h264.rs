@@ -169,6 +169,18 @@ pub fn build_sei_nal(payload_type: u64, payload: &[u8]) -> Vec<u8> {
 
 /// One SEI message plus trailing bits, unescaped. HEVC uses the same syntax
 /// under a different NAL header.
+/// Several SEI messages in one payload, as an SEI NAL can carry them.
+pub(crate) fn sei_rbsp_of(messages: &[(u64, Vec<u8>)]) -> Vec<u8> {
+    let mut rbsp = Vec::new();
+    for (payload_type, payload) in messages {
+        push_varlen(&mut rbsp, *payload_type);
+        push_varlen(&mut rbsp, payload.len() as u64);
+        rbsp.extend_from_slice(payload);
+    }
+    rbsp.push(0x80); // rbsp_trailing_bits
+    rbsp
+}
+
 pub(crate) fn sei_rbsp(payload_type: u64, payload: &[u8]) -> Vec<u8> {
     let mut rbsp = Vec::with_capacity(payload.len() + 8);
     push_varlen(&mut rbsp, payload_type);

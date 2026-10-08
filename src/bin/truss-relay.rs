@@ -63,6 +63,11 @@ struct Cli {
     source: Option<String>,
     #[arg(skip)]
     pull: Option<pull::Spec>,
+    /// What to do with Truss records the source already carries, as a stream
+    /// that has been through a relay does: strip them, or keep them beside
+    /// this relay's own, to measure a hop.
+    #[arg(long, value_enum, default_value_t = SourceRecords::Strip, requires = "source", conflicts_with = "passthrough")]
+    source_records: SourceRecords,
     /// Where to publish the stream: rtmp://host/app, with the port after the
     /// host when it is not 1935, and "live" when no application is given.
     /// The stream key is never part of this: see --stream-key-file.
@@ -140,6 +145,12 @@ struct Cli {
 const DEFAULT_ARTNET_MAX_PAYLOAD: usize = 9216;
 const DEFAULT_CARRIERS: &str = "sei-unreg";
 const DEFAULT_LISTEN: &str = "127.0.0.1:1935";
+
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+enum SourceRecords {
+    Strip,
+    Keep,
+}
 
 impl Cli {
     fn listen(&self) -> &str {
@@ -658,6 +669,9 @@ impl Dashboard {
                 if let Some(note) = s.injector.and_then(|i| oversize_note(i, cli)) {
                     warnings.push(note);
                 }
+                if let Some(note) = s.injector.and_then(|i| records_note(i, cli)) {
+                    warnings.push(note);
+                }
                 if kbps > cli.warn_kbps {
                     warnings.push(format!(
                         "{kbps:.0} kb/s is above {:.0}: lower the encoder bitrate or raise --every",
@@ -837,6 +851,7 @@ impl<'a> Onward<'a> {
                     payload_len: cli.payload_len,
                     keyframes_only: false,
                 })
+                .map(|i| i.strip_existing(strips_records(cli)))
             })
             .transpose()?;
         Ok(Self {
@@ -902,10 +917,13 @@ impl<'a> Onward<'a> {
                     let rewritten = match dmx {
                         Some(Ok(bytes)) => {
                             let now = now_unix_nanos();
+                            let written = inj.records_written();
                             let rewritten = inj.inject_tag_with(&data, now, Some(&bytes))?;
                             // The lane carries the payload the stream carries,
-                            // so a frame the injector left alone gets no record.
-                            if rewritten.is_some()
+                            // so a frame that got no record of its own gets
+                            // none on the lane, even if it was rewritten to
+                            // strip records already in it.
+                            if inj.records_written() > written
                                 && let Some(o) = self.osc.as_mut()
                             {
                                 o.send(&bytes, now);
@@ -1152,6 +1170,7 @@ fn session_pull(
     let mut state = SourceState::Connecting.describe();
     let mut dts: Option<DtsWindow> = None;
     let mut rebase = Rebase::default();
+    let mut records_said = false;
     // The relay writes the onMetaData an encoder would have sent, from what
     // the source's parameters say.
     let mut metadata = StreamMetadata::new();
@@ -1244,6 +1263,13 @@ fn session_pull(
                     let cts = i64::from(rebase.ms(pts_us)) - i64::from(out);
                     let tag = truss::flv::avc_frame(key, cts as i32, &data)?;
                     onward.video(Bytes::from(tag), RtmpTimestamp::new(out))?;
+                    if !records_said
+                        && let Some(note) =
+                            onward.injector.as_ref().and_then(|i| records_note(i, cli))
+                    {
+                        console::event(format!("source: {note}"));
+                        records_said = true;
+                    }
                 }
                 SourceEvent::AudioFrame { data, pts_us } => {
                     let out = rebase.place(AUDIO, pts_us);
@@ -1740,6 +1766,39 @@ fn client_handshake(socket: &mut TcpStream, timeout: Duration) -> Result<Vec<u8>
     socket.set_read_timeout(None)?;
     socket.set_write_timeout(None)?;
     Ok(result)
+}
+
+/// Whether the relay strips records the stream already carries: only when
+/// pulling, since an encoder does not put them there.
+fn strips_records(cli: &Cli) -> bool {
+    cli.pull.is_some() && cli.source_records == SourceRecords::Strip
+}
+
+/// The warning for records an earlier relay left in the source, if any.
+/// Fresh ones usually mean the source is this channel's own egress, which
+/// feeds the relay its own output.
+fn records_note(injector: &Injector, cli: &Cli) -> Option<String> {
+    let n = injector.stats.existing_records;
+    (n > 0).then(|| {
+        let newest = injector.stats.existing_newest_nanos;
+        let age = match now_unix_nanos().checked_sub(newest) {
+            Some(ns) if newest > 0 && ns < 1_000_000_000 => {
+                format!(", the newest sent {} ms ago", ns / 1_000_000)
+            }
+            Some(ns) if newest > 0 => format!(", the newest sent {:.1} s ago", ns as f64 / 1e9),
+            _ => String::new(),
+        };
+        let fate = if strips_records(cli) {
+            "stripped"
+        } else {
+            "kept beside this relay's own"
+        };
+        format!(
+            "the source carries Truss records from an earlier relay ({} so far{age}), {fate}. \
+             If it is this channel's own egress, the relay is feeding itself",
+            console::count(n)
+        )
+    })
 }
 
 /// The warning for records the injector left out as too large, if it has.

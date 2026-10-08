@@ -12,9 +12,10 @@ use std::collections::BTreeMap;
 use anyhow::{Result, bail};
 
 use crate::carrier::{Carrier, Class, Placement};
+use crate::codec::VideoCodec;
 use crate::flv::{self, Flv, Video};
 use crate::h264;
-use crate::record::{DEFAULT_PAYLOAD_LEN, MAX_PAYLOAD_LEN, Record};
+use crate::record::{self, DEFAULT_PAYLOAD_LEN, MAX_PAYLOAD_LEN, Record};
 
 #[derive(Debug, Clone)]
 pub struct InjectOptions {
@@ -53,6 +54,11 @@ pub struct InjectStats {
     /// The video's codec, when records cannot ride in it. Its frames pass
     /// through untouched.
     pub unsupported_codec: Option<String>,
+    /// Truss records the stream already carried, put there by an earlier
+    /// relay or injector, and found on frames the injector read.
+    pub existing_records: u64,
+    /// The newest send time among them, by the clock of whatever wrote it.
+    pub existing_newest_nanos: u64,
 }
 
 impl InjectStats {
@@ -81,6 +87,7 @@ pub struct Injector {
     payload_len: usize,
     keyframes_only: bool,
     length_size: usize,
+    strip_existing: bool,
     seq: BTreeMap<&'static str, u32>,
     pub stats: InjectStats,
 }
@@ -116,9 +123,24 @@ impl Injector {
             // wrong here would corrupt every access unit, so the default only
             // stands for streams that never send one.
             length_size: 4,
+            strip_existing: false,
             seq: BTreeMap::new(),
             stats: InjectStats::default(),
         })
+    }
+
+    /// Drop Truss records the stream already carries, so a stream that went
+    /// through a relay before does not come out carrying two sets. Every
+    /// video frame is checked, not only those that get a record.
+    pub fn strip_existing(mut self, on: bool) -> Self {
+        self.strip_existing = on;
+        self
+    }
+
+    /// Records written so far, across the carriers. A call that rewrote the
+    /// frame without raising this only stripped records already in it.
+    pub fn records_written(&self) -> u64 {
+        self.stats.injected.values().sum()
     }
 
     /// Learn the NAL length size from a sequence header's configuration
@@ -162,15 +184,41 @@ impl Injector {
         let frame_index = self.stats.video_frames as u32;
         self.stats.video_frames += 1;
 
-        if (self.keyframes_only && !keyframe) || !frame_index.is_multiple_of(self.every_n_frames) {
-            return Ok(None);
-        }
+        let inject_now =
+            !(self.keyframes_only && !keyframe) && frame_index.is_multiple_of(self.every_n_frames);
 
+        // Every frame is read for records already in it, not only those due
+        // one of their own: a source can carry them on any frame.
         let body = &tag_data[header_len..];
         let Some(nals) = h264::nal_units_avcc(body, self.length_size) else {
-            bail!("video tag is not consistently length-prefixed");
+            if inject_now {
+                bail!("video tag is not consistently length-prefixed");
+            }
+            return Ok(None);
         };
-        let owned: Vec<Vec<u8>> = nals.into_iter().map(<[u8]>::to_vec).collect();
+        let mut owned = Vec::with_capacity(nals.len() + 2);
+        let mut stripped = false;
+        for nal in nals {
+            let Some((sent, rest)) = existing_records(codec, nal) else {
+                owned.push(nal.to_vec());
+                continue;
+            };
+            self.stats.existing_records += sent.len() as u64;
+            if let Some(&newest) = sent.iter().max() {
+                self.stats.existing_newest_nanos = self.stats.existing_newest_nanos.max(newest);
+            }
+            if self.strip_existing {
+                stripped = true;
+                owned.extend(rest);
+            } else {
+                owned.push(nal.to_vec());
+            }
+        }
+        // A frame of nothing but records is not a picture, and emptying it
+        // would leave a tag with no NAL units, so it goes on as it came.
+        if owned.is_empty() || (!inject_now && !stripped) {
+            return Ok(None);
+        }
 
         // An access-unit delimiter stays first when one is present.
         let insert_at = usize::from(
@@ -181,7 +229,8 @@ impl Injector {
 
         let mut before = Vec::new();
         let mut after = Vec::new();
-        for c in &self.carriers {
+        let carriers: &[Carrier] = if inject_now { &self.carriers } else { &[] };
+        for c in carriers {
             let n = self.seq.entry(c.slug()).or_insert(0);
             let record = match payload {
                 Some(p) => {
@@ -238,6 +287,51 @@ impl Injector {
         out.extend_from_slice(&tag_data[..header_len]);
         out.extend_from_slice(&rebuilt);
         Ok(Some(out))
+    }
+}
+
+/// The Truss records `nal` carries, as their send times (0 for one that does
+/// not decode), with what is left of the NAL once they are taken out: `None`
+/// when nothing is, or the NAL rebuilt under its own header from the SEI
+/// messages that shared it. `None` overall when it carries no records.
+///
+/// A record is an SEI message with this crate's UUID or T.35 codes, or filler
+/// starting with the record magic.
+fn existing_records(codec: VideoCodec, nal: &[u8]) -> Option<(Vec<u64>, Option<Vec<u8>>)> {
+    let ty = codec.nal_type(*nal.first()?);
+    let header = codec.nal_header_len();
+    let body = nal.get(header..)?;
+    let sent = |r: &[u8]| Record::decode(r).map_or(0, |r| r.send_unix_nanos);
+    if codec.is_sei(ty) {
+        let rbsp = h264::unescape_rbsp(body);
+        let mut ours = Vec::new();
+        let mut others = Vec::new();
+        h264::sei_messages(&rbsp, |payload_type, payload| {
+            let carrier = match payload_type {
+                h264::SEI_UNREGISTERED => Some(Carrier::SeiUnregistered),
+                h264::SEI_T35 => Some(Carrier::SeiT35),
+                _ => None,
+            };
+            match carrier.and_then(|c| c.unframe_sei(payload)) {
+                Some(record) => ours.push(sent(record)),
+                None => others.push((payload_type, payload.to_vec())),
+            }
+        });
+        if ours.is_empty() {
+            return None;
+        }
+        let rest = (!others.is_empty()).then(|| {
+            let mut rebuilt = nal[..header].to_vec();
+            rebuilt.extend_from_slice(&h264::escape_rbsp(&h264::sei_rbsp_of(&others)));
+            rebuilt
+        });
+        Some((ours, rest))
+    } else if codec.is_filler(ty) {
+        let rbsp = h264::unescape_rbsp(body);
+        rbsp.starts_with(&record::MAGIC)
+            .then(|| (vec![sent(&rbsp)], None))
+    } else {
+        None
     }
 }
 
@@ -481,6 +575,177 @@ mod tests {
         );
         assert_eq!(recovered.len(), 3);
         assert_eq!(recovered[0], blocks);
+    }
+
+    /// How many of a tag's NALs are Truss records, and their carriers' send
+    /// times.
+    fn records_in(tag_data: &[u8]) -> Vec<u64> {
+        h264::nal_units_avcc(&tag_data[5..], 4)
+            .expect("framed")
+            .into_iter()
+            .filter_map(|n| existing_records(VideoCodec::H264, n))
+            .flat_map(|(sent, _)| sent)
+            .collect()
+    }
+
+    fn one_carrier(every: u32) -> InjectOptions {
+        InjectOptions {
+            carriers: vec![Carrier::SeiUnregistered],
+            every_n_frames: every,
+            ..InjectOptions::default()
+        }
+    }
+
+    #[test]
+    fn records_from_an_earlier_relay_are_stripped_and_counted() {
+        let frame = video_tag(true, &avcc(&[&[0x09, 0x10], &[0x65, 0xAA]]), 0).data;
+        let mut earlier = Injector::new(&one_carrier(1)).unwrap();
+        let carried = earlier.inject_tag(&frame, 1_000).unwrap().unwrap();
+        assert_eq!(records_in(&carried), [1_000]);
+
+        let mut relay = Injector::new(&one_carrier(1)).unwrap().strip_existing(true);
+        let out = relay.inject_tag(&carried, 2_000).unwrap().unwrap();
+        assert_eq!(records_in(&out), [2_000], "one set, this relay's own");
+        assert_eq!(relay.stats.existing_records, 1);
+        assert_eq!(relay.stats.existing_newest_nanos, 1_000);
+
+        let mut keeping = Injector::new(&one_carrier(1)).unwrap();
+        let out = keeping.inject_tag(&carried, 2_000).unwrap().unwrap();
+        let mut kept = records_in(&out);
+        kept.sort();
+        assert_eq!(kept, [1_000, 2_000], "kept, so two");
+        assert_eq!(keeping.stats.existing_records, 1);
+    }
+
+    #[test]
+    fn a_frame_skipped_for_injection_is_still_stripped() {
+        let frame = video_tag(false, &avcc(&[&[0x41, 0xCC]]), 0).data;
+        let carried = Injector::new(&one_carrier(1))
+            .unwrap()
+            .inject_tag(&frame, 1_000)
+            .unwrap()
+            .unwrap();
+        let mut relay = Injector::new(&one_carrier(2)).unwrap().strip_existing(true);
+        relay.inject_tag(&frame, 0).unwrap();
+        // The second frame is not one --every 2 writes to.
+        let out = relay.inject_tag(&carried, 2_000).unwrap().unwrap();
+        assert!(records_in(&out).is_empty());
+        assert_eq!(&out[5..], avcc(&[&[0x41, 0xCC]]));
+    }
+
+    #[test]
+    fn a_frame_of_nothing_but_records_is_passed_on_not_emptied() {
+        let record = Carrier::SeiUnregistered
+            .frame(&Record::new(Carrier::SeiUnregistered.id(), 0, 1_000, 0, 8))
+            .unwrap();
+        let frame = video_tag(false, &avcc(&[&record]), 0).data;
+        let plain = video_tag(false, &avcc(&[&[0x41, 0xCC]]), 0).data;
+        // On a frame that gets a record of its own, and on one --every skips.
+        for every in [1, 2] {
+            let mut relay = Injector::new(&one_carrier(every))
+                .unwrap()
+                .strip_existing(true);
+            relay.inject_tag(&plain, 0).unwrap();
+            assert_eq!(
+                relay.inject_tag(&frame, 2_000).unwrap(),
+                None,
+                "every {every}"
+            );
+            assert_eq!(relay.stats.existing_records, 1);
+        }
+    }
+
+    /// One SEI NAL holding the given messages, as some encoders bundle them.
+    fn sei_nal_of(messages: &[(u64, Vec<u8>)]) -> Vec<u8> {
+        let mut nal = vec![h264::NAL_SEI];
+        nal.extend_from_slice(&h264::escape_rbsp(&h264::sei_rbsp_of(messages)));
+        nal
+    }
+
+    fn truss_payload(seq: u32, sent: u64) -> Vec<u8> {
+        let mut payload = crate::carrier::PROBE_UUID.to_vec();
+        payload.extend_from_slice(
+            &Record::new(Carrier::SeiUnregistered.id(), seq, sent, seq, 8)
+                .encode()
+                .unwrap(),
+        );
+        payload
+    }
+
+    #[test]
+    fn an_encoders_message_sharing_a_nal_with_records_is_kept() {
+        let mut x264 = vec![0xDC; 16];
+        x264.extend_from_slice(b"x264 - core");
+        let shared = sei_nal_of(&[
+            (h264::SEI_UNREGISTERED, x264.clone()),
+            (h264::SEI_UNREGISTERED, truss_payload(0, 1_000)),
+            (h264::SEI_UNREGISTERED, truss_payload(1, 1_500)),
+        ]);
+        let frame = video_tag(true, &avcc(&[&shared, &[0x65, 0xAA]]), 0).data;
+        let mut relay = Injector::new(&one_carrier(1)).unwrap().strip_existing(true);
+        let out = relay.inject_tag(&frame, 2_000).unwrap().unwrap();
+        assert_eq!(relay.stats.existing_records, 2, "each record counted");
+        assert_eq!(relay.stats.existing_newest_nanos, 1_500);
+        assert_eq!(records_in(&out), [2_000]);
+        let nals = h264::nal_units_avcc(&out[5..], 4).unwrap();
+        let expected = sei_nal_of(&[(h264::SEI_UNREGISTERED, x264)]);
+        assert!(
+            nals.contains(&expected.as_slice()),
+            "the encoder's message is kept"
+        );
+    }
+
+    #[test]
+    fn records_on_a_skipped_frame_are_counted_when_kept() {
+        let frame = video_tag(false, &avcc(&[&[0x41, 0xCC]]), 0).data;
+        let carried = Injector::new(&one_carrier(1))
+            .unwrap()
+            .inject_tag(&frame, 1_000)
+            .unwrap()
+            .unwrap();
+        let mut relay = Injector::new(&one_carrier(2)).unwrap();
+        relay.inject_tag(&frame, 0).unwrap();
+        assert_eq!(
+            relay.inject_tag(&carried, 2_000).unwrap(),
+            None,
+            "left alone"
+        );
+        assert_eq!(relay.stats.existing_records, 1);
+    }
+
+    #[test]
+    fn stripping_alone_writes_no_record() {
+        let frame = video_tag(false, &avcc(&[&[0x41, 0xCC]]), 0).data;
+        let carried = Injector::new(&one_carrier(1))
+            .unwrap()
+            .inject_tag(&frame, 1_000)
+            .unwrap()
+            .unwrap();
+        let mut relay = Injector::new(&one_carrier(2)).unwrap().strip_existing(true);
+        relay.inject_tag(&frame, 0).unwrap();
+        let written = relay.records_written();
+        assert!(
+            relay.inject_tag(&carried, 2_000).unwrap().is_some(),
+            "rewritten"
+        );
+        assert_eq!(relay.records_written(), written, "but nothing written");
+    }
+
+    #[test]
+    fn another_encoders_sei_is_not_taken_for_a_record() {
+        // An x264-style user data SEI with a UUID that is not ours.
+        let mut payload = vec![0xDC; 16];
+        payload.extend_from_slice(b"x264 - core");
+        let foreign = h264::build_sei_nal(h264::SEI_UNREGISTERED, &payload);
+        let frame = video_tag(true, &avcc(&[&foreign, &[0x65, 0xAA]]), 0).data;
+        let mut relay = Injector::new(&one_carrier(1)).unwrap().strip_existing(true);
+        let out = relay.inject_tag(&frame, 2_000).unwrap().unwrap();
+        assert_eq!(relay.stats.existing_records, 0);
+        let nals = h264::nal_units_avcc(&out[5..], 4).unwrap();
+        assert!(
+            nals.contains(&foreign.as_slice()),
+            "the foreign SEI is kept"
+        );
     }
 
     #[test]

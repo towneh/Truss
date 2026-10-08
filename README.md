@@ -194,8 +194,13 @@ same.
 
 The source needs H.264 video. AAC audio is carried, and any other audio is left
 out with a warning. A source that asks for a user and password is not supported
-yet, and nor is one that already carries records: re-relaying a relayed stream
-would give it two sets.
+yet.
+
+A source that has been through a relay already carries records. The relay
+strips them before adding its own, so the stream carries one set, and warns
+with how fresh they are: fresh ones usually mean the source is this channel's
+own egress, and the relay is feeding itself. `--source-records keep` leaves
+them in beside the relay's own, to measure a hop.
 
 The publish starts 5 to 10 seconds after the relay connects. It waits for two
 of the source's sender reports in a row to agree, so the audio and video it
