@@ -142,6 +142,10 @@ version = "2.2.1"
 version = "0.7.0"
 features = ["async_tokio"]
 
+[dev-dependencies.mylog]
+git = "https://github.com/scottlamb/mylog"
+rev = "78a46b9c98521e32b0db04bdb5e026b11609b925"
+
 [dev-dependencies.pretty_assertions]
 version = "1.4.1"
 

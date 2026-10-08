@@ -8,6 +8,10 @@
 *.md    text eol=lf
 *.yml   text eol=lf
 
+# RTSP puts CRLF on the wire, and retina's captured exchanges are the bytes as
+# sent. Normalising them breaks the tests that parse them.
+third_party/retina/src/**/testdata/** -text
+
 *.png binary
 *.jpg binary
 *.flv binary

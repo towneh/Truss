@@ -1,4 +1,7 @@
 /target
+# Written when retina's own tests are run; see third_party/retina/PATCHES.md.
+/third_party/retina/Cargo.lock
+/third_party/retina/target
 # Captures and logs from a live run. ffmpeg puts the publish URL in its stderr,
 # and the stream key is in that URL, so nothing from a run belongs in the repo
 # even when it looks like plain text.

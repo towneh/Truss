@@ -95,3 +95,19 @@ dropped. The source matches the crates.io release apart from these changes:
 
 Each is a candidate for an upstream report or pull request to
 scottlamb/retina. The copy can go once a release carries them.
+
+## Running retina's own tests
+
+```sh
+cargo test --manifest-path third_party/retina/Cargo.toml --lib
+```
+
+All 124 pass with the patches applied. `Cargo.toml` names the `mylog`
+dev-dependency that crates.io's copy leaves out (it is a git dependency, which
+a published manifest cannot carry), pinned to the commit these results came
+from; `src/testutil.rs` needs it. It is resolved only when retina's tests are
+built, so the workspace's `Cargo.lock` does not change. The run writes a
+`Cargo.lock` of its own here, which is ignored.
+
+The captured RTSP exchanges under `src/**/testdata/` keep the CRLF line endings
+RTSP sends. `.gitattributes` marks them `-text`, so git stores them as they are.
