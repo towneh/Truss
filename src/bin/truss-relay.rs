@@ -1842,8 +1842,7 @@ fn bind_one(addr: SocketAddr) -> Result<TcpListener> {
 
 fn connect_upstream(cli: &Cli) -> Result<Upstream> {
     console::event(format!("connecting to {}...", cli.target.authority));
-    let mut socket = TcpStream::connect(&cli.target.authority)
-        .with_context(|| format!("connecting to {}", cli.target.authority))?;
+    let mut socket = connect_ingest(&cli.target.authority, INGEST_CONNECT_TIMEOUT)?;
     socket.set_nodelay(true).ok();
     socket2::SockRef::from(&socket)
         .set_send_buffer_size(UPSTREAM_SEND_BUFFER)
@@ -1901,6 +1900,46 @@ const PUBLISHER_IDLE_TIMEOUT: Duration = Duration::from_secs(15);
 /// and then stalls would otherwise stop everything. Longer than the
 /// publisher's because the ingest is usually remote.
 const INGEST_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long the ingest has to accept the TCP connection, across every address
+/// it resolves to. One that drops the connection attempt would otherwise hold
+/// the relay's only thread for as long as the OS waits. The name lookup before
+/// it is not covered: bounding that would take a thread of its own.
+const INGEST_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Connect to `authority` within `budget`, trying the addresses it resolves
+/// to in turn. Each attempt gets an even share of what is left, so an address
+/// that swallows the attempt, as a broken IPv6 route does, cannot leave none
+/// for the next.
+fn connect_ingest(authority: &str, budget: Duration) -> Result<TcpStream> {
+    let addrs: Vec<SocketAddr> = authority
+        .to_socket_addrs()
+        .with_context(|| format!("resolving {authority}"))?
+        .collect();
+    if addrs.is_empty() {
+        bail!("{authority} resolves to no address");
+    }
+    connect_any(&addrs, budget).with_context(|| format!("connecting to {authority}"))
+}
+
+/// The first of `addrs` to accept within `budget`, in order, each attempt
+/// taking an even share of what is left.
+fn connect_any(addrs: &[SocketAddr], budget: Duration) -> std::io::Result<TcpStream> {
+    let deadline = Instant::now() + budget;
+    let mut last = None;
+    for (i, addr) in addrs.iter().enumerate() {
+        let left = deadline.saturating_duration_since(Instant::now());
+        let share = left / u32::try_from(addrs.len() - i).unwrap_or(u32::MAX);
+        if share.is_zero() {
+            break;
+        }
+        match TcpStream::connect_timeout(addr, share) {
+            Ok(socket) => return Ok(socket),
+            Err(e) => last = Some(e),
+        }
+    }
+    Err(last.unwrap_or_else(|| std::io::Error::from(ErrorKind::TimedOut)))
+}
 
 fn server_handshake(socket: &mut TcpStream, timeout: Duration) -> Result<Vec<u8>> {
     let clock = HandshakeClock::start(timeout, "publisher");
@@ -2577,6 +2616,34 @@ mod tests {
                 }
             }
         })
+    }
+
+    #[test]
+    fn the_ingest_connection_keeps_to_its_budget() {
+        // 192.0.2.1 is reserved for documentation, so nothing should answer
+        // it. Whatever the network does with it (drops it, refuses it, or a
+        // proxy takes it), the attempt must end close to the budget rather
+        // than when the OS gives up.
+        let started = Instant::now();
+        let _ = connect_ingest("192.0.2.1:1935", Duration::from_millis(300));
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "{:?}",
+            started.elapsed()
+        );
+
+        // No budget: no attempt at all.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let open = listener.local_addr().unwrap();
+        assert!(connect_any(&[open], Duration::ZERO).is_err());
+
+        // A first address that refuses leaves the next its share.
+        let closed = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        assert!(connect_any(&[closed, open], Duration::from_secs(2)).is_ok());
+        assert!(connect_any(&[closed], Duration::from_millis(500)).is_err());
     }
 
     #[test]
