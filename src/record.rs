@@ -242,33 +242,53 @@ pub struct Hit {
 /// the haystack. Records that decode never overlap, so an undamaged haystack
 /// spends at most its own length. Candidates past the cap are reported as
 /// [`DecodeError::OverBudget`].
-pub fn find_records(haystack: &[u8]) -> Vec<Hit> {
-    let mut hits = Vec::new();
-    if haystack.len() < MAGIC.len() {
-        return hits;
+///
+/// Hits come one at a time, so a caller holds one however many there are: a
+/// haystack of back-to-back magics has one for every 8 bytes.
+pub fn find_records(haystack: &[u8]) -> Records<'_> {
+    Records {
+        haystack,
+        at: 0,
+        budget: haystack.len().saturating_mul(CRC_BUDGET_PER_BYTE),
     }
-    let mut budget = haystack.len().saturating_mul(CRC_BUDGET_PER_BYTE);
-    let mut i = 0usize;
-    while i + MAGIC.len() <= haystack.len() {
-        if haystack[i..i + MAGIC.len()] != MAGIC {
-            i += 1;
-            continue;
+}
+
+/// The hits in a haystack, as [`find_records`] finds them.
+#[derive(Debug, Clone)]
+pub struct Records<'a> {
+    haystack: &'a [u8],
+    /// Where the scan resumes.
+    at: usize,
+    /// CRC work left to spend.
+    budget: usize,
+}
+
+impl Iterator for Records<'_> {
+    type Item = Hit;
+
+    fn next(&mut self) -> Option<Hit> {
+        let haystack = self.haystack;
+        while self.at + MAGIC.len() <= haystack.len() {
+            let i = self.at;
+            if haystack[i..i + MAGIC.len()] != MAGIC {
+                self.at += 1;
+                continue;
+            }
+            let cost = crc_span(&haystack[i..]);
+            let result = if cost > self.budget {
+                Err(DecodeError::OverBudget)
+            } else {
+                self.budget -= cost;
+                Record::decode(&haystack[i..])
+            };
+            self.at += match &result {
+                Ok(r) => Record::encoded_len(r.payload.len()),
+                Err(_) => MAGIC.len(),
+            };
+            return Some(Hit { offset: i, result });
         }
-        let cost = crc_span(&haystack[i..]);
-        let result = if cost > budget {
-            Err(DecodeError::OverBudget)
-        } else {
-            budget -= cost;
-            Record::decode(&haystack[i..])
-        };
-        let advance = match &result {
-            Ok(r) => Record::encoded_len(r.payload.len()),
-            Err(_) => MAGIC.len(),
-        };
-        hits.push(Hit { offset: i, result });
-        i += advance;
+        None
     }
-    hits
 }
 
 /// CRC work [`find_records`] may spend per byte of haystack.
@@ -390,7 +410,7 @@ mod tests {
         hay.extend_from_slice(&b.encode().unwrap());
         hay.extend_from_slice(&[0xFF; 3]);
 
-        let hits = find_records(&hay);
+        let hits: Vec<Hit> = find_records(&hay).collect();
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[0].result.as_ref().unwrap().seq, 7);
         assert_eq!(hits[1].result.as_ref().unwrap().seq, 9);
@@ -402,7 +422,7 @@ mod tests {
         let mut bytes = sample().encode().unwrap();
         let good_seq = sample().seq;
         bytes[HEADER_LEN + 3] ^= 0xFF;
-        let hits = find_records(&bytes);
+        let hits: Vec<Hit> = find_records(&bytes).collect();
         assert_eq!(hits.len(), 1, "the magic survived, so it is still a hit");
         assert!(hits[0].result.is_err());
         // The header is readable even though the body is not, which is how the
@@ -423,7 +443,7 @@ mod tests {
         let mut hay = sample().encode().unwrap();
         hay.extend(period.iter().copied().cycle().take(512 * 1024));
 
-        let hits = find_records(&hay);
+        let hits: Vec<Hit> = find_records(&hay).collect();
         assert_eq!(hits[0].result.as_ref().unwrap(), &sample());
         let spent: usize = hits
             .iter()
@@ -461,7 +481,7 @@ mod tests {
                     .unwrap(),
             );
         }
-        let hits = find_records(&hay);
+        let hits: Vec<Hit> = find_records(&hay).collect();
         assert_eq!(hits.len(), 50);
         assert!(hits.iter().all(|h| h.result.is_ok()));
     }

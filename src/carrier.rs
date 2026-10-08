@@ -323,7 +323,7 @@ mod tests {
         let back = hex_decode(&text).expect("decodes");
         assert_eq!(Record::decode(&back).unwrap(), record);
         // And the decoded bytes are findable by the generic scanner.
-        assert_eq!(find_records(&back).len(), 1);
+        assert_eq!(find_records(&back).count(), 1);
     }
 
     #[test]
