@@ -502,11 +502,15 @@ OSC lane has run at the set rate with no publisher and at the video's frame rate
 with one, with no gaps on loopback, into the VRSL-URP source and into
 `truss-detect`.
 
-`--source` has pulled VRCDN's RTSP egress for five minutes with a record on
-every one of 8,825 frames, no gaps and no decode errors. Through MediaMTX it
-has pulled a source with B-frames, one with no audio, one behind a login with
-Basic and with Digest, and HEVC from x265 with three B-frames in open and
-closed GOPs.
+`--source` has pulled VRCDN's RTSP egress for an hour, carrying live desk
+data from SoundSwitch and publishing back to VRCDN, with `--record` and the OSC
+lane running alongside. The publish held for the whole hour. Read back from
+VRCDN's egress over 59 minutes, every record arrived intact, a median of 106 ms
+after the relay sent it. The recording carried a record on every one of its
+107,686 frames, with no gaps and no decode errors, and the OSC lane lost 2
+datagrams of 107,385. Through MediaMTX it has pulled a source with B-frames,
+one with no audio, one behind a login with Basic and with Digest, and HEVC
+from x265 with three B-frames in open and closed GOPs.
 
 `--record` has written H.264 from an encoder and HEVC from a pulled source
 while publishing, and recorded alone with no publish; every file carried every
@@ -526,8 +530,8 @@ Sending 4,000 kb/s over a link capped at 3 Mb/s, it dropped 48% of its frames
 through the relay and 59% straight to the link, and every record the relay
 sent arrived. At 2,500 kb/s it dropped none, and the relay never held it back.
 
-Nothing longer than a thirty-minute publish has been measured, nor a real
-degraded uplink.
+Nothing longer than an hour's publish has been measured, nor a real degraded
+uplink.
 
 ## Licence
 
