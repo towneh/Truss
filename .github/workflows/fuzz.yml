@@ -42,7 +42,7 @@ jobs:
           - inject_video_tag
           - pull_au_to_flv
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@nightly
       - uses: Swatinem/rust-cache@v2
         with:
@@ -56,7 +56,7 @@ jobs:
       # Restored before the seeds are written, so a run continues from what
       # earlier runs found rather than starting cold every week.
       - name: Restore corpus
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v6
         with:
           path: fuzz/corpus/${{ matrix.target }}
           key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
@@ -76,7 +76,7 @@ jobs:
       # reproducer is thrown away with the container.
       - name: Upload the reproducer
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: crash-${{ matrix.target }}
           path: fuzz/artifacts/${{ matrix.target }}
@@ -84,7 +84,7 @@ jobs:
 
       - name: Save corpus
         if: always()
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v6
         with:
           path: fuzz/corpus/${{ matrix.target }}
           key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
@@ -95,8 +95,9 @@ jobs:
     name: advisories
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo install cargo-audit --locked
       - run: cargo audit
+      - run: cargo audit --file fuzz/Cargo.lock
