@@ -38,7 +38,12 @@ fn avc_reorder_depth(avcc: &[u8]) -> Option<usize> {
         return Some(0);
     }
     let record = AvcDecoderConfigurationRecord::try_from(avcc).ok()?;
-    let sps = record.sequence_parameter_sets().next()?.ok()?;
+    // RefNal::new panics on an empty slice.
+    let sps = record
+        .sequence_parameter_sets()
+        .next()?
+        .ok()
+        .filter(|sps| !sps.is_empty())?;
     let sps = SeqParameterSet::from_bits(RefNal::new(sps, &[], true).rbsp_bits()).ok()?;
     let frames = sps
         .vui_parameters?
@@ -524,6 +529,16 @@ mod tests {
             Some(0)
         );
         assert_eq!(reorder_depth(VideoCodec::H264, &[]), None);
+    }
+
+    #[test]
+    fn an_empty_avc_sps_is_no_depth() {
+        // Main profile, one SPS of no bytes, then seven empty PPSs. h264-reader
+        // reads an SPS's NAL type from the byte after its length, so the PPS
+        // count of 7 is what lets the empty SPS through.
+        let mut avcc = vec![1, 77, 0, 0x1F, 0xFF, 0xE1, 0, 0, 7];
+        avcc.resize(avcc.len() + 14, 0);
+        assert_eq!(reorder_depth(VideoCodec::H264, &avcc), None);
     }
 
     /// An hvcC holding `sps` as its only parameter set, after a VPS array
